@@ -1,0 +1,171 @@
+@import "tailwindcss";
+
+/* --------------------------------------------------------------------------
+   Design tokens.  One dark palette, tuned for a NAS dashboard that people
+   leave open on a second screen: low-glare background, high-contrast numbers.
+   -------------------------------------------------------------------------- */
+@theme {
+  --color-ink-950: #080b13;
+  --color-ink-900: #0d1220;
+  --color-ink-850: #121829;
+  --color-ink-800: #171e33;
+  --color-ink-700: #212a45;
+  --color-ink-600: #2e3a5c;
+  --color-ink-500: #4a5779;
+  --color-ink-400: #6b7ba0;
+  --color-ink-300: #94a1c2;
+  --color-ink-200: #c3cde3;
+  --color-ink-100: #e6ecf8;
+
+  --color-brand-400: #a78bfa;
+  --color-brand-500: #8b6df0;
+  --color-brand-600: #7451e8;
+  --color-brand-700: #5b3ecf;
+
+  --color-save-400: #34d399;
+  --color-save-500: #10b981;
+  --color-save-600: #059669;
+
+  --color-warn-400: #fbbf24;
+  --color-warn-500: #f59e0b;
+
+  --color-danger-400: #fb7185;
+  --color-danger-500: #f43f5e;
+
+  --color-info-400: #38bdf8;
+  --color-info-500: #0ea5e9;
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+
+  --radius-panel: 0.875rem;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(ellipse 1200px 700px at 12% -8%, rgba(116, 81, 232, 0.16), transparent 60%),
+    radial-gradient(ellipse 900px 600px at 92% 0%, rgba(16, 185, 129, 0.09), transparent 55%),
+    var(--color-ink-950);
+  color: var(--color-ink-100);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "tnum" 1;
+}
+
+/* Scrollbars that do not fight the dark theme */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-ink-600) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-ink-700);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--color-ink-600);
+  background-clip: content-box;
+}
+
+/* `btn` is declared as a utility (not a component class) so the variants below
+   can @apply it - Tailwind v4 only lets @apply reference utilities. */
+@utility btn {
+  @apply inline-flex items-center justify-center gap-2 rounded-lg px-3.5 py-2 text-sm
+         font-medium transition-all disabled:cursor-not-allowed disabled:opacity-40;
+}
+
+@layer components {
+  .panel {
+    @apply rounded-[var(--radius-panel)] border border-ink-700/70 bg-ink-900/70 backdrop-blur-sm;
+  }
+
+  .panel-hover {
+    @apply transition-colors hover:border-ink-600 hover:bg-ink-850/80;
+  }
+
+  .btn-primary {
+    @apply btn bg-brand-600 text-white shadow-lg shadow-brand-700/25
+           hover:bg-brand-500 active:scale-[0.98];
+  }
+  .btn-ghost {
+    @apply btn border border-ink-600 bg-ink-800/60 text-ink-200
+           hover:border-ink-500 hover:bg-ink-700/70 hover:text-ink-100;
+  }
+  .btn-danger {
+    @apply btn border border-danger-500/40 bg-danger-500/10 text-danger-400
+           hover:border-danger-500/70 hover:bg-danger-500/20;
+  }
+  .btn-sm {
+    @apply px-2.5 py-1.5 text-xs;
+  }
+
+  .field {
+    @apply w-full rounded-lg border border-ink-600 bg-ink-950/60 px-3 py-2 text-sm
+           text-ink-100 outline-none transition-colors placeholder:text-ink-500
+           focus:border-brand-500 focus:ring-2 focus:ring-brand-600/25;
+  }
+
+  .chip {
+    @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium;
+  }
+
+  .label {
+    @apply text-sm font-medium text-ink-200;
+  }
+  .hint {
+    @apply mt-1 text-xs leading-relaxed text-ink-400;
+  }
+
+  .table-row {
+    @apply border-b border-ink-800/80 transition-colors hover:bg-ink-800/40;
+  }
+}
+
+@keyframes pulse-ring {
+  0% { box-shadow: 0 0 0 0 rgba(139, 109, 240, 0.45); }
+  70% { box-shadow: 0 0 0 8px rgba(139, 109, 240, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(139, 109, 240, 0); }
+}
+.pulse-ring {
+  animation: pulse-ring 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@keyframes shimmer {
+  100% { transform: translateX(100%); }
+}
+.shimmer::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.07),
+    transparent
+  );
+  animation: shimmer 1.8s infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

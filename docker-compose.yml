@@ -1,0 +1,36 @@
+services:
+  optimizarr:
+    build: .
+    image: ghcr.io/gottschalkfelix4-source/optimizarr:latest
+    container_name: optimizarr
+    restart: unless-stopped
+    ports:
+      - "8474:8080"
+    environment:
+      # These are the only environment variables that exist - everything about
+      # how Optimizarr behaves is configured in the web UI.
+      PUID: "99"
+      PGID: "100"
+      UMASK: "002"
+      TZ: "Europe/Berlin"
+    volumes:
+      - ./data/config:/config
+      # Put this on fast storage: the full output file is written here first.
+      - ./data/transcode:/transcode
+      # Your library. Needs write access - the converted file replaces the original.
+      - /mnt/user/media:/media
+    devices:
+      # Intel GPU. Remove this line if the host has no /dev/dri.
+      - /dev/dri:/dev/dri
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - |
+          import urllib.request, sys
+          sys.exit(0 if urllib.request.urlopen("http://127.0.0.1:8080/api/health", timeout=4).status == 200 else 1)
+      interval: 30s
+      timeout: 5s
+      start_period: 45s
+      retries: 3

@@ -1,0 +1,14 @@
+.git
+.venv
+node_modules
+frontend/node_modules
+frontend/dist
+backend/tests
+**/__pycache__
+*.pyc
+.pytest_cache
+*.md
+!README.md
+.github
+unraid
+docker-compose.yml

@@ -1,0 +1,141 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>Optimizarr</Name>
+  <Repository>ghcr.io/gottschalkfelix4-source/optimizarr:latest</Repository>
+  <Registry>https://github.com/gottschalkfelix4-source/optimizarr/pkgs/container/optimizarr</Registry>
+  <Branch>
+    <Tag>latest</Tag>
+    <TagDescription>Aktuelle stabile Version</TagDescription>
+  </Branch>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/gottschalkfelix4-source/optimizarr/issues</Support>
+  <Project>https://github.com/gottschalkfelix4-source/optimizarr</Project>
+  <Overview>
+    Optimizarr durchsucht deine Medienbibliothek und findet heraus, welche Dateien sich
+    wirklich lohnen, nach AV1 umgewandelt zu werden - und mit welchen Einstellungen.
+
+    Statt pauschal alles neu zu kodieren, misst Optimizarr nach: es schneidet kurze
+    Ausschnitte aus jeder Datei, kodiert sie testweise und rechnet das Ergebnis hoch. Aus
+    jeder abgeschlossenen Konvertierung lernt ein Modell dazu, sodass die Vorhersagen mit
+    der Zeit genauer werden. Optional kann die Claude-API hinzugeschaltet werden, die
+    erkennt, ob es sich um Anime, koerniges Filmmaterial oder eine dunkle Konzertaufnahme
+    handelt, und die Einstellungen entsprechend anpasst.
+
+    Eine Datei wird nur dann ersetzt, wenn das Ergebnis kleiner UND technisch einwandfrei
+    ist. Faellt eine der Pruefungen durch, wird das Ergebnis verworfen und das Original
+    bleibt unangetastet. Originale wandern standardmaessig in einen Papierkorb-Ordner.
+
+    Intel-Grafik wird automatisch erkannt: Arc- und Core-Ultra-GPUs kodieren AV1 in
+    Hardware, aeltere iGPUs uebernehmen zumindest das Dekodieren, und ohne GPU laeuft
+    alles auf der CPU mit SVT-AV1. Alle Einstellungen werden in der Weboberflaeche
+    vorgenommen - es gibt keine Konfigurationsdateien und keine Umgebungsvariablen fuer
+    das Verhalten.
+
+    Wichtig: /dev/dri muss durchgereicht werden, damit die GPU genutzt werden kann
+    (unten unter "Intel GPU" bereits vorbereitet).
+  </Overview>
+  <Category>MediaApp:Video Tools: Status:Stable</Category>
+  <WebUI>http://[IP]:[PORT:8080]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/gottschalkfelix4-source/optimizarr/main/unraid/optimizarr.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/gottschalkfelix4-source/optimizarr/main/unraid/icon.png</Icon>
+  <ExtraParams>--device=/dev/dri:/dev/dri</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires>Fuer Hardware-Beschleunigung wird eine Intel-GPU mit /dev/dri benoetigt.</Requires>
+
+  <Config Name="WebUI Port"
+          Target="8080"
+          Default="8474"
+          Mode="tcp"
+          Description="Port der Weboberflaeche."
+          Type="Port"
+          Display="always"
+          Required="true"
+          Mask="false">8474</Config>
+
+  <Config Name="Konfiguration"
+          Target="/config"
+          Default="/mnt/user/appdata/optimizarr"
+          Mode="rw"
+          Description="Datenbank, Einstellungen und Papierkorb fuer ersetzte Originale. Sollte auf dem Cache liegen."
+          Type="Path"
+          Display="always"
+          Required="true"
+          Mask="false">/mnt/user/appdata/optimizarr</Config>
+
+  <Config Name="Arbeitsverzeichnis (Transcode)"
+          Target="/transcode"
+          Default="/mnt/user/appdata/optimizarr/transcode"
+          Mode="rw"
+          Description="Hier entstehen die Dateien waehrend des Encodens. Unbedingt auf eine SSD bzw. den Cache-Pool legen - es wird jeweils die komplette Ausgabedatei zwischengespeichert. Mindestens 50 GB freihalten."
+          Type="Path"
+          Display="always"
+          Required="true"
+          Mask="false">/mnt/user/appdata/optimizarr/transcode</Config>
+
+  <Config Name="Medien"
+          Target="/media"
+          Default="/mnt/user/media"
+          Mode="rw"
+          Description="Deine Medienbibliothek. Schreibrechte sind noetig, weil Optimizarr die konvertierten Dateien zurueckschreibt. Die konkreten Unterordner werden spaeter in der Weboberflaeche ausgewaehlt."
+          Type="Path"
+          Display="always"
+          Required="true"
+          Mask="false">/mnt/user/media</Config>
+
+  <Config Name="Intel GPU"
+          Target="/dev/dri"
+          Default="/dev/dri"
+          Mode=""
+          Description="Render-Node der Intel-Grafik. Ohne diesen Eintrag laeuft das Encoding komplett auf der CPU."
+          Type="Device"
+          Display="always"
+          Required="false"
+          Mask="false">/dev/dri</Config>
+
+  <Config Name="PUID"
+          Target="PUID"
+          Default="99"
+          Mode=""
+          Description="Benutzer-ID, unter der Optimizarr laeuft und Dateien schreibt. In Unraid ueblicherweise 99 (nobody)."
+          Type="Variable"
+          Display="advanced"
+          Required="true"
+          Mask="false">99</Config>
+
+  <Config Name="PGID"
+          Target="PGID"
+          Default="100"
+          Mode=""
+          Description="Gruppen-ID. In Unraid ueblicherweise 100 (users)."
+          Type="Variable"
+          Display="advanced"
+          Required="true"
+          Mask="false">100</Config>
+
+  <Config Name="UMASK"
+          Target="UMASK"
+          Default="002"
+          Mode=""
+          Description="Dateirechte-Maske fuer neu erzeugte Dateien."
+          Type="Variable"
+          Display="advanced"
+          Required="false"
+          Mask="false">002</Config>
+
+  <Config Name="TZ"
+          Target="TZ"
+          Default="Europe/Berlin"
+          Mode=""
+          Description="Zeitzone - wichtig fuer das Encoding-Zeitfenster."
+          Type="Variable"
+          Display="advanced"
+          Required="false"
+          Mask="false">Europe/Berlin</Config>
+</Container>
