@@ -70,14 +70,14 @@ def test_look_ahead_depth_is_never_sent():
 def test_low_power_is_still_sent():
     """Not a fix - it silences a misleading 'unsupported' line, and the smoke
     test that passes on this hardware includes it."""
-    assert "-low_power 1" in qsv_command()
+    assert "-low_power:v 1" in qsv_command()
 
 
 def test_quality_and_bitrate_are_never_combined():
     """Together they select a rate-control mode that AV1 has no Linux
     implementation for, which fails every time."""
     command = qsv_command()
-    assert "-global_quality" in command
+    assert "-global_quality:v" in command
     assert "-b:v" not in command
     assert "-maxrate" not in command
 
@@ -309,3 +309,100 @@ def test_consequences_alone_leave_the_verdict_open():
     # But as soon as one line names a stream, that decides it.
     with_cause = "[aost#0:1/libopus @ 0x1] Error while opening encoder\n" + log
     assert failure_is_video(with_cause) is False
+
+
+# --------------------------------------------------------------------------- #
+# Stream specifiers
+#
+# Options without a `:v` land on every output stream.  `-global_quality` then
+# puts the audio encoders into quality mode, which libopus refuses - and the
+# resulting error names libopus, so the video encoder looks innocent while the
+# job dies.  Verified against a real 4K file with two E-AC3 tracks.
+# --------------------------------------------------------------------------- #
+
+#: Options that configure the video encoder and must never reach audio.
+_VIDEO_ONLY = (
+    "-global_quality", "-preset", "-g", "-qp", "-crf", "-low_power",
+    "-svtav1-params", "-color_primaries", "-color_trc", "-colorspace",
+)
+
+
+def _assert_all_qualified(args: list[str], label: str) -> None:
+    stray = [a for a in args if a in _VIDEO_ONLY]
+    assert not stray, f"{label}: unqualified video options would hit audio too: {stray}"
+
+
+def test_qsv_options_never_leak_onto_audio():
+    settings = AppSettings()
+    info = make_info(audio_streams=[{
+        "index": 1, "codec": "eac3", "channels": 6, "channel_layout": "5.1(side)",
+        "bitrate": 640_000, "sample_rate": 48000, "language": "ger", "title": "",
+        "default": True, "commentary": False,
+    }])
+    plan = planner.build_plan(info, settings, hw=arc_report())
+    args = planner.build_ffmpeg_args(plan, info, info.path, "/tmp/out.mkv")
+    _assert_all_qualified(args, "av1_qsv")
+    assert "-global_quality:v" in args
+
+
+def test_svtav1_options_never_leak_onto_audio():
+    settings = AppSettings()
+    settings.encoding.encoder = "svt_av1"
+    info = make_info(audio_streams=[{
+        "index": 1, "codec": "dts", "channels": 6, "channel_layout": "5.1",
+        "bitrate": 1_509_000, "sample_rate": 48000, "language": "ger", "title": "",
+        "default": True, "commentary": False,
+    }])
+    plan = planner.build_plan(info, settings, hw=None)
+    args = planner.build_ffmpeg_args(plan, info, info.path, "/tmp/out.mkv")
+    _assert_all_qualified(args, "libsvtav1")
+    assert "-crf:v" in args
+
+
+def test_vaapi_options_never_leak_onto_audio():
+    settings = AppSettings()
+    settings.encoding.encoder = "av1_vaapi"
+    info = make_info(audio_streams=[{
+        "index": 1, "codec": "eac3", "channels": 6, "channel_layout": "5.1(side)",
+        "bitrate": 640_000, "sample_rate": 48000, "language": "ger", "title": "",
+        "default": True, "commentary": False,
+    }])
+    plan = planner.build_plan(info, settings, hw=arc_report())
+    args = planner.build_ffmpeg_args(plan, info, info.path, "/tmp/out.mkv")
+    _assert_all_qualified(args, "av1_vaapi")
+    assert "-qp:v" in args
+
+
+def test_colour_metadata_is_qualified_too():
+    settings = AppSettings()
+    info = make_info(
+        is_hdr=True, hdr_format="hdr10", bit_depth=10,
+        color_primaries="bt2020", color_transfer="smpte2084", color_space="bt2020nc",
+    )
+    args = planner.build_ffmpeg_args(
+        planner.build_plan(info, settings, hw=arc_report()), info, info.path, "/tmp/out.mkv"
+    )
+    _assert_all_qualified(args, "colour metadata")
+    assert "-color_primaries:v" in args
+
+
+def test_shared_encoder_args_are_qualified():
+    """The probe uses these too - an unqualified option there would verify a
+    command that differs from the real one."""
+    _assert_all_qualified(planner.qsv_encoder_args(30, 6, 120, True), "qsv_encoder_args")
+
+
+def test_audio_options_stay_stream_specific():
+    """The mirror image: audio settings must not reach the video encoder."""
+    settings = AppSettings()
+    info = make_info(audio_streams=[{
+        "index": 1, "codec": "eac3", "channels": 6, "channel_layout": "5.1(side)",
+        "bitrate": 640_000, "sample_rate": 48000, "language": "ger", "title": "",
+        "default": True, "commentary": False,
+    }])
+    plan = planner.build_plan(info, settings, hw=arc_report())
+    args = planner.build_ffmpeg_args(plan, info, info.path, "/tmp/out.mkv")
+    for option in ("-b:a", "-vbr", "-application"):
+        bare = [a for a in args if a == option]
+        assert not bare, f"{option} must carry a stream specifier"
+    assert "-b:a:0" in args

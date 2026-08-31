@@ -420,16 +420,21 @@ def qsv_encoder_args(crf: float, preset: int, keyint: int, low_power: bool) -> l
         this ever move to a bitrate-based mode, it must come back together with
         ``-async_depth 1``, or the encoder fails a few seconds in.
     """
+    # Every option carries the `:v` stream specifier.  Without it these land on
+    # *all* output streams, and `-global_quality` then switches the audio
+    # encoders into quality mode - which libopus rejects outright ("Quality-based
+    # encoding not supported"), taking the whole job down with an error that
+    # reads as if the audio were at fault.
     args = [
         "-c:v", "av1_qsv",
-        "-global_quality", f"{crf:g}",
-        "-preset", str(_QSV_PRESET_MAP.get(preset, 4)),
-        "-g", str(keyint),
+        "-global_quality:v", f"{crf:g}",
+        "-preset:v", str(_QSV_PRESET_MAP.get(preset, 4)),
+        "-g:v", str(keyint),
     ]
     if low_power:
         # A no-op on Arc (the driver forces it on), but it silences a misleading
         # "Low power mode is unsupported" line in the log.
-        args += ["-low_power", "1"]
+        args += ["-low_power:v", "1"]
     return args
 
 
@@ -514,25 +519,26 @@ def build_ffmpeg_args(
 
     # --- video encoder ---
     if plan.encoder == "libsvtav1":
-        args += ["-c:v", "libsvtav1", "-crf", f"{plan.crf:g}", "-preset", str(plan.preset)]
+        args += ["-c:v", "libsvtav1", "-crf:v", f"{plan.crf:g}", "-preset:v", str(plan.preset)]
         params = _svtav1_params(plan)
         if params:
-            args += ["-svtav1-params", params]
-        args += ["-g", str(plan.keyint_frames)]
+            args += ["-svtav1-params:v", params]
+        args += ["-g:v", str(plan.keyint_frames)]
     elif plan.encoder == "av1_qsv":
         args += qsv_encoder_args(plan.crf, plan.preset, plan.keyint_frames, plan.low_power)
     elif plan.encoder == "av1_vaapi":
-        args += ["-c:v", "av1_vaapi", "-qp", f"{plan.crf:g}", "-g", str(plan.keyint_frames)]
+        args += ["-c:v", "av1_vaapi", "-qp:v", f"{plan.crf:g}",
+                 "-g:v", str(plan.keyint_frames)]
     else:
         raise ValueError(f"unsupported encoder {plan.encoder}")
 
     # --- colour metadata must survive, especially for HDR ---
     if info.color_primaries:
-        args += ["-color_primaries", info.color_primaries]
+        args += ["-color_primaries:v", info.color_primaries]
     if info.color_transfer:
-        args += ["-color_trc", info.color_transfer]
+        args += ["-color_trc:v", info.color_transfer]
     if info.color_space:
-        args += ["-colorspace", info.color_space]
+        args += ["-colorspace:v", info.color_space]
 
     if not quiet_streams:
         # --- audio ---

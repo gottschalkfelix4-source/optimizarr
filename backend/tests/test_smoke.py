@@ -210,7 +210,8 @@ def test_plan_builds_valid_svtav1_command():
 
     args = planner.build_ffmpeg_args(plan, info, info.path, "/tmp/out.mkv")
     assert "-c:v" in args and "libsvtav1" in args
-    assert "-crf" in args
+    # Qualified with :v so it cannot reach the audio encoders.
+    assert "-crf:v" in args
     assert args[-1] == "/tmp/out.mkv"
     # DTS 5.1 at 1.5 Mbit/s is bloated -> Opus
     assert "libopus" in args
@@ -265,8 +266,8 @@ def test_hdr_metadata_is_preserved():
     )
     plan = planner.build_plan(info, settings, hw=None)
     args = planner.build_ffmpeg_args(plan, info, info.path, "/tmp/out.mkv")
-    assert "-color_primaries" in args and "bt2020" in args
-    assert "-color_trc" in args and "smpte2084" in args
+    assert "-color_primaries:v" in args and "bt2020" in args
+    assert "-color_trc:v" in args and "smpte2084" in args
 
 
 def test_interlaced_source_gets_deinterlaced():
