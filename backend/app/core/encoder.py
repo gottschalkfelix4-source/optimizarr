@@ -260,7 +260,7 @@ async def run_job(
             # GPU is then quietly unused for every future job and the reason is
             # gone, so the actual ffmpeg output and the command that produced it
             # both go into the job log.
-            reason = _first_error_line(log_tail)
+            reason = ffmpeg.first_error_line(log_tail)
             failed_args = planner.build_ffmpeg_args(plan, info, info.path, str(temp_out))
             log.warning("hardware encode failed for %s: %s", source, reason)
             _append_log(job_id, (
@@ -615,32 +615,6 @@ def _reject(job_id: int, file_id: int, outcome: EncodeOutcome, message: str) -> 
     bus.publish("job.finished", {"job_id": job_id, "state": "rejected", "message": message})
     log.info("job %s rejected: %s", job_id, message)
     return outcome
-
-
-#: ffmpeg prints plenty of noise before the line that matters.  These are the
-#: shapes that actually explain a failed hardware encode.
-_ERROR_MARKERS = (
-    "error", "failed", "unsupported", "invalid", "cannot", "unable",
-    "no such", "not implemented", "incompatible", "device creation",
-)
-_ERROR_NOISE = ("error_rate", "last message repeated", "deprecated")
-
-
-def _first_error_line(log_tail: str) -> str:
-    """The most explanatory line from an ffmpeg failure.
-
-    Reading the tail backwards finds the summary line ("Error while opening
-    encoder...") before the specific cause, so scan forwards and keep the first
-    line that names a real problem - that is usually the one worth showing.
-    """
-    lines = [ln.strip() for ln in (log_tail or "").splitlines() if ln.strip()]
-    for line in lines:
-        lowered = line.lower()
-        if any(noise in lowered for noise in _ERROR_NOISE):
-            continue
-        if any(marker in lowered for marker in _ERROR_MARKERS):
-            return line[:300]
-    return lines[-1][:300] if lines else "keine Fehlermeldung von ffmpeg"
 
 
 def _fmt(num: int | float) -> str:

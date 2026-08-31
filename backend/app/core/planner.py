@@ -64,6 +64,10 @@ class EncodePlan:
     hw_decode: bool = False
     hw_device: str = ""
     low_power: bool = True
+    #: Extra surfaces for the decoder pool when decoding on the GPU.  Pools are
+    #: fixed at allocation, and the default is tight for a full-hardware
+    #: transcode; more than this only wastes VRAM.
+    extra_hw_frames: int = 16
     keyint_frames: int = 240
     container: str = "mkv"
     audio: list[dict[str, Any]] = field(default_factory=list)
@@ -304,9 +308,20 @@ def build_plan(
         settings.hardware.hw_decode
         and hw is not None
         and hw.readable
+        # A probe that found the decode path broken vetoes it outright; the
+        # encoder stays on the GPU either way.
+        and getattr(hw, "hw_decode_usable", None) is not False
         and {"h264": hw.decode_h264, "hevc": hw.decode_hevc,
              "vp9": hw.decode_vp9, "av1": hw.decode_av1}.get(info.video_codec.lower(), False)
     )
+    if (
+        settings.hardware.hw_decode
+        and hw is not None
+        and getattr(hw, "hw_decode_usable", None) is False
+    ):
+        plan.notes.append(
+            "GPU-Dekodierung ist auf diesem System nicht nutzbar - dekodiert wird auf der CPU."
+        )
     if plan.hw_decode and not plan.is_hardware and plan.deinterlace:
         # Mixing VAAPI decode with a software deinterlacer means a download per
         # frame; not worth the complexity, so decode in software instead.
@@ -335,25 +350,41 @@ def _video_filters(plan: EncodePlan, info: MediaInfo) -> list[str]:
 
 
 def _hw_filters(plan: EncodePlan, info: MediaInfo, hw_frames_in: bool) -> list[str]:
-    """Filter chain when the encoder lives on the GPU."""
+    """Filter chain when the encoder lives on the GPU.
+
+    The conversion stage runs **even when there is nothing to scale or
+    deinterlace**, which is not obvious and was previously wrong here.  The QSV
+    encoder never converts bit depth itself - it reads the format off the
+    incoming surfaces - so without this stage an 8-bit source is silently
+    encoded as 8-bit AV1 while the plan still claims 10-bit.  It also hands the
+    encoder its own frame pool instead of the decoder's fixed one, which is the
+    likelier cause of outright failures.
+
+    Exactly one ``vpp_qsv`` instance, and never a software ``format=`` filter in
+    a QSV surface chain - that inserts an auto-scaler that cannot bridge
+    hardware and software formats.
+    """
     filters: list[str] = []
     if plan.encoder == "av1_qsv":
+        if not hw_frames_in:
+            # Software decode: convert on the CPU, then upload.
+            filters.append(f"format={plan.pix_fmt}")
+            filters.append("hwupload=extra_hw_frames=64")
         vpp: list[str] = []
         if plan.deinterlace:
             vpp.append("deinterlace=2")
         if plan.target_height:
             vpp.append(f"w=-1:h={plan.target_height}")
-        if vpp:
-            filters.append("vpp_qsv=" + ":".join(vpp))
-        if not hw_frames_in:
-            filters.append(f"format={plan.pix_fmt}")
-            filters.append("hwupload=extra_hw_frames=64")
+        vpp.append(f"format={plan.pix_fmt}")
+        filters.append("vpp_qsv=" + ":".join(vpp))
     else:  # av1_vaapi
         if hw_frames_in:
             if plan.deinterlace:
                 filters.append("deinterlace_vaapi=mode=default")
-            if plan.target_height:
-                filters.append(f"scale_vaapi=w=-1:h={plan.target_height}:format={plan.pix_fmt}")
+            # Same reasoning: without this stage the encoder inherits the
+            # decoder's pixel format and the 10-bit target is quietly lost.
+            size = f"w=-1:h={plan.target_height}:" if plan.target_height else ""
+            filters.append(f"scale_vaapi={size}format={_vaapi_format(plan.pix_fmt)}")
         else:
             if plan.deinterlace:
                 filters.append("bwdif=mode=send_frame")
@@ -362,6 +393,44 @@ def _hw_filters(plan: EncodePlan, info: MediaInfo, hw_frames_in: bool) -> list[s
             filters.append(f"format={plan.pix_fmt}")
             filters.append("hwupload")
     return filters
+
+
+def _vaapi_format(pix_fmt: str) -> str:
+    """VAAPI names the 10-bit format ``p010``, without the endianness suffix."""
+    return "p010" if pix_fmt in ("p010le", "p010") else pix_fmt
+
+
+def qsv_encoder_args(crf: float, preset: int, keyint: int, low_power: bool) -> list[str]:
+    """The av1_qsv encoder arguments - one source of truth.
+
+    Kept here rather than inline so the hardware probe in ``hwaccel.py`` tests
+    exactly what the real encode runs.  A probe that verifies a different
+    configuration is how a broken encode gets declared working.
+
+    Two options are deliberately absent:
+
+    ``-extbrc``
+        Reaches the driver for AV1 regardless of rate-control mode, and Intel
+        lists it as unsupported for AV1 on DG2/Arc; there are reports of a hard
+        initialisation failure on the A380.  With ICQ it would buy nothing
+        anyway.
+    ``-look_ahead_depth``
+        ``-global_quality`` without a bitrate selects ICQ, and in that branch
+        ffmpeg never writes the lookahead depth at all - it is a no-op.  Should
+        this ever move to a bitrate-based mode, it must come back together with
+        ``-async_depth 1``, or the encoder fails a few seconds in.
+    """
+    args = [
+        "-c:v", "av1_qsv",
+        "-global_quality", f"{crf:g}",
+        "-preset", str(_QSV_PRESET_MAP.get(preset, 4)),
+        "-g", str(keyint),
+    ]
+    if low_power:
+        # A no-op on Arc (the driver forces it on), but it silences a misleading
+        # "Low power mode is unsupported" line in the log.
+        args += ["-low_power", "1"]
+    return args
 
 
 def _svtav1_params(plan: EncodePlan) -> str:
@@ -394,6 +463,10 @@ def build_ffmpeg_args(
         args += ["-init_hw_device", f"qsv=hw,child_device={plan.hw_device}", "-filter_hw_device", "hw"]
         if plan.hw_decode:
             args += ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv", "-hwaccel_device", "hw"]
+            # Frame pools cannot grow at runtime, so the decoder's has to be
+            # sized up front - the default is tight for a full-hardware
+            # transcode.  This is an input option and must precede -i.
+            args += ["-extra_hw_frames", str(max(0, plan.extra_hw_frames))]
             hw_frames_in = True
     elif plan.encoder == "av1_vaapi":
         args += ["-vaapi_device", plan.hw_device]
@@ -447,12 +520,7 @@ def build_ffmpeg_args(
             args += ["-svtav1-params", params]
         args += ["-g", str(plan.keyint_frames)]
     elif plan.encoder == "av1_qsv":
-        args += ["-c:v", "av1_qsv", "-global_quality", f"{plan.crf:g}",
-                 "-preset", str(_QSV_PRESET_MAP.get(plan.preset, 4)),
-                 "-g", str(plan.keyint_frames)]
-        if plan.low_power:
-            args += ["-low_power", "1"]
-        args += ["-extbrc", "1", "-look_ahead_depth", "40"]
+        args += qsv_encoder_args(plan.crf, plan.preset, plan.keyint_frames, plan.low_power)
     elif plan.encoder == "av1_vaapi":
         args += ["-c:v", "av1_vaapi", "-qp", f"{plan.crf:g}", "-g", str(plan.keyint_frames)]
     else:

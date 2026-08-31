@@ -108,6 +108,33 @@ class MediaInfo:
         return self.video_bitrate / pps
 
 
+#: ffmpeg prints plenty of noise around the line that matters.  These are the
+#: shapes that actually explain a failure.
+_ERROR_MARKERS = (
+    "error", "failed", "unsupported", "invalid", "cannot", "unable",
+    "no such", "not implemented", "incompatible", "device creation",
+    "impossible to convert",
+)
+_ERROR_NOISE = ("error_rate", "last message repeated", "deprecated")
+
+
+def first_error_line(log_tail: str) -> str:
+    """The most explanatory line from an ffmpeg failure.
+
+    Scanned forwards on purpose: ffmpeg names the specific cause first and then
+    a vaguer summary, so reading from the end reliably returns the least useful
+    line ("Error while opening encoder ...").
+    """
+    lines = [ln.strip() for ln in (log_tail or "").splitlines() if ln.strip()]
+    for line in lines:
+        lowered = line.lower()
+        if any(noise in lowered for noise in _ERROR_NOISE):
+            continue
+        if any(marker in lowered for marker in _ERROR_MARKERS):
+            return line[:300]
+    return lines[-1][:300] if lines else "keine Fehlermeldung von ffmpeg"
+
+
 async def _run(cmd: list[str], timeout: float | None = None) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE

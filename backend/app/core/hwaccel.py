@@ -7,10 +7,18 @@ Rather than asking the user to know, we probe at startup:
 1. is there a render node at all?
 2. what does ``vainfo`` report for profiles/entrypoints?
 3. does ffmpeg list the encoder?
-4. does a 10-frame throwaway encode actually succeed?
+4. does a realistic throwaway encode actually succeed?
+5. does the full decode-on-GPU path work too?
 
-Only step 4 is trusted for "yes, we can use this" - the first three are for the
-explanation shown in the UI.
+Only steps 4 and 5 are trusted for "yes, we can use this" - the first three are
+for the explanation shown in the UI.
+
+Step 4 runs at the same output format and with the same encoder arguments the
+real encode uses.  An earlier version probed 8-bit at a low resolution with
+minimal arguments, declared the encoder working, and then watched every real
+job fall back to the CPU: a probe that differs from production verifies
+nothing.  Step 5 exists because the two halves fail separately - a GPU that
+cannot feed itself should lose GPU decoding, not GPU encoding.
 """
 from __future__ import annotations
 
@@ -23,6 +31,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from . import ffmpeg
+from .ffmpeg import first_error_line
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +80,10 @@ class HardwareReport:
     svt_av1: bool = False
     libvmaf: bool = False
     quality_metric: str = "none"       # vmaf | ssim | none
+    #: Encoding on the GPU and decoding on the GPU fail independently, so they
+    #: get independent verdicts.  None = not probed.
+    hw_decode_usable: bool | None = None
+    hw_decode_reason: str = ""
     recommended_encoder: str = "svt_av1"
     summary: str = ""
     notes: list[str] = field(default_factory=list)
@@ -152,25 +165,34 @@ def _va_supports(profiles: list[str], profile_match: str, entrypoint: str) -> bo
     return False
 
 
-async def _smoke_test(encoder: str, device: str, low_power: bool) -> tuple[bool, str]:
-    """Encode ten frames of a test pattern.  The only trustworthy check."""
-    src = ["-f", "lavfi", "-i", "testsrc2=size=640x480:rate=30", "-frames:v", "10"]
+async def _smoke_test(
+    encoder: str, device: str, low_power: bool, pix_fmt: str = "p010le"
+) -> tuple[bool, str]:
+    """Encode a realistic clip.  The only trustworthy check.
+
+    Deliberately not ten frames of a small 8-bit pattern: a probe whose
+    configuration differs from the real encode verifies something that then
+    fails in production.  This runs at the output format the encoder will
+    actually be asked for, with the same encoder arguments, and for long enough
+    that failures which only appear after a few seconds still show up.
+    """
+    from . import planner  # local import: planner imports this module
+
+    src = ["-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=24", "-frames:v", "120"]
     if encoder == "av1_qsv":
         args = [
             "-init_hw_device", f"qsv=hw,child_device={device}",
             "-filter_hw_device", "hw",
             *src,
-            "-vf", "format=nv12,hwupload=extra_hw_frames=16",
-            "-c:v", "av1_qsv", "-global_quality", "30",
+            "-vf", f"format={pix_fmt},hwupload=extra_hw_frames=64",
+            *planner.qsv_encoder_args(30, 6, 120, low_power),
+            "-f", "null", "-",
         ]
-        if low_power:
-            args += ["-low_power", "1"]
-        args += ["-f", "null", "-"]
     elif encoder == "av1_vaapi":
         args = [
             "-vaapi_device", device,
             *src,
-            "-vf", "format=nv12,hwupload",
+            "-vf", f"format={pix_fmt},hwupload",
             "-c:v", "av1_vaapi", "-qp", "30",
             "-f", "null", "-",
         ]
@@ -179,23 +201,77 @@ async def _smoke_test(encoder: str, device: str, low_power: bool) -> tuple[bool,
             "-init_hw_device", f"qsv=hw,child_device={device}",
             "-filter_hw_device", "hw",
             *src,
-            "-vf", "format=nv12,hwupload=extra_hw_frames=16",
+            "-vf", f"format={pix_fmt},hwupload=extra_hw_frames=64",
             "-c:v", "hevc_qsv", "-global_quality", "28",
             "-f", "null", "-",
         ]
     elif encoder == "libsvtav1":
-        args = [*src, "-c:v", "libsvtav1", "-crf", "40", "-preset", "12", "-f", "null", "-"]
+        sw_fmt = "yuv420p10le" if pix_fmt in ("p010le", "yuv420p10le") else "yuv420p"
+        args = [*src, "-vf", f"format={sw_fmt}", "-c:v", "libsvtav1",
+                "-crf", "40", "-preset", "12", "-f", "null", "-"]
     else:
         return False, f"unbekannter Encoder {encoder}"
 
     try:
-        code, _, err = await ffmpeg.run_simple(["-y", *args], timeout=90)
+        code, _, err = await ffmpeg.run_simple(["-y", *args], timeout=180)
     except ffmpeg.FFmpegError as exc:
         return False, str(exc)
     if code == 0:
         return True, ""
-    tail = [ln for ln in err.strip().splitlines() if ln.strip()][-3:]
-    return False, " | ".join(tail)[:300]
+    return False, first_error_line(err)
+
+
+async def _decode_path_test(device: str, low_power: bool, pix_fmt: str) -> tuple[bool, str]:
+    """Does the whole decode -> convert -> encode chain hold up?
+
+    Encoding from a generated pattern proves the encoder works; it says nothing
+    about decoding on the GPU and handing surfaces straight to the encoder,
+    which is where a full-hardware transcode actually tends to break.  So this
+    builds a throwaway 8-bit H.264 file and runs the exact command shape the
+    planner produces - including the 8-to-10-bit conversion the encoder cannot
+    do by itself.
+
+    A failure here disables GPU *decoding* only.  The encoder stays in use, and
+    decoding falls back to the CPU, which costs some throughput but keeps the
+    expensive half on the GPU.
+    """
+    import tempfile
+    from pathlib import Path as _Path
+
+    from . import planner
+
+    tmp = _Path(tempfile.gettempdir()) / "optimizarr-hwprobe.mp4"
+    try:
+        code, _, err = await ffmpeg.run_simple([
+            "-y", "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=24",
+            "-frames:v", "120", "-c:v", "libx264", "-preset", "ultrafast",
+            "-pix_fmt", "yuv420p", str(tmp),
+        ], timeout=120)
+        if code != 0:
+            return False, "Testdatei konnte nicht erzeugt werden"
+
+        code, _, err = await ffmpeg.run_simple([
+            "-y",
+            "-init_hw_device", f"qsv=hw,child_device={device}",
+            "-filter_hw_device", "hw",
+            "-hwaccel", "qsv", "-hwaccel_output_format", "qsv",
+            "-hwaccel_device", "hw", "-extra_hw_frames", "16",
+            "-i", str(tmp), "-map", "0:v:0", "-an", "-sn", "-dn",
+            "-vf", f"vpp_qsv=format={pix_fmt}",
+            *planner.qsv_encoder_args(30, 6, 120, low_power),
+            "-f", "null", "-",
+        ], timeout=180)
+    except ffmpeg.FFmpegError as exc:
+        return False, str(exc)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    if code == 0:
+        return True, ""
+    return False, first_error_line(err)
 
 
 async def detect(device: str = "/dev/dri/renderD128", low_power: bool = True,
@@ -277,6 +353,24 @@ async def detect(device: str = "/dev/dri/renderD128", low_power: bool = True,
             rep.recommended_encoder = "av1_vaapi"
         else:
             rep.recommended_encoder = "svt_av1"
+
+        # --- can the GPU also feed itself? -------------------------------- #
+        # Encoding from a generated pattern says nothing about decoding on the
+        # GPU and passing surfaces straight to the encoder.  That half fails on
+        # its own often enough to be worth a separate verdict: if it does, only
+        # GPU decoding is switched off, and the encoder - the expensive half -
+        # keeps running.
+        if rep.encoders["av1_qsv"].verified:
+            ok_decode, decode_reason = await _decode_path_test(device, low_power, "p010le")
+            rep.hw_decode_usable = ok_decode
+            rep.hw_decode_reason = decode_reason
+            if not ok_decode:
+                rep.notes.append(
+                    "Das Dekodieren auf der GPU funktioniert auf diesem System nicht "
+                    f"({decode_reason}). Optimizarr kodiert weiterhin auf der GPU und "
+                    "dekodiert auf der CPU - etwas langsamer, aber stabil."
+                )
+                log.warning("GPU decode path unusable: %s", decode_reason)
 
         # --- human summary for the dashboard ---
         if rep.hw_av1_encode:

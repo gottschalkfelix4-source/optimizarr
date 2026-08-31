@@ -128,7 +128,24 @@ wenn die durchläuft, gilt ein Encoder als nutzbar.
 | Keine GPU | SVT-AV1 auf der CPU |
 
 Schlägt ein Hardware-Encode unterwegs fehl, wird der Job automatisch auf der CPU
-wiederholt, statt als Fehler zu enden.
+wiederholt, statt als Fehler zu enden — mit der ffmpeg-Fehlermeldung und dem verwendeten
+Befehl im Job-Protokoll, damit nachvollziehbar bleibt, warum.
+
+Encoden und Dekodieren auf der GPU werden **getrennt** geprüft. Kann die GPU zwar
+encodieren, aber ihre eigenen Frames nicht zuverlässig entgegennehmen, verliert nur das
+Dekodieren die Beschleunigung — die teure Hälfte bleibt auf der GPU.
+
+### Wenn trotzdem auf die CPU zurückgefallen wird
+
+```bash
+curl -sL https://raw.githubusercontent.com/gottschalkfelix4-source/optimizarr/main/scripts/intel-diagnose.sh | docker exec -i Optimizarr sh
+```
+
+Das Skript probiert die Varianten einzeln durch — 10-Bit-Ausgabe, GPU-Dekodierung,
+einzelne Encoder-Parameter, VAAPI als Alternative — und zeigt, welche auf deiner Karte
+trägt. Nützlich vor allem dann, wenn die Erkennung die GPU als einsatzbereit meldet und
+die echten Jobs trotzdem umschwenken: dann unterscheidet sich der echte Encode in einem
+Detail vom Prüflauf.
 
 ---
 
