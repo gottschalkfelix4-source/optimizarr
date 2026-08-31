@@ -257,7 +257,9 @@ export interface SystemInfo {
   advisor: {
     sdk_installed: boolean;
     enabled: boolean;
+    provider: AdvisorProviderId;
     configured: boolean;
+    reason: string;
     model: string;
     calls_used: number;
   };
@@ -320,6 +322,54 @@ export interface FileListResponse {
   page_size: number;
   pages: number;
   aggregate: { count: number; total_size: number; potential_saving: number };
+}
+
+export type AdvisorProviderId = "anthropic" | "openai_compatible" | "openai_codex";
+
+export interface AdvisorProviderInfo {
+  id: AdvisorProviderId;
+  label: string;
+  hint: string;
+  needs: string[];
+  sdk_installed: boolean;
+}
+
+export interface CodexStatus {
+  signed_in: boolean;
+  account_label?: string;
+  plan_type?: string;
+  account_id_present?: boolean;
+  expires_at?: string | null;
+  expired?: boolean;
+  can_refresh?: boolean;
+  last_refresh?: string | null;
+  last_error?: string;
+  known_models?: string[];
+  redirect_uri?: string;
+}
+
+export interface AdvisorOverview {
+  active: AdvisorProviderId;
+  enabled: boolean;
+  ready: boolean;
+  reason: string;
+  providers: AdvisorProviderInfo[];
+  codex: CodexStatus;
+  calls_used: number;
+  budget_left: number;
+}
+
+export interface AdvisorTestResult {
+  ok: boolean;
+  message: string;
+  provider: string;
+  capabilities?: {
+    structured: string;
+    structured_label: string;
+    token_field: string;
+    send_temperature: boolean;
+    send_system_role: boolean;
+  };
 }
 
 export interface Settings {
@@ -420,8 +470,18 @@ export interface Settings {
   };
   advisor: {
     enabled: boolean;
+    provider: AdvisorProviderId;
     api_key: string;
     model: string;
+    openai_base_url: string;
+    openai_api_key: string;
+    openai_model: string;
+    openai_structured_mode: "auto" | "json_schema" | "json_object" | "prompt";
+    openai_max_tokens: number;
+    openai_temperature: number;
+    openai_send_system_role: boolean;
+    codex_model: string;
+    codex_reasoning_effort: "low" | "medium" | "high";
     mode: "uncertain_only" | "all_candidates" | "explain_only";
     allow_setting_changes: boolean;
     max_crf_delta: number;
@@ -460,6 +520,32 @@ export const endpoints = {
       "/system/render-devices",
     ),
   refitModel: () => api.post<ModelStats>("/system/refit-model"),
+
+  advisorOverview: () => api.get<AdvisorOverview>("/advisor/providers"),
+  advisorTest: (payload: Record<string, string>) =>
+    api.post<AdvisorTestResult>("/advisor/test", payload),
+  advisorOpenAIModels: (baseUrl: string, apiKey: string) =>
+    api.get<{ ok: boolean; models: string[]; message: string }>(
+      `/advisor/openai/models?base_url=${encodeURIComponent(baseUrl)}&api_key=${encodeURIComponent(apiKey)}`,
+    ),
+  codexStart: () =>
+    api.post<{ authorize_url: string; state: string; redirect_uri: string; instructions: string }>(
+      "/advisor/codex/start",
+    ),
+  codexComplete: (pasted: string, state?: string) =>
+    api.post<{ ok: boolean; message: string; status: CodexStatus }>("/advisor/codex/complete", {
+      pasted,
+      state,
+    }),
+  codexImport: (authJson: string) =>
+    api.post<{ ok: boolean; message: string; status: CodexStatus }>("/advisor/codex/import", {
+      auth_json: authJson,
+    }),
+  codexLogout: () => api.post<{ ok: boolean; message: string }>("/advisor/codex/logout"),
+  codexModels: (refresh = false) =>
+    api.get<{ ok: boolean; models: string[]; message: string }>(
+      `/advisor/codex/models?refresh=${refresh}`,
+    ),
 
   settings: () => api.get<Settings>("/settings"),
   saveSettings: (patch: SettingsPatch) => api.put<Settings>("/settings", patch),

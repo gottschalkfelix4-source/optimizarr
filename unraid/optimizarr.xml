@@ -20,9 +20,14 @@
     Statt pauschal alles neu zu kodieren, misst Optimizarr nach: es schneidet kurze
     Ausschnitte aus jeder Datei, kodiert sie testweise und rechnet das Ergebnis hoch. Aus
     jeder abgeschlossenen Konvertierung lernt ein Modell dazu, sodass die Vorhersagen mit
-    der Zeit genauer werden. Optional kann die Claude-API hinzugeschaltet werden, die
-    erkennt, ob es sich um Anime, koerniges Filmmaterial oder eine dunkle Konzertaufnahme
-    handelt, und die Einstellungen entsprechend anpasst.
+    der Zeit genauer werden.
+
+    Optional laesst sich ein KI-Berater zuschalten, der erkennt, ob es sich um Anime,
+    koerniges Filmmaterial oder eine dunkle Konzertaufnahme handelt, und die Einstellungen
+    entsprechend anpasst. Zur Wahl stehen die Claude-API, eine Anmeldung mit dem
+    ChatGPT-Konto (wie beim Codex-CLI) oder ein beliebiger OpenAI-kompatibler Endpunkt -
+    auch ein lokal laufender wie Ollama oder LM Studio. Ohne Berater arbeitet Optimizarr
+    vollstaendig eigenstaendig und ohne jede Verbindung nach aussen.
 
     Eine Datei wird nur dann ersetzt, wenn das Ergebnis kleiner UND technisch einwandfrei
     ist. Faellt eine der Pruefungen durch, wird das Ergebnis verworfen und das Original

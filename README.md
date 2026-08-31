@@ -56,14 +56,40 @@ genauer, weil sie deine Bibliothek und deine Hardware kennenlernt.
 
 Messwerte sehen nicht, *was* für ein Film das ist. Ein flächiger Anime verträgt einen
 deutlich höheren CRF, ein körniger 70er-Jahre-Klassiker braucht Filmkorn-Synthese, eine
-dunkle Konzertaufnahme neigt zu Banding. Wenn du einen Anthropic-API-Schlüssel hinterlegst,
-bekommt Claude die Messwerte und den Dateinamen und darf die Einstellungen nachjustieren –
-innerhalb eines Rahmens, den du festlegst (standardmäßig maximal ±4 CRF).
+dunkle Konzertaufnahme neigt zu Banding. Der Berater bekommt die Messwerte und den
+Dateinamen und darf die Einstellungen nachjustieren – innerhalb eines Rahmens, den du
+festlegst (standardmäßig maximal ±4 CRF).
 
-Der Berater ist strikt optional und niemals blockierend: kein Schlüssel, Zeitüberschreitung
-oder Rate-Limit führen einfach dazu, dass die lokale Entscheidung gilt. Standardmäßig wird
-er nur bei unsicheren Einschätzungen befragt, und ein hartes Anfragelimit pro Scan
-begrenzt die Kosten.
+Drei Anbieter stehen zur Wahl, einer ist jeweils aktiv:
+
+| Anbieter | Was du brauchst | Wofür |
+|---|---|---|
+| **Claude (Anthropic API)** | API-Schlüssel von console.anthropic.com | Beste Einschätzung, Abrechnung pro Anfrage |
+| **ChatGPT-Anmeldung (Codex)** | Ein ChatGPT-Konto, Anmeldung im Browser | Nutzt das bestehende Abo statt separater Guthaben |
+| **OpenAI-kompatibler Endpunkt** | URL, Modellname, optional ein Schlüssel | OpenAI, OpenRouter, Groq, DeepSeek – oder lokal via Ollama, LM Studio, vLLM, LocalAI |
+
+Der Berater ist strikt optional und niemals blockierend: kein Schlüssel, Zeitüberschreitung,
+Rate-Limit oder ein Endpunkt, der nicht antwortet, führen einfach dazu, dass die lokale
+Entscheidung gilt. Standardmäßig wird er nur bei unsicheren Einschätzungen befragt, und ein
+hartes Anfragelimit pro Scan begrenzt die Kosten.
+
+**Beim OpenAI-kompatiblen Endpunkt** handelt Optimizarr beim ersten Aufruf selbst aus, was
+der Dienst kann: erzwungenes JSON-Schema, JSON-Modus oder nur eine Prompt-Anweisung – und
+ebenso, ob er `max_tokens` oder `max_completion_tokens` erwartet und ob er eine
+System-Nachricht akzeptiert. Was funktioniert hat, wird gemerkt. Damit läuft derselbe
+Code gegen die aktuelle OpenAI-API und gegen ein zwei Jahre altes Ollama.
+
+> **Zur ChatGPT-Anmeldung, damit du es vorher weißt:** Dieser Weg meldet sich so an wie
+> OpenAIs eigenes Codex-Kommandozeilenwerkzeug. Vorgesehen ist er für OpenAIs Anwendungen;
+> für Drittprogramme wie Optimizarr ist das eine Grauzone, und OpenAI kann den Zugang
+> jederzeit einschränken. Wenn du das vermeiden möchtest, nimm einen Platform-API-Schlüssel
+> über den Punkt *OpenAI-kompatibler Endpunkt* – der ist der offiziell vorgesehene Weg.
+
+Weil Optimizarr im Container läuft und dein Browser woanders, kann es den OAuth-Rücksprung
+nicht selbst auffangen. Der Anmelde-Assistent führt deshalb durch drei Schritte: Link
+öffnen, anmelden, und die Adresse der (absichtlich fehlschlagenden) Zielseite zurück ins
+Feld kopieren. Wer das Codex-CLI schon eingerichtet hat, kann stattdessen den Inhalt von
+`~/.codex/auth.json` einfügen.
 
 ---
 
@@ -206,9 +232,15 @@ backend/app/
     planner.py     Analyse-Ergebnis -> ffmpeg-Kommandozeile
     analyzer.py    Entscheidungslogik (die drei Stufen)
     encoder.py     Job-Ausführung und die Sicherheits-Gates
-    advisor.py     optionale Claude-API-Schicht
     scanner.py     Bibliotheks-Scan
     worker.py      Warteschlange und Zeitplan
+    advisor/
+      base.py              gemeinsamer Prompt, Schema, Antwort-Absicherung
+      service.py           Budget, Anbieterwahl, Grenzwerte
+      provider_anthropic.py
+      provider_openai.py   OpenAI-kompatibel, mit Laufzeit-Aushandlung
+      provider_codex.py    ChatGPT-Backend
+      codex_oauth.py       PKCE-Anmeldung ohne lokalen Browser
 frontend/src/      React + Tailwind
 unraid/            Community-Applications-Template
 ```

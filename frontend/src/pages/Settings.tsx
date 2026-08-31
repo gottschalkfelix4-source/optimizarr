@@ -17,11 +17,11 @@ import {
   RotateCcw,
   Save,
   Shield,
-  Sparkles,
   Trash2,
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import { AdvisorSettings } from "../components/AdvisorSettings";
 import { endpoints, type Settings, type SettingsPatch } from "../lib/api";
 import { bytes, number } from "../lib/format";
 import { useToast } from "../lib/live";
@@ -126,7 +126,7 @@ export default function SettingsPage() {
       {tab === "output" && <OutputTab draft={draft} update={update} />}
       {tab === "queue" && <QueueTab draft={draft} update={update} />}
       {tab === "hardware" && <HardwareTab draft={draft} update={update} />}
-      {tab === "advisor" && <AdvisorTab draft={draft} update={update} />}
+      {tab === "advisor" && <AdvisorSettings draft={draft} update={update} />}
       {tab === "system" && <SystemTab />}
 
       {/* ---------------- save bar ---------------- */}
@@ -1468,166 +1468,6 @@ function HardwareTab({ draft, update }: { draft: Settings; update: UpdateFn }) {
           </dl>
         </Panel>
       )}
-    </div>
-  );
-}
-
-/* -------------------------------------------------------------------------- */
-/* Advisor                                                                    */
-/* -------------------------------------------------------------------------- */
-
-function AdvisorTab({ draft, update }: { draft: Settings; update: UpdateFn }) {
-  const { push } = useToast();
-  const [testing, setTesting] = useState(false);
-  const { data: info } = useQuery({ queryKey: ["system"], queryFn: endpoints.systemInfo });
-
-  const test = useMutation({
-    mutationFn: () =>
-      endpoints.testAdvisor({ api_key: draft.advisor.api_key, model: draft.advisor.model }),
-    onMutate: () => setTesting(true),
-    onSettled: () => setTesting(false),
-    onSuccess: (result) => push(result.message, result.ok ? "success" : "error"),
-    onError: (e: Error) => push(e.message, "error"),
-  });
-
-  return (
-    <div className="space-y-4">
-      <Callout tone="info" icon={<Sparkles className="size-4" />}>
-        Die lokale Analyse entscheidet auch ohne diese Funktion vollstaendig eigenstaendig. Der
-        KI-Berater ergaenzt das, was Messwerte nicht sehen koennen: ob ein Film ein koerniger
-        Klassiker ist, ein flaechiger Anime oder eine dunkle Konzertaufnahme - und passt CRF und
-        Filmkorn entsprechend an. Jede Aenderung wird auf den eingestellten Rahmen begrenzt.
-      </Callout>
-
-      {!info?.advisor.sdk_installed && (
-        <Callout tone="warn">
-          Das Python-Paket <code>anthropic</code> ist im Container nicht installiert - der Berater
-          bleibt deaktiviert.
-        </Callout>
-      )}
-
-      <Panel title="Claude-API">
-        <div className="space-y-5">
-          <Toggle
-            checked={draft.advisor.enabled}
-            onChange={(enabled) => update("advisor", { enabled })}
-            label="KI-Berater verwenden"
-            hint="Ohne Aktivierung werden keinerlei Daten nach aussen gesendet."
-          />
-
-          {draft.advisor.enabled && (
-            <>
-              <div className="grid gap-5 md:grid-cols-2">
-                <Field
-                  label="API-Schluessel"
-                  hint="Wird in der lokalen Datenbank gespeichert und nur an die Anthropic-API gesendet."
-                >
-                  <div className="flex gap-2">
-                    <input
-                      type="password"
-                      className="field font-mono text-sm"
-                      value={draft.advisor.api_key}
-                      onChange={(e) => update("advisor", { api_key: e.target.value })}
-                      placeholder="sk-ant-..."
-                      autoComplete="off"
-                    />
-                    <button
-                      className="btn-ghost shrink-0"
-                      onClick={() => test.mutate()}
-                      disabled={testing || !draft.advisor.api_key}
-                    >
-                      {testing ? <Spinner className="size-4" /> : <Check className="size-4" />}
-                      Testen
-                    </button>
-                  </div>
-                </Field>
-                <Field label="Modell">
-                  <Select
-                    value={draft.advisor.model}
-                    onChange={(model) => update("advisor", { model })}
-                    options={[
-                      { value: "claude-opus-5", label: "Claude Opus 5 (beste Einschaetzung)" },
-                      { value: "claude-sonnet-5", label: "Claude Sonnet 5 (guenstiger)" },
-                      { value: "claude-haiku-4-5", label: "Claude Haiku 4.5 (am guenstigsten)" },
-                    ]}
-                  />
-                </Field>
-                <Field
-                  label="Wann gefragt wird"
-                  hint="Jede Anfrage kostet Geld. 'Nur bei Unsicherheit' fragt genau dann, wenn es etwas bringt."
-                >
-                  <Select
-                    value={draft.advisor.mode}
-                    onChange={(mode) => update("advisor", { mode })}
-                    options={[
-                      { value: "uncertain_only", label: "Nur bei unsicherer Einschaetzung (empfohlen)" },
-                      { value: "all_candidates", label: "Bei jedem Kandidaten" },
-                      { value: "explain_only", label: "Nur erklaeren, nichts aendern" },
-                    ]}
-                  />
-                </Field>
-                <Field label="Maximale Anfragen pro Scan" hint="Harte Obergrenze fuer die Kosten.">
-                  <NumberField
-                    value={draft.advisor.max_calls_per_scan}
-                    onChange={(max_calls_per_scan) => update("advisor", { max_calls_per_scan })}
-                    min={0}
-                    max={5000}
-                  />
-                </Field>
-                {draft.advisor.mode === "uncertain_only" && (
-                  <Field
-                    label="Unsicher unterhalb von"
-                    hint="Bezieht sich auf die Sicherheit der lokalen Schaetzung."
-                  >
-                    <SliderField
-                      value={draft.advisor.uncertain_below_confidence}
-                      onChange={(uncertain_below_confidence) =>
-                        update("advisor", { uncertain_below_confidence })
-                      }
-                      min={0}
-                      max={1}
-                      step={0.05}
-                      format={(v) => `${Math.round(v * 100)} %`}
-                    />
-                  </Field>
-                )}
-                <Field
-                  label="Maximale CRF-Verschiebung"
-                  hint="Begrenzt, wie stark die KI die Qualitaetseinstellung veraendern darf."
-                >
-                  <NumberField
-                    value={draft.advisor.max_crf_delta}
-                    onChange={(max_crf_delta) => update("advisor", { max_crf_delta })}
-                    min={0}
-                    max={15}
-                  />
-                </Field>
-              </div>
-
-              <div className="space-y-3 border-t border-ink-800 pt-5">
-                <Toggle
-                  checked={draft.advisor.allow_setting_changes}
-                  onChange={(allow_setting_changes) => update("advisor", { allow_setting_changes })}
-                  label="Einstellungen anpassen lassen"
-                  hint="Aus: die KI liefert nur eine Begruendung, aendert aber keine Werte."
-                />
-                <Toggle
-                  checked={draft.advisor.include_filename}
-                  onChange={(include_filename) => update("advisor", { include_filename })}
-                  label="Dateinamen mitsenden"
-                  hint="Hilft beim Erkennen von Anime, Klassikern oder Handyaufnahmen. Aus, wenn dir das zu viel Information ist."
-                />
-              </div>
-
-              {info?.advisor.calls_used ? (
-                <p className="text-xs text-ink-500">
-                  In diesem Scan wurden bisher {info.advisor.calls_used} Anfragen gestellt.
-                </p>
-              ) : null}
-            </>
-          )}
-        </div>
-      </Panel>
     </div>
   );
 }

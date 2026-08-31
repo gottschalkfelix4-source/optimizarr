@@ -177,26 +177,77 @@ class HardwareSettings(BaseModel):
 
 
 class AdvisorSettings(BaseModel):
-    """Optional Claude API layer that reviews the local decision."""
+    """Optional AI layer that reviews the local decision.
+
+    Three backends are supported and only one is active at a time.  The local
+    analyzer works entirely without any of them; the advisor can only refine a
+    decision that has already been made.
+    """
 
     enabled: bool = False
+    provider: Literal["anthropic", "openai_compatible", "openai_codex"] = Field(
+        "anthropic",
+        description=(
+            "anthropic = Claude API key; "
+            "openai_compatible = any OpenAI-style endpoint (URL + model + key); "
+            "openai_codex = sign in with a ChatGPT account via the browser"
+        ),
+    )
+
+    # --- Anthropic ---
     api_key: str = ""
     model: str = "claude-opus-5"
+
+    # --- any OpenAI-compatible endpoint (OpenAI, OpenRouter, Ollama, LM Studio, ...) ---
+    openai_base_url: str = Field(
+        "", description="Base URL, e.g. https://api.openai.com/v1 or http://192.168.1.5:11434/v1"
+    )
+    openai_api_key: str = ""
+    openai_model: str = Field("", description="Model name exactly as the endpoint expects it")
+    openai_structured_mode: Literal["auto", "json_schema", "json_object", "prompt"] = Field(
+        "auto",
+        description=(
+            "How to force JSON. auto probes what the endpoint accepts and remembers it; "
+            "prompt works everywhere but is the least reliable"
+        ),
+    )
+    openai_max_tokens: int = Field(4000, ge=256, le=32000)
+    openai_temperature: float = Field(0.2, ge=0.0, le=2.0)
+    openai_send_system_role: bool = Field(
+        True, description="Some endpoints reject a system message - turn this off if so"
+    )
+
+    # --- ChatGPT sign-in (Codex).  Tokens live in the oauth_credentials table. ---
+    codex_model: str = Field(
+        "gpt-5.6-sol",
+        description=(
+            "Model requested over the ChatGPT backend. Slugs rotate and depend on the "
+            "plan - the settings screen can fetch the account's actual list."
+        ),
+    )
+    codex_reasoning_effort: Literal["low", "medium", "high"] = "low"
+
+    # --- shared behaviour ---
     mode: Literal["uncertain_only", "all_candidates", "explain_only"] = Field(
         "uncertain_only",
         description=(
-            "uncertain_only asks Claude when the local model is unsure; "
+            "uncertain_only asks when the local model is unsure; "
             "all_candidates asks for every file; explain_only never changes settings"
         ),
     )
-    allow_setting_changes: bool = Field(True, description="Let Claude nudge CRF/preset/grain")
-    max_crf_delta: int = Field(4, ge=0, le=15, description="Clamp on how far Claude may move CRF")
+    allow_setting_changes: bool = Field(True, description="Let the advisor nudge CRF/grain")
+    max_crf_delta: int = Field(4, ge=0, le=15, description="Clamp on how far the advisor may move CRF")
     max_calls_per_scan: int = Field(50, ge=0, le=5000)
     uncertain_below_confidence: float = Field(0.6, ge=0.0, le=1.0)
     timeout_seconds: int = Field(45, ge=5, le=300)
     include_filename: bool = Field(
-        True, description="Filenames help Claude spot anime, grainy classics, cam rips"
+        True, description="Filenames help spot anime, grainy classics, cam rips"
     )
+
+    @field_validator("openai_base_url")
+    @classmethod
+    def _clean_base_url(cls, v: str) -> str:
+        return v.strip().rstrip("/")
 
 
 class NotificationSettings(BaseModel):

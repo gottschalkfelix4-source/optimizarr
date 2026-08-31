@@ -43,13 +43,7 @@ async def system_info() -> dict[str, Any]:
         },
         "hardware": hw.to_dict() if hw else None,
         "learning_model": model.stats(),
-        "advisor": {
-            "sdk_installed": sdk_available(),
-            "enabled": settings.advisor.enabled,
-            "configured": bool(settings.advisor.api_key),
-            "model": settings.advisor.model,
-            "calls_used": get_advisor(settings.advisor).calls_used,
-        },
+        "advisor": _advisor_info(settings),
         "scan": scanner.state.snapshot(),
         "queue": worker.queue_worker.status(),
         "next_scan": worker.scheduler.next_scan.isoformat() if worker.scheduler.next_scan else None,
@@ -58,6 +52,21 @@ async def system_info() -> dict[str, Any]:
             "transcode": str(cfg.TRANSCODE_DIR),
             "transcode_free_gb": round(_free_gb(cfg.TRANSCODE_DIR), 1),
         },
+    }
+
+
+def _advisor_info(settings) -> dict[str, Any]:
+    """Which backend is active and whether it could actually answer right now."""
+    advisor = get_advisor(settings.advisor)
+    ready, reason = advisor.readiness()
+    return {
+        "sdk_installed": sdk_available(),
+        "enabled": settings.advisor.enabled,
+        "provider": settings.advisor.provider,
+        "configured": ready,
+        "reason": reason,
+        "model": advisor.provider.describe_model(),
+        "calls_used": advisor.calls_used,
     }
 
 
@@ -144,19 +153,10 @@ def set_profile(name: str) -> dict[str, Any]:
 
 @router.post("/settings/test-advisor")
 async def test_advisor(payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Verify the Claude API key from the settings screen."""
-    settings = load_settings()
-    advisor_cfg = settings.advisor.model_copy()
-    if payload:
-        if payload.get("api_key"):
-            advisor_cfg.api_key = str(payload["api_key"])
-        if payload.get("model"):
-            advisor_cfg.model = str(payload["model"])
-    advisor = get_advisor(advisor_cfg, force_new=True)
-    ok, message = await advisor.test_connection()
-    # Rebuild the shared advisor from the persisted settings afterwards.
-    get_advisor(settings.advisor, force_new=True)
-    return {"ok": ok, "message": message}
+    """Kept for compatibility - the provider-aware version lives in routes_advisor."""
+    from .routes_advisor import TestRequest, test_provider
+
+    return await test_provider(TestRequest(**(payload or {})))
 
 
 @router.post("/settings/reset")

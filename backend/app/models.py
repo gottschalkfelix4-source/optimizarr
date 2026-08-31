@@ -211,6 +211,46 @@ class LearningSample(Base):
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow)
 
 
+class OAuthCredential(Base):
+    """Tokens obtained by signing in to a provider through the browser.
+
+    Deliberately not part of ``settings``: these are secrets with a lifecycle of
+    their own (they refresh, they expire, they get revoked), and they must never
+    be round-tripped through the settings form.
+    """
+
+    __tablename__ = "oauth_credentials"
+
+    provider: Mapped[str] = mapped_column(String(32), primary_key=True)  # openai_codex
+    access_token: Mapped[str] = mapped_column(Text, default="")
+    refresh_token: Mapped[str] = mapped_column(Text, default="")
+    id_token: Mapped[str] = mapped_column(Text, default="")
+    account_id: Mapped[str] = mapped_column(String(128), default="")
+    account_label: Mapped[str] = mapped_column(String(255), default="")  # e-mail / plan, for display
+    plan_type: Mapped[str] = mapped_column(String(64), default="")
+    expires_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    last_refresh: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class OAuthFlow(Base):
+    """A sign-in that has been started but not finished.
+
+    Survives a container restart between "open this link" and "here is the code",
+    which an in-memory dict would not.
+    """
+
+    __tablename__ = "oauth_flows"
+
+    state: Mapped[str] = mapped_column(String(128), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), default="")
+    code_verifier: Mapped[str] = mapped_column(Text, default="")
+    redirect_uri: Mapped[str] = mapped_column(String(512), default="")
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class HistoryEntry(Base):
     """Human-readable activity feed shown on the dashboard."""
 

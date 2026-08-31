@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .api import routes_jobs, routes_library, routes_system
+from .api import routes_advisor, routes_jobs, routes_library, routes_system
 from .config import CONFIG_DIR, TRANSCODE_DIR, load_settings, save_settings
 from .core import hwaccel, scanner, worker
 from .core.events import bus
@@ -127,6 +127,7 @@ app.add_middleware(
 app.include_router(routes_system.router, prefix="/api", tags=["system"])
 app.include_router(routes_library.router, prefix="/api", tags=["library"])
 app.include_router(routes_jobs.router, prefix="/api", tags=["jobs"])
+app.include_router(routes_advisor.router, prefix="/api", tags=["advisor"])
 
 
 @app.exception_handler(Exception)
