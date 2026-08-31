@@ -43,6 +43,7 @@ class EncodeOutcome:
     elapsed: float = 0.0
     log_tail: str = ""
     fell_back_to_cpu: bool = False
+    hw_failure_reason: str = ""        # why the GPU path was abandoned
 
 
 class JobCancelled(Exception):
@@ -255,16 +256,41 @@ async def run_job(
 
         # --- hardware encoders fail in creative ways; retry on the CPU ---- #
         if code != 0 and plan.is_hardware and settings.hardware.fallback_to_cpu:
-            log.warning("hardware encode failed for %s, retrying on CPU", source)
-            _append_log(job_id, "Hardware-Encoding fehlgeschlagen - Wiederholung mit SVT-AV1 (CPU).")
+            # Record *why* it failed.  A bare "fell back to CPU" is useless: the
+            # GPU is then quietly unused for every future job and the reason is
+            # gone, so the actual ffmpeg output and the command that produced it
+            # both go into the job log.
+            reason = _first_error_line(log_tail)
+            failed_args = planner.build_ffmpeg_args(plan, info, info.path, str(temp_out))
+            log.warning("hardware encode failed for %s: %s", source, reason)
+            _append_log(job_id, (
+                f"Hardware-Encoding ({plan.encoder}) fehlgeschlagen - Wiederholung mit "
+                f"SVT-AV1 (CPU).\n"
+                f"  Grund: {reason}\n"
+                f"  Befehl: ffmpeg {' '.join(failed_args)}\n"
+                f"  Vollstaendige Ausgabe:\n"
+                + "\n".join(f"    {line}" for line in log_tail.strip().splitlines()[-15:])
+            ))
             bus.publish("job.log", {
                 "job_id": job_id,
-                "message": "Hardware-Encoding fehlgeschlagen - Neuversuch auf der CPU.",
+                "message": f"Hardware-Encoding fehlgeschlagen ({reason}) - Neuversuch auf der CPU.",
             })
+            with session_scope() as s:
+                s.add(HistoryEntry(
+                    level="warning", category="encode", file_id=file_id,
+                    message=(
+                        f"{Path(source).name}: Hardware-Encoding mit {plan.encoder} "
+                        f"fehlgeschlagen - {reason}"
+                    ),
+                    detail={"encoder": plan.encoder, "pix_fmt": plan.pix_fmt,
+                            "hw_decode": plan.hw_decode, "error": reason},
+                ))
+
             plan.encoder = "libsvtav1"
             plan.hw_decode = False
             plan.pix_fmt = "yuv420p10le" if plan.pix_fmt in ("p010le", "yuv420p10le") else "yuv420p"
             outcome.fell_back_to_cpu = True
+            outcome.hw_failure_reason = reason
             temp_out.unlink(missing_ok=True)
             code, log_tail = await _run_encode(
                 plan, info, str(temp_out), job_id, settings, cancel
@@ -589,6 +615,32 @@ def _reject(job_id: int, file_id: int, outcome: EncodeOutcome, message: str) -> 
     bus.publish("job.finished", {"job_id": job_id, "state": "rejected", "message": message})
     log.info("job %s rejected: %s", job_id, message)
     return outcome
+
+
+#: ffmpeg prints plenty of noise before the line that matters.  These are the
+#: shapes that actually explain a failed hardware encode.
+_ERROR_MARKERS = (
+    "error", "failed", "unsupported", "invalid", "cannot", "unable",
+    "no such", "not implemented", "incompatible", "device creation",
+)
+_ERROR_NOISE = ("error_rate", "last message repeated", "deprecated")
+
+
+def _first_error_line(log_tail: str) -> str:
+    """The most explanatory line from an ffmpeg failure.
+
+    Reading the tail backwards finds the summary line ("Error while opening
+    encoder...") before the specific cause, so scan forwards and keep the first
+    line that names a real problem - that is usually the one worth showing.
+    """
+    lines = [ln.strip() for ln in (log_tail or "").splitlines() if ln.strip()]
+    for line in lines:
+        lowered = line.lower()
+        if any(noise in lowered for noise in _ERROR_NOISE):
+            continue
+        if any(marker in lowered for marker in _ERROR_MARKERS):
+            return line[:300]
+    return lines[-1][:300] if lines else "keine Fehlermeldung von ffmpeg"
 
 
 def _fmt(num: int | float) -> str:
