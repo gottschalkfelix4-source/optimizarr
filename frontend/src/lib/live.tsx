@@ -24,6 +24,9 @@ export interface JobProgress {
   speed: number;
   eta_seconds: number;
   current_size: number;
+  /** Seconds of source encoded so far, and the total - used to extrapolate. */
+  out_time?: number;
+  duration?: number;
 }
 
 interface LiveContextValue {
@@ -68,6 +71,16 @@ export function LiveProvider({ children }: { children: ReactNode }) {
   const handleEvent = useCallback(
     (event: LiveEvent) => {
       if (event.type === "ping") return;
+
+      // Progress arrives several times a second.  Storing it in `lastEvent`
+      // too would re-render every consumer of the context for a value only the
+      // progress bars care about.
+      if (event.type === "job.progress") {
+        const d = event.data as unknown as { job_id: number } & JobProgress;
+        setJobProgress((prev) => ({ ...prev, [d.job_id]: d }));
+        return;
+      }
+
       setLastEvent(event);
 
       if (event.type === "hello") {
@@ -84,11 +97,6 @@ export function LiveProvider({ children }: { children: ReactNode }) {
       }
       if (event.type === "scan.finished") {
         setScan((prev) => (prev ? { ...prev, running: false, phase: "idle" } : prev));
-      }
-      if (event.type === "job.progress") {
-        const d = event.data as unknown as { job_id: number } & JobProgress;
-        setJobProgress((prev) => ({ ...prev, [d.job_id]: d }));
-        return; // far too frequent to trigger refetches
       }
       if (event.type === "job.finished") {
         const d = event.data as unknown as { job_id: number };

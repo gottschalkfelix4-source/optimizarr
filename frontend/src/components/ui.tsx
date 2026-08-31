@@ -57,11 +57,15 @@ export function ProgressBar({
   className,
   tone = "brand",
   indeterminate = false,
+  smooth = false,
 }: {
   value: number;
   className?: string;
   tone?: "brand" | "save" | "warn";
   indeterminate?: boolean;
+  /** For values updated many times a second: a short linear transition, so the
+   *  bar glides instead of easing into every tiny step. */
+  smooth?: boolean;
 }) {
   const toneClass =
     tone === "save" ? "bg-save-500" : tone === "warn" ? "bg-warn-500" : "bg-brand-500";
@@ -71,7 +75,13 @@ export function ProgressBar({
         <div className={cn("shimmer absolute inset-0 overflow-hidden", toneClass, "opacity-40")} />
       ) : (
         <div
-          className={cn("h-full rounded-full transition-[width] duration-500 ease-out", toneClass)}
+          className={cn(
+            "h-full rounded-full",
+            smooth
+              ? "transition-[width] duration-150 ease-linear"
+              : "transition-[width] duration-500 ease-out",
+            toneClass,
+          )}
           style={{ width: `${Math.min(100, Math.max(0, value * 100))}%` }}
         />
       )}

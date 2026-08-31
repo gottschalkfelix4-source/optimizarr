@@ -30,6 +30,27 @@ from .planner import EncodePlan
 
 log = logging.getLogger(__name__)
 
+#: How often progress is pushed to the UI.  Fast enough that the bar keeps
+#: moving on its own between updates, slow enough not to flood the socket.
+PROGRESS_INTERVAL = 0.4
+
+#: How often it is written to the database.  Only needed so a restart resumes
+#: with a sane number, so a few seconds of drift costs nothing.
+PERSIST_INTERVAL = 5.0
+
+
+def _persist_progress(job_id: int, snapshot: dict[str, Any]) -> None:
+    """Store the latest progress.  Runs in a worker thread."""
+    try:
+        with session_scope() as s:
+            row = s.get(Job, job_id)
+            if row is None:
+                return
+            for key, value in snapshot.items():
+                setattr(row, key, value)
+    except Exception:  # progress bookkeeping must never break an encode
+        log.debug("could not persist progress for job %s", job_id, exc_info=True)
+
 
 @dataclass
 class EncodeOutcome:
@@ -155,32 +176,50 @@ async def _run_encode(
     loop = asyncio.get_running_loop()
     started = loop.time()
     last_push = 0.0
+    last_persist = 0.0
 
     def on_progress(p: ffmpeg.Progress) -> None:
-        nonlocal last_push
+        """Publish progress often, persist it rarely.
+
+        These two have opposite needs.  The UI wants a steady stream so its bar
+        moves smoothly; the database only needs enough to survive a restart.
+        Writing on every update put a synchronous SQLite transaction in the
+        event loop several times a second, which delayed the very messages it
+        was meant to accompany.
+        """
+        nonlocal last_push, last_persist
         now = loop.time()
-        if now - last_push < 1.0 and not p.done:
+        if now - last_push < PROGRESS_INTERVAL and not p.done:
             return
         last_push = now
+
         progress = min(1.0, p.out_time / duration) if duration else 0.0
         elapsed = now - started
         eta = int(elapsed / progress - elapsed) if progress > 0.01 else 0
-        payload = {
-            "job_id": job_id, "progress": progress, "fps": p.fps, "speed": p.speed,
+        bus.publish("job.progress", {
+            "job_id": job_id,
+            "progress": progress,
+            "fps": p.fps,
+            "speed": p.speed,
+            "eta_seconds": eta,
+            "current_size": p.total_size,
+            # The client extrapolates between updates; it needs to know how far
+            # along the source we are and how fast that is moving.
+            "out_time": p.out_time,
+            "duration": duration,
+        })
+
+        if not p.done and now - last_persist < PERSIST_INTERVAL:
+            return
+        last_persist = now
+        snapshot = {
+            "progress": progress, "fps": p.fps, "speed": p.speed,
             "eta_seconds": eta, "current_size": p.total_size,
         }
-        bus.publish("job.progress", payload)
-        try:
-            with session_scope() as s:
-                row = s.get(Job, job_id)
-                if row:
-                    row.progress = progress
-                    row.fps = p.fps
-                    row.speed = p.speed
-                    row.eta_seconds = eta
-                    row.current_size = p.total_size
-        except Exception:  # progress updates must never break the encode
-            pass
+        # Off the event loop: a blocked write must never stall the stream.
+        asyncio.get_running_loop().run_in_executor(
+            None, _persist_progress, job_id, snapshot
+        )
 
     return await ffmpeg.run_with_progress(
         args,

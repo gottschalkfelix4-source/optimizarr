@@ -24,9 +24,10 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { endpoints, type MediaFile } from "../lib/api";
+import { endpoints, type Job, type MediaFile } from "../lib/api";
 import { bytes, humanDuration, number, percent, resolutionLabel } from "../lib/format";
-import { useLive, useToast } from "../lib/live";
+import { useLive, useToast, type JobProgress } from "../lib/live";
+import { useSmoothEta, useSmoothProgress } from "../lib/progress";
 import { Callout, EmptyState, Panel, ProgressBar, Skeleton, cn } from "../components/ui";
 
 const CODEC_COLORS: Record<string, string> = {
@@ -218,44 +219,9 @@ export default function Dashboard() {
               }
             />
           ) : (
-            running.map((job) => {
-              const live = jobProgress[job.id];
-              const progress = live?.progress ?? job.progress;
-              const eta = live?.eta_seconds ?? job.eta_seconds;
-              const currentSize = live?.current_size ?? job.current_size;
-              const projected =
-                progress > 0.02 && currentSize > 0 ? currentSize / progress : job.predicted_size;
-              return (
-                <div key={job.id} className="rounded-lg border border-ink-700/60 bg-ink-850/50 p-4">
-                  <div className="flex flex-wrap items-start justify-between gap-2">
-                    <div className="min-w-0 flex-1">
-                      <p className="truncate text-sm font-medium text-ink-100">{job.name}</p>
-                      <p className="mt-0.5 truncate text-xs text-ink-500">
-                        {job.resolution} · {job.plan?.encoder} · CRF {job.plan?.crf}
-                      </p>
-                    </div>
-                    <span className="font-mono text-sm text-brand-400">
-                      {(progress * 100).toFixed(1)} %
-                    </span>
-                  </div>
-                  <ProgressBar value={progress} className="mt-3" />
-                  <div className="mt-2.5 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-ink-400">
-                    {(live?.speed ?? job.speed) > 0 && (
-                      <span>{(live?.speed ?? job.speed).toFixed(2)}x Echtzeit</span>
-                    )}
-                    {(live?.fps ?? job.fps) > 0 && (
-                      <span>{Math.round(live?.fps ?? job.fps)} fps</span>
-                    )}
-                    {eta > 0 && <span>noch {humanDuration(eta)}</span>}
-                    {projected > 0 && job.input_size > 0 && (
-                      <span className="text-save-400">
-                        voraussichtlich {bytes(projected)} statt {bytes(job.input_size)}
-                      </span>
-                    )}
-                  </div>
-                </div>
-              );
-            })
+            running.map((job) => (
+              <ActiveJob key={job.id} job={job} live={jobProgress[job.id]} />
+            ))
           )}
         </Panel>
 
@@ -394,6 +360,45 @@ export default function Dashboard() {
             />
           )}
         </Panel>
+      </div>
+    </div>
+  );
+}
+
+function ActiveJob({ job, live }: { job: Job; live?: JobProgress }) {
+  // Own component rather than inline in the map: the smoothing hooks cannot
+  // run inside a loop.
+  const progress = useSmoothProgress(
+    live ?? { progress: job.progress, speed: job.speed, duration: job.duration },
+  );
+  const eta = useSmoothEta(live?.eta_seconds ?? job.eta_seconds);
+  const currentSize = live?.current_size ?? job.current_size;
+  const projected =
+    progress > 0.02 && currentSize > 0 ? currentSize / progress : job.predicted_size;
+
+  return (
+    <div className="rounded-lg border border-ink-700/60 bg-ink-850/50 p-4">
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-sm font-medium text-ink-100">{job.name}</p>
+          <p className="mt-0.5 truncate text-xs text-ink-500">
+            {job.resolution} · {job.plan?.encoder} · CRF {job.plan?.crf}
+          </p>
+        </div>
+        <span className="font-mono text-sm text-brand-400">{(progress * 100).toFixed(1)} %</span>
+      </div>
+      <ProgressBar value={progress} className="mt-3" smooth />
+      <div className="mt-2.5 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-ink-400">
+        {(live?.speed ?? job.speed) > 0 && (
+          <span>{(live?.speed ?? job.speed).toFixed(2)}x Echtzeit</span>
+        )}
+        {(live?.fps ?? job.fps) > 0 && <span>{Math.round(live?.fps ?? job.fps)} fps</span>}
+        {eta > 0 && <span>noch {humanDuration(eta)}</span>}
+        {projected > 0 && job.input_size > 0 && (
+          <span className="text-save-400">
+            voraussichtlich {bytes(projected)} statt {bytes(job.input_size)}
+          </span>
+        )}
       </div>
     </div>
   );

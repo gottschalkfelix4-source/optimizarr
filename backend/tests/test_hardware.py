@@ -406,3 +406,48 @@ def test_audio_options_stay_stream_specific():
         bare = [a for a in args if a == option]
         assert not bare, f"{option} must carry a stream specifier"
     assert "-b:a:0" in args
+
+
+# --------------------------------------------------------------------------- #
+# Progress reporting
+#
+# The bar looked like it only updated now and then.  Two causes: ffmpeg emitted
+# progress at its own coarse default, and every update wrote to SQLite from the
+# event loop, delaying the messages it accompanied.
+# --------------------------------------------------------------------------- #
+
+def test_progress_interval_is_pinned():
+    """ffmpeg's default emit rate is too coarse for a bar that should glide."""
+    from app.core.ffmpeg import run_with_progress
+    import inspect
+
+    source = inspect.getsource(run_with_progress)
+    assert "-stats_period" in source
+
+
+def test_ui_updates_are_more_frequent_than_database_writes():
+    """Publishing is cheap, persisting is not - they must not share a rate."""
+    from app.core.encoder import PERSIST_INTERVAL, PROGRESS_INTERVAL
+
+    assert PROGRESS_INTERVAL <= 0.5, "updates any slower and the bar visibly steps"
+    assert PERSIST_INTERVAL >= PROGRESS_INTERVAL * 5, (
+        "the database only needs enough to survive a restart"
+    )
+
+
+def test_progress_payload_carries_what_the_client_extrapolates_from():
+    """The client walks the bar forward between updates and needs the inputs."""
+    import inspect
+
+    from app.core import encoder
+
+    source = inspect.getsource(encoder._run_encode)
+    for field in ("out_time", "duration", "speed", "progress"):
+        assert f'"{field}"' in source, f"progress payload is missing {field}"
+
+
+def test_persisting_progress_survives_a_missing_job():
+    """It runs in a worker thread - an exception there would be invisible."""
+    from app.core.encoder import _persist_progress
+
+    _persist_progress(999_999, {"progress": 0.5})  # must not raise

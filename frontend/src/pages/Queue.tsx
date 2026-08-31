@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 import { endpoints, type Job } from "../lib/api";
+import type { JobProgress } from "../lib/live";
 import {
   bytes,
   dateTime,
@@ -23,6 +24,7 @@ import {
   relativeTime,
 } from "../lib/format";
 import { useLive, useToast } from "../lib/live";
+import { useSmoothEta, useSmoothProgress } from "../lib/progress";
 import {
   Callout,
   EmptyState,
@@ -232,11 +234,15 @@ function RunningJob({
   onShowLog,
 }: {
   job: Job;
-  live?: { progress: number; fps: number; speed: number; eta_seconds: number; current_size: number };
+  live?: JobProgress;
   onCancel: () => void;
   onShowLog: () => void;
 }) {
-  const progress = live?.progress ?? job.progress;
+  // The bar keeps moving between updates instead of stepping on each one.
+  const progress = useSmoothProgress(
+    live ?? { progress: job.progress, speed: job.speed, duration: job.duration },
+  );
+  const eta = useSmoothEta(live?.eta_seconds ?? job.eta_seconds);
   const currentSize = live?.current_size ?? job.current_size;
   const projected = progress > 0.02 && currentSize > 0 ? currentSize / progress : job.predicted_size;
   const onTrack = projected > 0 && projected < job.input_size;
@@ -268,12 +274,12 @@ function RunningJob({
         </div>
       </div>
 
-      <ProgressBar value={progress} className="mt-3 h-2.5" />
+      <ProgressBar value={progress} className="mt-3 h-2.5" smooth />
 
       <div className="mt-3 grid grid-cols-2 gap-3 text-xs sm:grid-cols-4">
         <Metric label="Tempo" value={`${(live?.speed ?? job.speed).toFixed(2)}x`} />
         <Metric label="Bilder/s" value={number(Math.round(live?.fps ?? job.fps))} />
-        <Metric label="Restzeit" value={humanDuration(live?.eta_seconds ?? job.eta_seconds)} />
+        <Metric label="Restzeit" value={humanDuration(eta)} />
         <Metric
           label="Hochrechnung"
           value={projected > 0 ? bytes(projected) : "-"}

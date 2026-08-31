@@ -401,7 +401,14 @@ async def run_with_progress(
     Returns (returncode, tail of stderr).  Kills the process if ``cancel_event``
     fires or ``timeout`` elapses.
     """
-    cmd = [FFMPEG, "-hide_banner", "-nostdin", "-progress", "pipe:1", "-nostats", *args]
+    # -stats_period sets how often ffmpeg emits a -progress block.  Left to the
+    # default it is coarse enough that a progress bar visibly steps rather than
+    # moves, so it is pinned here instead of inherited.
+    cmd = [
+        FFMPEG, "-hide_banner", "-nostdin",
+        "-progress", "pipe:1", "-nostats", "-stats_period", "0.4",
+        *args,
+    ]
     if nice and hasattr(os, "nice"):
         cmd = ["nice", "-n", str(nice), *cmd]
 
