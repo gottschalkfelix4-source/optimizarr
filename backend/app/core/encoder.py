@@ -255,6 +255,30 @@ async def run_job(
             raise JobCancelled()
 
         # --- hardware encoders fail in creative ways; retry on the CPU ---- #
+        # But only when the *video* stream is what failed.  ffmpeg tears the
+        # whole pipeline down on any error, so an audio or muxer problem makes
+        # every stream shout at once - retrying that on the CPU costs hours and
+        # fails identically.
+        if code != 0 and plan.is_hardware and not ffmpeg.failure_is_video(log_tail):
+            reason = ffmpeg.first_error_line(log_tail)
+            command = " ".join(
+                planner.build_ffmpeg_args(plan, info, info.path, str(temp_out))
+            )
+            tail = "\n".join(
+                f"    {ln}" for ln in log_tail.strip().splitlines()[-60:]
+            )
+            _append_log(job_id, (
+                "Encoding fehlgeschlagen - nicht am Video-Encoder, daher kein Umweg "
+                "ueber die CPU.\n"
+                f"  Grund: {reason}\n"
+                f"  Befehl: ffmpeg {command}\n"
+                f"  Vollstaendige Ausgabe:\n{tail}"
+            ))
+            return _fail(job_id, file_id, outcome, (
+                f"Encoding fehlgeschlagen: {reason} "
+                "(nicht der Video-Encoder - ein Neuversuch auf der CPU wuerde genauso enden)"
+            ))
+
         if code != 0 and plan.is_hardware and settings.hardware.fallback_to_cpu:
             # Record *why* it failed.  A bare "fell back to CPU" is useless: the
             # GPU is then quietly unused for every future job and the reason is

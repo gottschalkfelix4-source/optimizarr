@@ -8,11 +8,12 @@ import {
   Microscope,
   Play,
   Search,
+  TerminalSquare,
   SlidersHorizontal,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { endpoints, type MediaFile } from "../lib/api";
+import { endpoints, type DryRunResult, type MediaFile } from "../lib/api";
 import {
   bytes,
   bitrate,
@@ -452,6 +453,22 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
     onError: (e: Error) => push(e.message, "error"),
   });
 
+  const [dry, setDry] = useState<DryRunResult | null>(null);
+
+  const dryRun = useMutation({
+    mutationFn: () => endpoints.dryRun(fileId!, 15),
+    onSuccess: (result) => {
+      setDry(result);
+      push(
+        result.ok
+          ? "Trockenlauf erfolgreich - der Plan funktioniert auf dieser Datei."
+          : `Trockenlauf fehlgeschlagen: ${result.error_line}`,
+        result.ok ? "success" : "error",
+      );
+    },
+    onError: (e: Error) => push(e.message, "error"),
+  });
+
   const enqueue = useMutation({
     mutationFn: () => endpoints.enqueue({ file_ids: [fileId!] }),
     onSuccess: (result) => {
@@ -493,6 +510,19 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
           >
             {analyze.isPending ? <Spinner className="size-4" /> : <Microscope className="size-4" />}
             Neu analysieren
+          </button>
+          <button
+            className="btn-ghost"
+            onClick={() => dryRun.mutate()}
+            disabled={dryRun.isPending || !plan}
+            title="Den geplanten Befehl 15 Sekunden lang wirklich ausfuehren"
+          >
+            {dryRun.isPending ? (
+              <Spinner className="size-4" />
+            ) : (
+              <TerminalSquare className="size-4" />
+            )}
+            Trockenlauf
           </button>
           <button
             className="btn-primary"
@@ -691,6 +721,49 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
               </ul>
             </div>
           ) : null}
+
+          {dry && (
+            <div
+              className={cn(
+                "rounded-lg border p-4",
+                dry.ok ? "border-save-500/30 bg-save-500/8" : "border-danger-500/30 bg-danger-500/8",
+              )}
+            >
+              <div className="flex flex-wrap items-baseline justify-between gap-2">
+                <h4 className="text-xs font-semibold uppercase tracking-wide text-ink-400">
+                  Trockenlauf
+                </h4>
+                <span className="text-xs text-ink-500">
+                  {dry.encoder}
+                  {dry.hw_decode ? " + GPU-Dekodierung" : ""} · {dry.pix_fmt} · {dry.seconds}s
+                </span>
+              </div>
+              <p
+                className={cn(
+                  "mt-2 text-sm leading-relaxed",
+                  dry.ok ? "text-save-400" : "text-danger-400",
+                )}
+              >
+                {dry.ok
+                  ? "Der geplante Befehl laeuft auf dieser Datei durch."
+                  : dry.error_line}
+              </p>
+              {!dry.ok && dry.video_at_fault === false && (
+                <p className="mt-1 text-xs text-warn-400">
+                  Der Fehler kommt nicht vom Video-Encoder - ein Umweg ueber die CPU wuerde
+                  genauso enden.
+                </p>
+              )}
+              <details className="mt-3">
+                <summary className="cursor-pointer text-xs text-ink-400">
+                  Vollstaendige ffmpeg-Ausgabe und Befehl
+                </summary>
+                <pre className="mt-2 max-h-72 overflow-auto rounded border border-ink-700/70 bg-ink-950/70 p-2 font-mono text-[10px] leading-relaxed text-ink-300">
+                  {`${dry.command}\n\n${dry.output}`}
+                </pre>
+              </details>
+            </div>
+          )}
 
           <p className="break-all font-mono text-[11px] text-ink-600">{file.path}</p>
         </div>

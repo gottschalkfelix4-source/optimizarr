@@ -231,3 +231,81 @@ def test_error_line_skips_noise():
 def test_error_line_survives_empty_input():
     assert first_error_line("") == "keine Fehlermeldung von ffmpeg"
     assert first_error_line("nur harmlose Ausgabe") == "nur harmlose Ausgabe"
+
+
+# --------------------------------------------------------------------------- #
+# Telling cause from consequence
+#
+# When one stream fails, ffmpeg tears the pipeline down and every other stream
+# reports its own error.  Retrying on the CPU only helps if the *video* encoder
+# is what broke - otherwise it burns hours to fail the same way.
+# --------------------------------------------------------------------------- #
+
+REAL_AUDIO_FAILURE = """\
+[aost#0:1/libopus @ 0x55a944bc2240] Error while opening encoder - maybe incorrect \
+parameters such as bit_rate, rate, width or height.
+[af#0:1 @ 0x55a944a52a40] Error sending frames to consumers: Invalid argument
+[af#0:2 @ 0x55a944b3d7c0] Task finished with error code: -22 (Invalid argument)
+[aost#0:1/libopus @ 0x55a944bc2240] Could not open encoder before EOF
+[aost#0:2/libopus @ 0x55a944b4c480] Could not open encoder before EOF
+[out#0/matroska @ 0x55a944a97400] Nothing was written into output file, because \
+at least one of its streams received no packets.
+Conversion failed!
+"""
+
+
+def test_audio_failure_is_not_blamed_on_the_gpu():
+    """Taken verbatim from a run that fell back to the CPU for no reason."""
+    from app.core.ffmpeg import failure_is_video, first_error_line
+
+    assert failure_is_video(REAL_AUDIO_FAILURE) is False
+    assert "libopus" in first_error_line(REAL_AUDIO_FAILURE)
+
+
+def test_video_failure_is_recognised_even_when_audio_shouts_louder():
+    from app.core.ffmpeg import failure_is_video, first_error_line
+
+    log = (
+        "[av1_qsv @ 0x1] Selected ratecontrol mode is unsupported\n"
+        "[vost#0:0/av1_qsv @ 0x1] Error while opening encoder\n"
+        + REAL_AUDIO_FAILURE
+    )
+    assert failure_is_video(log) is True
+    # The video line is the useful one even though audio produced more output.
+    assert "ratecontrol" in first_error_line(log)
+
+
+def test_device_failure_counts_as_video():
+    from app.core.ffmpeg import failure_is_video
+
+    assert failure_is_video("[AVHWDeviceContext @ 0x1] Error creating a QSV device") is True
+    assert failure_is_video("Device creation failed: -22.") is True
+
+
+def test_inconclusive_log_defaults_to_retrying():
+    """With nothing to go on, the CPU retry is the safer guess."""
+    from app.core.ffmpeg import failure_is_video
+
+    assert failure_is_video("") is True
+    assert failure_is_video("frame=  100 fps=25 q=-0.0") is True
+
+
+def test_consequences_alone_leave_the_verdict_open():
+    """A log with only follow-on errors names no culprit.
+
+    "Could not open encoder before EOF" appears on every stream once the
+    pipeline collapses, so it identifies nothing.  With no evidence either way
+    the CPU retry is the safer guess - it costs time, while wrongly refusing it
+    would leave a file unconverted.
+    """
+    from app.core.ffmpeg import failure_is_video
+
+    log = (
+        "[aost#0:1/libopus @ 0x1] Could not open encoder before EOF\n"
+        "Conversion failed!\n"
+    )
+    assert failure_is_video(log) is True
+
+    # But as soon as one line names a stream, that decides it.
+    with_cause = "[aost#0:1/libopus @ 0x1] Error while opening encoder\n" + log
+    assert failure_is_video(with_cause) is False

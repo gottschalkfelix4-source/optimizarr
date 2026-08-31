@@ -13,7 +13,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from ..config import DEFAULT_MEDIA_ROOT, TRANSCODE_DIR, load_settings
-from ..core import analyzer, ffmpeg, hwaccel, scanner
+from ..core import analyzer, ffmpeg, hwaccel, planner, scanner
 from ..core.advisor import get_advisor
 from ..core.events import bus
 from ..db import get_session, session_scope
@@ -368,3 +368,88 @@ def scan_history(
         select(ScanRun).order_by(ScanRun.started_at.desc()).limit(limit)
     ).scalars().all()
     return [serializers.scan_run(r) for r in rows]
+
+
+class DryRunRequest(BaseModel):
+    seconds: int = Field(15, ge=2, le=120, description="Wieviel Material probeweise kodiert wird")
+    force_encoder: str | None = Field(
+        None, description="Encoder abweichend vom Plan erzwingen, z.B. libsvtav1"
+    )
+    disable_hw_decode: bool = False
+
+
+@router.post("/files/{file_id}/dry-run")
+async def dry_run(file_id: int, payload: DryRunRequest | None = None) -> dict[str, Any]:
+    """Run the planned command against the real file for a few seconds.
+
+    A failing job leaves behind a truncated log and a guess.  This runs the
+    exact command the encoder would run - same filters, same streams, same
+    parameters - on a short slice, and hands back the complete ffmpeg output.
+    It is the difference between "hardware encoding failed" and knowing which
+    line failed and why.
+    """
+    payload = payload or DryRunRequest()
+    settings = load_settings()
+
+    with session_scope() as s:
+        row = s.get(MediaFile, file_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Datei nicht gefunden")
+        path, stored_plan = row.path, row.plan
+    if not os.path.exists(path):
+        raise HTTPException(status_code=410, detail="Datei existiert nicht mehr auf der Platte.")
+
+    try:
+        info = await ffmpeg.probe(path)
+    except ffmpeg.FFmpegError as exc:
+        raise HTTPException(status_code=422, detail=f"Datei nicht lesbar: {exc}") from exc
+
+    hw = hwaccel.cached() or await hwaccel.detect(
+        settings.hardware.render_device, settings.hardware.qsv_low_power
+    )
+    plan = planner.EncodePlan.from_dict(stored_plan) or planner.build_plan(info, settings, hw)
+    if payload.force_encoder:
+        plan.encoder = payload.force_encoder
+        if payload.force_encoder == "libsvtav1":
+            plan.hw_decode = False
+            plan.pix_fmt = "yuv420p10le" if plan.pix_fmt.endswith(("10le",)) else "yuv420p"
+    if payload.disable_hw_decode:
+        plan.hw_decode = False
+
+    dest = TRANSCODE_DIR / f"optimizarr-dryrun-{file_id}.{plan.container}"
+    args = planner.build_ffmpeg_args(plan, info, path, str(dest))
+    # Insert the duration limit right after the input so only a slice is read.
+    limited = list(args)
+    try:
+        limited.insert(limited.index("-i") + 2, "-t")
+        limited.insert(limited.index("-t") + 1, str(payload.seconds))
+    except ValueError:
+        pass
+
+    started = asyncio.get_running_loop().time()
+    try:
+        code, err = await ffmpeg.run_with_progress(
+            limited, log_lines=500, timeout=max(120, payload.seconds * 20)
+        )
+    except ffmpeg.FFmpegError as exc:
+        code, err = -1, str(exc)
+    finally:
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            pass
+    elapsed = asyncio.get_running_loop().time() - started
+
+    ok = code == 0
+    return {
+        "ok": ok,
+        "returncode": code,
+        "seconds": round(elapsed, 1),
+        "encoder": plan.encoder,
+        "hw_decode": plan.hw_decode,
+        "pix_fmt": plan.pix_fmt,
+        "command": "ffmpeg " + " ".join(limited),
+        "error_line": "" if ok else ffmpeg.first_error_line(err),
+        "video_at_fault": None if ok else ffmpeg.failure_is_video(err),
+        "output": err,
+    }

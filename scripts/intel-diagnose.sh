@@ -98,13 +98,29 @@ run 'Rueckfall: CPU-Dekodierung, GPU-Encode' \
   $FF -v error -y $QSV -i "$F" -t 20 -map 0:v:0 -an -sn \
   -vf format=p010le,hwupload=extra_hw_frames=64 \
   -c:v av1_qsv -global_quality 30 -low_power 1 -f null -
-[ "$F" = /tmp/diag-src.mp4 ] && rm -f "$F"
 echo
 
 echo '=== 4. VAAPI als Alternative ==='
 run 'av1_vaapi 10-bit' \
   $FF -v error -y -vaapi_device $D $SRC -vf format=p010le,hwupload \
   -c:v av1_vaapi -qp 30 -f null -
+echo
+
+echo '=== 5. Tonspuren ==='
+echo '  (Faellt hier etwas aus, sieht es im Job-Protokoll wie ein GPU-Problem aus,'
+echo '   weil ffmpeg bei einem Fehler die ganze Verarbeitung abbricht.)'
+if [ -n "${F:-}" ] && [ -f "$F" ]; then
+  $FP -v error -select_streams a \
+    -show_entries stream=index,codec_name,channels,channel_layout,sample_rate \
+    -of csv=p=0 "$F" 2>/dev/null | sed 's/^/  /'
+  run 'Alle Tonspuren nach Opus' \
+    $FF -v error -y -i "$F" -t 10 -map 0:a -c:a libopus -b:a 288k -f null -
+  run 'Alle Untertitel kopieren' \
+    $FF -v error -y -i "$F" -t 10 -map 0:s? -c:s copy -f matroska /dev/null
+else
+  echo '  (keine Datei zum Pruefen)'
+fi
+[ "${F:-}" = /tmp/diag-src.mp4 ] && rm -f "$F"
 echo
 
 echo 'Fertig. Was oben mit OK durchlaeuft, kann Optimizarr nutzen.'

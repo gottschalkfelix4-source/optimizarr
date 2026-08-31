@@ -315,6 +315,19 @@ export interface HistoryItem {
   created_at: string;
 }
 
+export interface DryRunResult {
+  ok: boolean;
+  returncode: number;
+  seconds: number;
+  encoder: string;
+  hw_decode: boolean;
+  pix_fmt: string;
+  command: string;
+  error_line: string;
+  video_at_fault: boolean | null;
+  output: string;
+}
+
 export interface FileListResponse {
   items: MediaFile[];
   total: number;
@@ -575,6 +588,8 @@ export const endpoints = {
   file: (id: number) => api.get<MediaFile>(`/files/${id}`),
   analyzeFile: (id: number, depth?: string) =>
     api.post<MediaFile>(`/files/${id}/analyze${depth ? `?depth=${depth}` : ""}`),
+  dryRun: (id: number, seconds = 15) =>
+    api.post<DryRunResult>(`/files/${id}/dry-run`, { seconds }),
   ignoreFile: (id: number, ignored: boolean) =>
     api.post<MediaFile>(`/files/${id}/ignore?ignored=${ignored}`),
 

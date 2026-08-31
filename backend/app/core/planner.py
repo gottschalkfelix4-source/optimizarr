@@ -541,12 +541,15 @@ def build_ffmpeg_args(
             if a.get("action") == "drop":
                 continue
             if a.get("action") == "opus":
-                channels = int(a.get("channels") or 2)
                 args += [f"-c:a:{out_index}", "libopus",
                          f"-b:a:{out_index}", str(int(a.get("bitrate") or 128_000))]
-                if channels > 2:
-                    # Required for correct multichannel Opus mapping.
-                    args += [f"-mapping_family:a:{out_index}", "1"]
+                # `mapping_family` is deliberately left to ffmpeg.  Forcing 1
+                # asks for the Vorbis channel order, which only matches layouts
+                # that actually use it: a 5.1(side) track - common in web
+                # releases - would come out with its surround channels in the
+                # wrong places, and on some builds refuses to open at all.
+                # Left alone, ffmpeg picks 1 when the layout fits and 255 when
+                # it does not, which is right in both cases.
                 args += [f"-vbr:a:{out_index}", "on", f"-application:a:{out_index}", "audio"]
             else:
                 args += [f"-c:a:{out_index}", "copy"]

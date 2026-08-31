@@ -212,22 +212,38 @@ def test_plan_builds_valid_svtav1_command():
     assert "-c:v" in args and "libsvtav1" in args
     assert "-crf" in args
     assert args[-1] == "/tmp/out.mkv"
-    # DTS 5.1 at 1.5 Mbit/s is bloated -> Opus with multichannel mapping
+    # DTS 5.1 at 1.5 Mbit/s is bloated -> Opus
     assert "libopus" in args
-    assert "-mapping_family:a:0" in args
-
-
-def test_multichannel_mapping_only_for_surround():
-    settings = AppSettings()
-    info = make_info(audio_streams=[{
-        "index": 1, "codec": "ac3", "channels": 2, "bitrate": 640_000, "language": "eng",
-        "default": True, "commentary": False, "channel_layout": "stereo",
-        "sample_rate": 48000, "title": "",
-    }])
-    plan = planner.build_plan(info, settings, hw=None)
-    args = planner.build_ffmpeg_args(plan, info, info.path, "/tmp/out.mkv")
-    assert "libopus" in args
+    # The channel mapping is left to ffmpeg on purpose - see the next test.
     assert "-mapping_family:a:0" not in args
+
+
+def test_opus_channel_mapping_is_left_to_ffmpeg():
+    """Forcing mapping_family=1 asks for the Vorbis channel order.
+
+    That order only matches layouts which actually use it.  A 5.1(side) track -
+    ordinary in web releases - would come out with its surround channels in the
+    wrong places, and on some builds refuses to open at all.  Left alone, ffmpeg
+    picks the family that fits the layout.
+    """
+    settings = AppSettings()
+    # Bitrates chosen above the "already lean" threshold so every track really
+    # gets re-encoded - otherwise the assertion would pass vacuously.
+    for layout, channels, bitrate in (
+        ("stereo", 2, 448_000),
+        ("5.1", 6, 640_000),
+        ("5.1(side)", 6, 640_000),
+        ("7.1", 8, 1_509_000),
+    ):
+        info = make_info(audio_streams=[{
+            "index": 1, "codec": "eac3", "channels": channels, "bitrate": bitrate,
+            "language": "ger", "default": True, "commentary": False,
+            "channel_layout": layout, "sample_rate": 48000, "title": "",
+        }])
+        plan = planner.build_plan(info, settings, hw=None)
+        args = planner.build_ffmpeg_args(plan, info, info.path, "/tmp/out.mkv")
+        assert "libopus" in args, layout
+        assert not any(a.startswith("-mapping_family") for a in args), layout
 
 
 def test_lean_audio_is_copied_not_reencoded():

@@ -118,21 +118,90 @@ _ERROR_MARKERS = (
 _ERROR_NOISE = ("error_rate", "last message repeated", "deprecated")
 
 
+#: When one stream fails, ffmpeg tears the whole pipeline down and every other
+#: stream reports a follow-on error.  Audio encoders are especially loud about
+#: it ("Could not open encoder before EOF"), which makes them look like the
+#: cause when they are only a casualty.  These mark a line as consequence.
+_CONSEQUENCE_MARKERS = (
+    "could not open encoder before eof",
+    "error sending frames to consumers",
+    "terminating thread with return code",
+    "task finished with error code",
+    "nothing was written into output file",
+    "conversion failed",
+    "error closing file",
+)
+
+
+def classify_error_line(line: str) -> str:
+    """"video", "other" or "consequence" - which stream a failure belongs to."""
+    lowered = line.lower()
+    if any(marker in lowered for marker in _CONSEQUENCE_MARKERS):
+        return "consequence"
+    # ffmpeg tags output streams as vost#/aost#/sost# and decoders as vist#/dec:.
+    if any(tag in lowered for tag in ("vost#", "vist#", "[dec:", "hwaccel", "hwupload",
+                                      "_qsv", "_vaapi", "libsvtav1", "vf#", "avhwdevice",
+                                      "qsv", "vaapi", "device creation")):
+        return "video"
+    if any(tag in lowered for tag in ("aost#", "af#", "libopus", "audio", "aac", "eac3")):
+        return "other"
+    if any(tag in lowered for tag in ("sost#", "subtitle")):
+        return "other"
+    return "other"
+
+
 def first_error_line(log_tail: str) -> str:
     """The most explanatory line from an ffmpeg failure.
 
-    Scanned forwards on purpose: ffmpeg names the specific cause first and then
-    a vaguer summary, so reading from the end reliably returns the least useful
-    line ("Error while opening encoder ...").
+    Two rules, both learned the hard way:
+
+    * Scan **forwards** - ffmpeg names the specific cause first and a vaguer
+      summary afterwards, so reading from the end returns "Error while opening
+      encoder", which explains nothing.
+    * Prefer a line about the **video** stream.  When the video encoder fails,
+      every audio encoder in the file reports its own error a moment later; the
+      loudest line is usually not the one that started it.
+    """
+    lines = [ln.strip() for ln in (log_tail or "").splitlines() if ln.strip()]
+    candidates: list[tuple[str, str]] = []
+    for line in lines:
+        lowered = line.lower()
+        if any(noise in lowered for noise in _ERROR_NOISE):
+            continue
+        if any(marker in lowered for marker in _ERROR_MARKERS):
+            candidates.append((classify_error_line(line), line))
+
+    for wanted in ("video", "other"):
+        for kind, line in candidates:
+            if kind == wanted:
+                return line[:300]
+    if candidates:
+        return candidates[0][1][:300]
+    return lines[-1][:300] if lines else "keine Fehlermeldung von ffmpeg"
+
+
+def failure_is_video(log_tail: str) -> bool:
+    """Did the video stream cause this failure?
+
+    Retrying on the CPU only helps when the GPU encoder is what broke.  If the
+    audio or the muxer failed, the retry burns hours to fail exactly the same
+    way, so it is worth being sure before falling back.
     """
     lines = [ln.strip() for ln in (log_tail or "").splitlines() if ln.strip()]
     for line in lines:
         lowered = line.lower()
         if any(noise in lowered for noise in _ERROR_NOISE):
             continue
-        if any(marker in lowered for marker in _ERROR_MARKERS):
-            return line[:300]
-    return lines[-1][:300] if lines else "keine Fehlermeldung von ffmpeg"
+        if not any(marker in lowered for marker in _ERROR_MARKERS):
+            continue
+        kind = classify_error_line(line)
+        if kind == "video":
+            return True
+        if kind == "other":
+            return False
+    # Nothing conclusive: assume it was the video path, since that is the one
+    # the caller was about to give up on anyway.
+    return True
 
 
 async def _run(cmd: list[str], timeout: float | None = None) -> tuple[int, str, str]:
@@ -322,7 +391,7 @@ _PROGRESS_KEYS = {
 async def run_with_progress(
     args: list[str],
     on_progress: Callable[[Progress], Any] | None = None,
-    log_lines: int = 60,
+    log_lines: int = 400,
     timeout: float | None = None,
     cancel_event: asyncio.Event | None = None,
     nice: int = 0,
