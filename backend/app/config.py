@@ -18,6 +18,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from .core.codecs import normalise_list as _normalise_codecs
+
 CONFIG_DIR = Path(os.environ.get("OPTIMIZARR_CONFIG_DIR", "/config"))
 TRANSCODE_DIR = Path(os.environ.get("OPTIMIZARR_TRANSCODE_DIR", "/transcode"))
 DEFAULT_MEDIA_ROOT = os.environ.get("OPTIMIZARR_MEDIA_ROOT", "/media")
@@ -64,13 +66,22 @@ class AnalysisSettings(BaseModel):
         20.0, ge=1.0, le=90.0, description="Below this predicted saving a file is skipped"
     )
     min_saving_mb: int = Field(100, ge=0, description="Absolute floor - tiny wins are not worth it")
-    skip_codecs: list[str] = Field(default_factory=lambda: ["av1"])
+    skip_codecs: list[str] = Field(
+        default_factory=lambda: ["av1"],
+        description="Sources in these codecs never become candidates",
+    )
     skip_if_bitrate_below_kbps: int = Field(
         0, ge=0, description="0 = auto (derived from resolution); already-lean files are skipped"
     )
     analysis_workers: int = Field(2, ge=1, le=16)
     use_learning_model: bool = True
     trust_learning_after_samples: int = Field(15, ge=3, le=500)
+
+    @field_validator("skip_codecs")
+    @classmethod
+    def _normalise_skip_codecs(cls, v: list[str]) -> list[str]:
+        """"h265", "x265" and "HEVC" all have to mean the same thing here."""
+        return _normalise_codecs(v)
 
 
 class EncodingSettings(BaseModel):

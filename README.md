@@ -22,6 +22,14 @@ solange das Ergebnis nicht nachweislich besser ist.
 Für jede Datei laufen bis zu drei Stufen. Was davon zum Einsatz kommt, stellst du in der
 Oberfläche ein.
 
+**Vorab: was du ausgeschlossen hast**
+Ganze Codecs lassen sich in den Einstellungen abwählen. Die Liste zeigt, was in der
+Bibliothek wirklich vorkommt – mit Dateizahl, Speicherbedarf und der Zahl der Kandidaten,
+die dahinter hängen. AV1 ist voreingestellt, weil eine erneute AV1-Kodierung nur Qualität
+kostet; wer sein HEVC-Material in Ruhe lassen will, hakt es an. Die Änderung greift sofort
+auf die bestehende Kandidatenliste durch, nicht erst beim nächsten Scan – und lässt sich
+genauso zurücknehmen.
+
 **1. Metadaten-Heuristik (Millisekunden pro Datei)**
 Aus Auflösung, Bildrate, Codec und Bitrate wird die *Bits pro Pixel* der Quelle berechnet
 und auf AV1-Verhältnisse umgerechnet. Eine 30-Mbit/s-H.264-Datei hat viel Luft nach unten,

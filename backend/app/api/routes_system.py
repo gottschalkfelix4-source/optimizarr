@@ -133,12 +133,20 @@ class SettingsPatch(BaseModel):
 
 @router.put("/settings")
 def put_settings(patch: dict[str, Any]) -> dict[str, Any]:
+    before = load_settings().analysis.skip_codecs
     try:
         settings = update_settings(patch)
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Ungueltige Einstellungen: {exc}") from exc
     bus.publish("settings.changed", {"groups": list(patch.keys())})
-    return settings.model_dump(mode="json")
+    payload = settings.model_dump(mode="json")
+    # A changed exclusion list has to reach the files that were already
+    # analysed - otherwise it would only apply to the next scan and the
+    # candidate list the user wanted cleaned up would stay exactly as it was.
+    payload["applied"] = {
+        "codec_exclusions": scanner.apply_codec_exclusions(before, settings.analysis.skip_codecs)
+    }
+    return payload
 
 
 @router.post("/settings/profile/{name}")
@@ -161,6 +169,11 @@ async def test_advisor(payload: dict[str, Any] | None = None) -> dict[str, Any]:
 
 @router.post("/settings/reset")
 def reset_settings() -> dict[str, Any]:
+    before = load_settings().analysis.skip_codecs
     settings = save_settings(AppSettings())
     bus.publish("settings.changed", {"reset": True})
-    return settings.model_dump(mode="json")
+    payload = settings.model_dump(mode="json")
+    payload["applied"] = {
+        "codec_exclusions": scanner.apply_codec_exclusions(before, settings.analysis.skip_codecs)
+    }
+    return payload

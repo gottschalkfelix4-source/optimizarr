@@ -26,6 +26,8 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from . import codecs
+
 log = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
@@ -47,18 +49,21 @@ _BASE_BPP: list[tuple[int, float]] = [
 
 # How much bitrate AV1 needs relative to the source codec for the same quality.
 # Lower = the source codec was less efficient = more headroom for us.
+# Keys are canonical codec names (see core/codecs.py) - lookups normalise first,
+# so "h265", "x265" and "hvc1" all land on "hevc".
 CODEC_EFFICIENCY: dict[str, float] = {
     "av1": 1.00,
-    "hevc": 0.75, "h265": 0.75,
+    "vvc": 1.15,
     "vp9": 0.78,
-    "vvc": 1.15, "h266": 1.15,
-    "h264": 0.55, "avc": 0.55,
-    "vp8": 0.48,
-    "mpeg4": 0.42, "msmpeg4v3": 0.40, "divx": 0.42, "xvid": 0.42,
-    "vc1": 0.50, "wmv3": 0.48, "wmv2": 0.42,
-    "mpeg2video": 0.35, "mpeg1video": 0.30,
+    "hevc": 0.75,
+    "h264": 0.55,
+    "vc1": 0.50,
+    "vp8": 0.48, "wmv3": 0.48,
     "theora": 0.45,
-    "prores": 0.06, "dnxhd": 0.06, "huffyuv": 0.03, "ffv1": 0.05, "rawvideo": 0.01,
+    "mpeg4": 0.42, "wmv2": 0.42,
+    "msmpeg4v3": 0.40,
+    "mpeg2video": 0.35, "mpeg1video": 0.30,
+    "prores": 0.06, "dnxhd": 0.06, "ffv1": 0.05, "huffyuv": 0.03, "rawvideo": 0.01,
 }
 DEFAULT_EFFICIENCY = 0.60
 
@@ -88,7 +93,8 @@ def crf_factor(crf: float) -> float:
 
 
 def codec_efficiency(codec: str) -> float:
-    return CODEC_EFFICIENCY.get((codec or "").lower(), DEFAULT_EFFICIENCY)
+    """How many bits this codec needs relative to AV1 for the same picture."""
+    return CODEC_EFFICIENCY.get(codecs.normalise(codec), DEFAULT_EFFICIENCY)
 
 
 @dataclass

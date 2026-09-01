@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import AppSettings
-from . import ffmpeg, planner, predictor, quality
+from . import codecs, ffmpeg, planner, predictor, quality
 from .advisor import Advisor, Advice
 from .hwaccel import HardwareReport
 from .planner import EncodePlan
@@ -100,10 +100,14 @@ def _min_useful_bitrate(height: int, crf: float) -> float:
 
 def precheck(info: ffmpeg.MediaInfo, settings: AppSettings) -> tuple[bool, str]:
     """Fast rejections that need no encoding at all.  Returns (skip, reason)."""
-    codec = (info.video_codec or "").lower()
-    skip_codecs = {c.lower() for c in settings.analysis.skip_codecs}
-    if codec in skip_codecs:
-        return True, f"Bereits {codec.upper()} - eine Neukodierung wuerde nichts sparen."
+    codec = codecs.normalise(info.video_codec)
+    if codecs.is_excluded(codec, settings.analysis.skip_codecs):
+        # AV1 is excluded because re-encoding it is pointless; everything else
+        # on that list is a deliberate choice, and saying "would not save
+        # anything" about HEVC would simply be wrong.
+        if codec == "av1":
+            return True, "Bereits AV1 - eine Neukodierung wuerde nur Qualitaet kosten."
+        return True, f"{codecs.label(codec)} {codecs.EXCLUSION_REASON}"
     if info.duration and info.duration < settings.library.min_duration_seconds:
         return True, (
             f"Nur {info.duration:.0f}s lang - unter der Mindestlaenge von "

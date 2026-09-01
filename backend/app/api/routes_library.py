@@ -9,11 +9,11 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from ..config import DEFAULT_MEDIA_ROOT, TRANSCODE_DIR, load_settings
-from ..core import analyzer, ffmpeg, hwaccel, planner, scanner
+from ..core import analyzer, codecs, ffmpeg, hwaccel, planner, scanner
 from ..core.advisor import get_advisor
 from ..core.events import bus
 from ..db import get_session, session_scope
@@ -144,6 +144,60 @@ def browse(path: str = Query(default="")) -> dict[str, Any]:
     }
 
 
+@router.get("/library/codecs")
+def library_codecs(session: Session = Depends(get_session)) -> dict[str, Any]:
+    """Which video codecs the library actually contains, and how much of each.
+
+    The exclusion setting used to be a free-text field, which meant guessing
+    ffprobe's spelling and getting no feedback when the guess was wrong.  With
+    this the settings screen can list what is really there, with the file
+    counts that make the decision obvious.
+    """
+    rows = session.execute(
+        select(
+            MediaFile.video_codec,
+            func.count(MediaFile.id),
+            func.sum(MediaFile.size),
+            func.sum(
+                case((MediaFile.state == FileState.CANDIDATE.value, 1), else_=0)
+            ),
+        )
+        .where(MediaFile.video_codec != "")
+        .group_by(MediaFile.video_codec)
+    ).all()
+
+    excluded = load_settings().analysis.skip_codecs
+    merged: dict[str, dict[str, Any]] = {}
+    for raw, count, size, candidates in rows:
+        canonical = codecs.normalise(raw)
+        entry = merged.setdefault(canonical, {
+            "codec": canonical,
+            "label": codecs.label(canonical),
+            "files": 0,
+            "total_size": 0,
+            "candidates": 0,
+            "excluded": codecs.is_excluded(canonical, excluded),
+        })
+        entry["files"] += count or 0
+        entry["total_size"] += size or 0
+        entry["candidates"] += candidates or 0
+
+    # Codecs that are excluded but no longer present must stay visible, or the
+    # only way to remove them would be to know they are there.
+    for name in excluded:
+        canonical = codecs.normalise(name)
+        if canonical and canonical not in merged:
+            merged[canonical] = {
+                "codec": canonical, "label": codecs.label(canonical),
+                "files": 0, "total_size": 0, "candidates": 0, "excluded": True,
+            }
+
+    items = sorted(merged.values(), key=lambda e: (-e["files"], e["label"]))
+    return {"items": items, "known": [
+        {"codec": c, "label": label} for c, label in codecs.LABELS.items()
+    ]}
+
+
 # --------------------------------------------------------------------------- #
 # Files
 # --------------------------------------------------------------------------- #
@@ -176,7 +230,7 @@ def list_files(
     if library_id:
         conditions.append(MediaFile.library_id == library_id)
     if codec:
-        conditions.append(MediaFile.video_codec == codec.lower())
+        conditions.append(MediaFile.video_codec.in_(codecs.spellings(codec)))
     if search:
         like = f"%{search.lower()}%"
         conditions.append(func.lower(MediaFile.path).like(like))

@@ -521,6 +521,34 @@ export type SettingsPatch = {
   [K in keyof Settings]?: Partial<Settings[K]>;
 };
 
+/** What a settings change did to files that had already been analysed. */
+export interface CodecExclusionResult {
+  added: string[];
+  removed: string[];
+  excluded: number;
+  restored: number;
+  queued_untouched: number;
+}
+
+export type SettingsSaveResult = Settings & {
+  applied?: { codec_exclusions?: CodecExclusionResult };
+};
+
+/** One video codec the library contains, or one that is excluded by hand. */
+export interface LibraryCodec {
+  codec: string;
+  label: string;
+  files: number;
+  total_size: number;
+  candidates: number;
+  excluded: boolean;
+}
+
+export interface LibraryCodecs {
+  items: LibraryCodec[];
+  known: { codec: string; label: string }[];
+}
+
 /* -------------------------------------------------------------------------- */
 /* Endpoints                                                                  */
 /* -------------------------------------------------------------------------- */
@@ -561,13 +589,14 @@ export const endpoints = {
     ),
 
   settings: () => api.get<Settings>("/settings"),
-  saveSettings: (patch: SettingsPatch) => api.put<Settings>("/settings", patch),
+  saveSettings: (patch: SettingsPatch) => api.put<SettingsSaveResult>("/settings", patch),
   applyProfile: (name: string) => api.post<Settings>(`/settings/profile/${name}`),
   testAdvisor: (payload: { api_key?: string; model?: string }) =>
     api.post<{ ok: boolean; message: string }>("/settings/test-advisor", payload),
-  resetSettings: () => api.post<Settings>("/settings/reset"),
+  resetSettings: () => api.post<SettingsSaveResult>("/settings/reset"),
 
   libraryPaths: () => api.get<LibraryPathEntry[]>("/library/paths"),
+  libraryCodecs: () => api.get<LibraryCodecs>("/library/codecs"),
   addLibraryPath: (payload: { path: string; name?: string }) =>
     api.post<LibraryPathEntry>("/library/paths", payload),
   updateLibraryPath: (id: number, payload: Partial<LibraryPathEntry>) =>

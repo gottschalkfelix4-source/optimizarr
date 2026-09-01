@@ -162,8 +162,13 @@ def _sync_disk_to_db(settings: AppSettings, run_id: int) -> tuple[int, int, list
                     row.state = FileState.NEW.value
                     row.error = ""
                     needs_probe.append(row.id)
+                elif row.state == FileState.PROBED.value:
+                    # Metadata read but never analysed - unfinished work, so it
+                    # is picked up even when only changed files are rescanned.
+                    # This is also how a lifted codec exclusion comes back.
+                    needs_probe.append(row.id)
                 elif not settings.library.rescan_changed_only and row.state in (
-                    FileState.SKIPPED.value, FileState.CANDIDATE.value, FileState.PROBED.value
+                    FileState.SKIPPED.value, FileState.CANDIDATE.value
                 ):
                     needs_probe.append(row.id)
                 elif _analysis_is_stale(row, settings):
@@ -510,3 +515,90 @@ def cancel_scan() -> bool:
         state.cancel.set()
         return True
     return False
+
+
+# --------------------------------------------------------------------------- #
+# Codec exclusions
+# --------------------------------------------------------------------------- #
+
+def apply_codec_exclusions(before: list[str], after: list[str]) -> dict[str, Any]:
+    """Bring the stored library in line with a changed exclusion list.
+
+    Without this the setting would only apply to files analysed *after* the
+    change - the HEVC files already sitting in the candidate list would stay
+    there, which is precisely the list the user was trying to clean up.
+
+    Both directions are handled, and neither throws work away:
+
+    *Newly excluded* candidates become skipped and lose their estimate, so the
+    dashboard totals stop promising savings nobody intends to collect.  Files
+    that are queued or already encoding are left alone - somebody put them
+    there on purpose - but they are counted, so the UI can say so.
+
+    *No longer excluded* files go back to ``probed`` and get re-analysed on the
+    next scan.  Only files skipped *by this setting* are touched: one that was
+    skipped for being tiny or already lean stays skipped, and no trial encode
+    is spent re-discovering that.
+    """
+    from . import codecs
+
+    old = set(codecs.normalise_list(before))
+    new = set(codecs.normalise_list(after))
+    added = new - old
+    removed = old - new
+    # Match every spelling a probe may have stored, not just the canonical one.
+    added_spellings = [s for c in added for s in codecs.spellings(c)]
+    removed_spellings = [s for c in removed for s in codecs.spellings(c)]
+    result: dict[str, Any] = {
+        "added": sorted(added), "removed": sorted(removed),
+        "excluded": 0, "restored": 0, "queued_untouched": 0,
+    }
+    if not added and not removed:
+        return result
+
+    with session_scope() as s:
+        if added:
+            rows = s.execute(
+                select(MediaFile).where(
+                    MediaFile.video_codec.in_(added_spellings),
+                    MediaFile.state.in_([
+                        FileState.CANDIDATE.value, FileState.PROBED.value,
+                        FileState.QUEUED.value, FileState.ENCODING.value,
+                    ]),
+                )
+            ).scalars().all()
+            for row in rows:
+                if row.state in (FileState.QUEUED.value, FileState.ENCODING.value):
+                    result["queued_untouched"] += 1
+                    continue
+                row.state = FileState.SKIPPED.value
+                row.decision_reason = f"{codecs.label(row.video_codec)} {codecs.EXCLUSION_REASON}"
+                row.estimated_size = 0
+                row.estimated_saving_bytes = 0
+                row.estimated_saving_pct = 0.0
+                row.plan = None
+                result["excluded"] += 1
+
+        if removed:
+            rows = s.execute(
+                select(MediaFile).where(
+                    MediaFile.video_codec.in_(removed_spellings),
+                    MediaFile.state == FileState.SKIPPED.value,
+                    MediaFile.decision_reason.like(f"%{codecs.EXCLUSION_REASON}"),
+                )
+            ).scalars().all()
+            for row in rows:
+                row.state = FileState.PROBED.value
+                row.decision_reason = ""
+                row.analyzed_at = None
+                result["restored"] += 1
+
+    if result["excluded"] or result["restored"]:
+        bits = []
+        if result["excluded"]:
+            bits.append(f"{result['excluded']} Dateien aus der Kandidatenliste entfernt")
+        if result["restored"]:
+            bits.append(f"{result['restored']} Dateien zur Neubewertung vorgemerkt")
+        _log_history("info", "settings", "Codec-Ausschluss geaendert: " + ", ".join(bits))
+        bus.publish("library.changed", {"codec_exclusions": result})
+    return result

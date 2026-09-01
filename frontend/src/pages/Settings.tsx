@@ -76,11 +76,31 @@ export default function SettingsPage() {
 
   const save = useMutation({
     mutationFn: (patch: SettingsPatch) => endpoints.saveSettings(patch),
-    onSuccess: (result) => {
+    onSuccess: ({ applied, ...settings }) => {
       push("Einstellungen gespeichert.", "success");
-      queryClient.setQueryData(["settings"], result);
-      setDraft(structuredClone(result));
+      queryClient.setQueryData(["settings"], settings);
+      setDraft(structuredClone(settings as Settings));
       queryClient.invalidateQueries({ queryKey: ["system"] });
+
+      // Changing the codec exclusions moves files in and out of the candidate
+      // list, so say what happened instead of leaving stale numbers on screen.
+      const codecs = applied?.codec_exclusions;
+      if (codecs && (codecs.excluded || codecs.restored)) {
+        const parts: string[] = [];
+        if (codecs.excluded) parts.push(`${codecs.excluded} aus der Kandidatenliste entfernt`);
+        if (codecs.restored) parts.push(`${codecs.restored} zur Neubewertung vorgemerkt`);
+        push(`Codec-Ausschluss angewendet: ${parts.join(", ")}.`, "info");
+        ["files", "stats", "library", "jobs"].forEach((key) =>
+          queryClient.invalidateQueries({ queryKey: [key] }),
+        );
+      }
+      if (codecs?.queued_untouched) {
+        push(
+          `${codecs.queued_untouched} bereits eingereihte Datei(en) bleiben in der Warteschlange - dort ` +
+            "kannst du sie einzeln entfernen.",
+          "info",
+        );
+      }
     },
     onError: (e: Error) => push(e.message, "error"),
   });
@@ -598,16 +618,6 @@ function AnalysisTab({ draft, update }: { draft: Settings; update: UpdateFn }) {
             />
           </Field>
           <Field
-            label="Diese Codecs ueberspringen"
-            hint="AV1 ist hier voreingestellt - eine erneute Kodierung wuerde nur Qualitaet kosten."
-          >
-            <TagListField
-              values={draft.analysis.skip_codecs}
-              onChange={(skip_codecs) => update("analysis", { skip_codecs })}
-              placeholder="av1, vp9"
-            />
-          </Field>
-          <Field
             label="Parallele Analysen"
             hint="Wie viele Dateien gleichzeitig untersucht werden."
           >
@@ -619,6 +629,16 @@ function AnalysisTab({ draft, update }: { draft: Settings; update: UpdateFn }) {
             />
           </Field>
         </div>
+      </Panel>
+
+      <Panel
+        title="Codecs ausschliessen"
+        subtitle="Angehakte Codecs werden nie zu Kandidaten - egal wie viel sie sparen wuerden"
+      >
+        <CodecExclusions
+          selected={draft.analysis.skip_codecs}
+          onChange={(skip_codecs) => update("analysis", { skip_codecs })}
+        />
       </Panel>
 
       <Panel title="Lernmodell">
@@ -645,6 +665,151 @@ function AnalysisTab({ draft, update }: { draft: Settings; update: UpdateFn }) {
           </Field>
         </div>
       </Panel>
+    </div>
+  );
+}
+
+/** Codec exclusions.
+ *
+ * This used to be a comma-separated text field, which meant guessing the name
+ * ffprobe uses: typing "h265" looked accepted and did nothing at all.  Now the
+ * library itself supplies the list, with the file counts that make the choice
+ * obvious, and the consequence of the pending change is spelled out before it
+ * is saved - checking HEVC drops however many candidates are behind it.
+ */
+function CodecExclusions({
+  selected,
+  onChange,
+}: {
+  selected: string[];
+  onChange: (values: string[]) => void;
+}) {
+  const { data, isLoading } = useQuery({
+    queryKey: ["library", "codecs"],
+    queryFn: endpoints.libraryCodecs,
+  });
+  const [pending, setPending] = useState("");
+
+  const chosen = useMemo(() => new Set(selected), [selected]);
+
+  // The list the server knows, plus anything picked in this session that is
+  // not in the library at all.
+  const rows = useMemo(() => {
+    const items = data?.items ?? [];
+    const known = new Map((data?.known ?? []).map((k) => [k.codec, k.label]));
+    const extra = selected
+      .filter((codec) => !items.some((i) => i.codec === codec))
+      .map((codec) => ({
+        codec,
+        label: known.get(codec) ?? codec.toUpperCase(),
+        files: 0,
+        total_size: 0,
+        candidates: 0,
+        excluded: false,
+      }));
+    return [...items, ...extra];
+  }, [data, selected]);
+
+  const addable = useMemo(
+    () => (data?.known ?? []).filter((k) => !rows.some((r) => r.codec === k.codec)),
+    [data, rows],
+  );
+
+  // What saving would do - counted against the state the server has stored.
+  const losing = rows
+    .filter((r) => chosen.has(r.codec) && !r.excluded)
+    .reduce((sum, r) => sum + r.candidates, 0);
+  const returning = rows.filter((r) => !chosen.has(r.codec) && r.excluded);
+
+  function toggle(codec: string) {
+    onChange(
+      chosen.has(codec) ? selected.filter((c) => c !== codec) : [...selected, codec],
+    );
+  }
+
+  if (isLoading) return <Skeleton className="h-40" />;
+
+  return (
+    <div className="space-y-3">
+      <div className="space-y-2">
+        {rows.map((row) => {
+          const active = chosen.has(row.codec);
+          return (
+            <label
+              key={row.codec}
+              className={cn(
+                "flex cursor-pointer items-center gap-3 rounded-lg border px-4 py-3 transition-colors",
+                active
+                  ? "border-brand-600/40 bg-brand-600/10"
+                  : "border-ink-700/70 bg-ink-850/40 hover:border-ink-600",
+              )}
+            >
+              <input
+                type="checkbox"
+                checked={active}
+                onChange={() => toggle(row.codec)}
+                className="size-4 shrink-0 rounded border-ink-600 bg-ink-800 accent-brand-500"
+              />
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-sm font-medium text-ink-100">{row.label}</p>
+                <p className="mt-0.5 text-xs text-ink-500">
+                  {row.files ? (
+                    <>
+                      {number(row.files)} Dateien · {bytes(row.total_size)}
+                      {row.candidates > 0 && (
+                        <span className="text-save-400"> · {number(row.candidates)} Kandidaten</span>
+                      )}
+                    </>
+                  ) : (
+                    "keine Dateien in der Bibliothek"
+                  )}
+                </p>
+              </div>
+              <span className="shrink-0 font-mono text-xs text-ink-500">{row.codec}</span>
+            </label>
+          );
+        })}
+      </div>
+
+      {addable.length > 0 && (
+        <Field
+          label="Weiteren Codec ausschliessen"
+          hint="Auch fuer Material, das erst spaeter in der Bibliothek landet."
+        >
+          <Select
+            value={pending}
+            onChange={(codec) => {
+              if (codec) onChange([...selected, codec]);
+              setPending("");
+            }}
+            options={[
+              { value: "", label: "Codec waehlen ..." },
+              ...addable.map((k) => ({ value: k.codec, label: k.label })),
+            ]}
+          />
+        </Field>
+      )}
+
+      {losing > 0 && (
+        <Callout tone="warn">
+          Beim Speichern fallen <strong>{number(losing)} Kandidaten</strong> aus der Liste. Die
+          Dateien bleiben auf der Platte unveraendert - sie werden nur nicht mehr vorgeschlagen.
+        </Callout>
+      )}
+
+      {returning.map((row) => (
+        <Callout key={row.codec} tone="info">
+          {row.label} wird wieder zugelassen. Die {number(row.files)} betroffenen Dateien werden
+          beim naechsten Scan neu bewertet.
+        </Callout>
+      ))}
+
+      {!chosen.has("av1") && (
+        <Callout tone="warn">
+          AV1 ist nicht ausgeschlossen. Eine AV1-Datei erneut nach AV1 zu kodieren kostet
+          Qualitaet und spart nichts - das sollte angehakt bleiben.
+        </Callout>
+      )}
     </div>
   );
 }
