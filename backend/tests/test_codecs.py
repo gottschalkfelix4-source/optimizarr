@@ -17,9 +17,9 @@ from app.config import AppSettings  # noqa: E402
 from app.core import codecs, predictor, scanner  # noqa: E402
 from app.core.analyzer import precheck  # noqa: E402
 from app.core.ffmpeg import MediaInfo  # noqa: E402
-from app.db import session_scope  # noqa: E402
+from app.db import engine, session_scope  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import FileState, MediaFile  # noqa: E402
+from app.models import Base, FileState, MediaFile  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -131,8 +131,16 @@ def test_hevc_is_a_candidate_when_it_is_not_excluded():
 # Applying a changed exclusion list to files that were already analysed
 # --------------------------------------------------------------------------- #
 
+@pytest.fixture(scope="module", autouse=True)
+def _schema():
+    """The tables normally appear when the app starts up.  Most tests here do
+    not need a running app, so create them explicitly instead of depending on
+    another test having gone first."""
+    Base.metadata.create_all(engine())
+
+
 @pytest.fixture(autouse=True)
-def _clean_test_files():
+def _clean_test_files(_schema):
     """Each test starts from an empty library - counts are asserted globally."""
     def wipe():
         with session_scope() as s:
