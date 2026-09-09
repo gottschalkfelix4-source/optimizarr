@@ -18,7 +18,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from .core.codecs import normalise_list as _normalise_codecs
+from .core.codecs import is_excluded, normalise, normalise_list as _normalise_codecs
 
 CONFIG_DIR = Path(os.environ.get("OPTIMIZARR_CONFIG_DIR", "/config"))
 TRANSCODE_DIR = Path(os.environ.get("OPTIMIZARR_TRANSCODE_DIR", "/transcode"))
@@ -49,6 +49,10 @@ class LibrarySettings(BaseModel):
 class AnalysisSettings(BaseModel):
     """How hard Optimizarr thinks before proposing a conversion."""
 
+    convert_all_h264: bool = Field(
+        False,
+        description="Convert H.264 to AV1 even without savings; larger outputs are accepted",
+    )
     mode: Literal["quick", "sample", "vmaf"] = Field(
         "sample",
         description=(
@@ -76,6 +80,13 @@ class AnalysisSettings(BaseModel):
     analysis_workers: int = Field(2, ge=1, le=16)
     use_learning_model: bool = True
     trust_learning_after_samples: int = Field(15, ge=3, le=500)
+
+    def requires_h264_conversion(self, codec: str) -> bool:
+        return (
+            self.convert_all_h264
+            and normalise(codec) == "h264"
+            and not is_excluded(codec, self.skip_codecs)
+        )
 
     @field_validator("skip_codecs")
     @classmethod
@@ -230,7 +241,7 @@ class AdvisorSettings(BaseModel):
 
     # --- ChatGPT sign-in (Codex).  Tokens live in the oauth_credentials table. ---
     codex_model: str = Field(
-        "gpt-5.6-sol",
+        "gpt-6-astra",
         description=(
             "Model requested over the ChatGPT backend. Slugs rotate and depend on the "
             "plan - the settings screen can fetch the account's actual list."

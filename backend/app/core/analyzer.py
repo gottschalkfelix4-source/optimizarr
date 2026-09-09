@@ -11,8 +11,8 @@ Three depths, picked in the settings:
             gets the highest CRF that still hits the quality bar.
 
 Every path ends in the same place: a prediction, a plan, and a decision with a
-reason a human can read.  The guiding rule is that a file must never come out
-bigger than it went in, so uncertainty always resolves towards skipping.
+reason a human can read.  Normally uncertainty resolves towards skipping;
+the explicit H.264 migration mode prioritises changing codec over saving space.
 """
 from __future__ import annotations
 
@@ -108,17 +108,18 @@ def precheck(info: ffmpeg.MediaInfo, settings: AppSettings) -> tuple[bool, str]:
         if codec == "av1":
             return True, "Bereits AV1 - eine Neukodierung wuerde nur Qualitaet kosten."
         return True, f"{codecs.label(codec)} {codecs.EXCLUSION_REASON}"
-    if info.duration and info.duration < settings.library.min_duration_seconds:
+    migrate = settings.analysis.requires_h264_conversion(codec)
+    if not migrate and info.duration and info.duration < settings.library.min_duration_seconds:
         return True, (
             f"Nur {info.duration:.0f}s lang - unter der Mindestlaenge von "
             f"{settings.library.min_duration_seconds}s."
         )
-    if info.size and info.size < settings.library.min_file_size_mb * 1024 * 1024:
+    if not migrate and info.size and info.size < settings.library.min_file_size_mb * 1024 * 1024:
         return True, f"Datei ist nur {info.size / 1024 / 1024:.0f} MB - zu klein zum Optimieren."
     if not info.width or not info.height:
         return True, "Keine gueltigen Bildmasse gefunden."
 
-    if info.video_bitrate > 0:
+    if not migrate and info.video_bitrate > 0:
         floor_kbps = settings.analysis.skip_if_bitrate_below_kbps
         if floor_kbps:
             if info.video_bitrate < floor_kbps * 1000:
@@ -405,7 +406,7 @@ async def analyze(
 
     # Skip the expensive path when the cheap one already says "hopeless".
     hopeless = quick.saving_pct < (settings.analysis.min_saving_percent - 25.0)
-    if mode != "quick" and hopeless:
+    if mode != "quick" and hopeless and not settings.analysis.requires_h264_conversion(info.video_codec):
         result.reasons.append(
             "Schnellschaetzung liegt weit unter der Zielersparnis - Testkodierung "
             "wurde eingespart."
@@ -560,6 +561,15 @@ def _decide(
 ) -> None:
     """Apply the thresholds and write a human-readable verdict."""
     cfg = settings.analysis
+    if cfg.requires_h264_conversion(info.video_codec):
+        result.decision = "convert"
+        result.reason = (
+            "H.264 vollstaendig nach AV1 konvertieren: "
+            f"{_fmt(info.size)} -> voraussichtlich {_fmt(result.estimated_size)}. "
+            "Die Umstellung erfolgt unabhaengig von der Ersparnis; groessere Ergebnisse sind erlaubt."
+        )
+        result.reasons.insert(0, result.reason)
+        return
     saving_pct = result.estimated_saving_pct
     saving_bytes = result.estimated_saving_bytes
     min_pct = cfg.min_saving_percent

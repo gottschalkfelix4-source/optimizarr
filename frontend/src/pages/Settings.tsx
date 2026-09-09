@@ -85,6 +85,12 @@ export default function SettingsPage() {
       // Changing the codec exclusions moves files in and out of the candidate
       // list, so say what happened instead of leaving stale numbers on screen.
       const codecs = applied?.codec_exclusions;
+      if (applied?.h264_reanalysis) {
+        push(`${applied.h264_reanalysis} H.264-Dateien zur Neubewertung vorgemerkt. Jetzt einen Scan starten.`, "info");
+        ["files", "stats", "library"].forEach((key) =>
+          queryClient.invalidateQueries({ queryKey: [key] }),
+        );
+      }
       if (codecs && (codecs.excluded || codecs.restored)) {
         const parts: string[] = [];
         if (codecs.excluded) parts.push(`${codecs.excluded} aus der Kandidatenliste entfernt`);
@@ -484,6 +490,26 @@ function AnalysisTab({ draft, update }: { draft: Settings; update: UpdateFn }) {
   const mode = draft.analysis.mode;
   return (
     <div className="space-y-4">
+      <Panel title="H.264 auf AV1 umstellen" subtitle="Alle erfassten H.264-Dateien als Konvertierungskandidaten behandeln">
+        <Toggle
+          label="H.264 vollstaendig nach AV1 konvertieren"
+          checked={draft.analysis.convert_all_h264}
+          onChange={(convert_all_h264) => update("analysis", { convert_all_h264 })}
+          hint="Umgeht fuer H.264 die Grenzen fuer Dateigroesse, Laufzeit, Bitrate und Ersparnis, auch beim automatischen Einreihen und beim Annehmen des Ergebnisses. Einzelne AV1-Dateien koennen dadurch groesser werden."
+        />
+        <p className="mt-3 text-xs leading-relaxed text-ink-400">
+          Nach dem Speichern einen Scan starten: Bereits uebersprungene H.264-Dateien werden neu bewertet.
+          Ausgeschlossene Ordner, Dateitypen, Codecs und ignorierte Dateien bleiben ausgenommen.
+          Integritaets- und aktivierte Qualitaetspruefungen gelten weiterhin.
+          Fuer eine Bibliothek ohne H.264 unter Ausgabe den Modus „Ersetzen“ verwenden;
+          separate AV1-Kopien lassen das H.264-Original bestehen.
+        </p>
+        {draft.analysis.convert_all_h264 && draft.analysis.skip_codecs.includes("h264") && (
+          <p className="mt-3 text-sm text-warn-400">
+            H.264 ist derzeit unter „Codecs ausschliessen“ angehakt. Diesen Ausschluss entfernen, damit die Umstellung greift.
+          </p>
+        )}
+      </Panel>
       <Panel
         title="Wie gruendlich analysiert wird"
         subtitle="Der wichtigste Kompromiss zwischen Geschwindigkeit und Treffsicherheit"
@@ -596,7 +622,7 @@ function AnalysisTab({ draft, update }: { draft: Settings; update: UpdateFn }) {
         <div className="grid gap-5 md:grid-cols-2">
           <Field
             label="Mindestersparnis"
-            hint="Darunter bleibt die Datei unangetastet. Bei unsicheren Schaetzungen erhoeht Optimizarr diese Schwelle automatisch."
+            hint="Darunter bleibt die Datei unangetastet. Bei unsicheren Schaetzungen steigt die Schwelle. Gilt nicht fuer H.264 im Umstellungsmodus."
           >
             <SliderField
               value={draft.analysis.min_saving_percent}
@@ -1190,11 +1216,11 @@ function OutputTab({ draft, update }: { draft: Settings; update: UpdateFn }) {
             checked={draft.output.require_smaller}
             onChange={(require_smaller) => update("output", { require_smaller })}
             label="Ergebnis muss kleiner sein als das Original"
-            hint="Sollte immer an bleiben - genau dafuer gibt es dieses Werkzeug."
+            hint="Verhindert groessere Ergebnisse. Gilt nicht fuer H.264, wenn die vollstaendige Umstellung unter Analyse aktiviert ist."
           />
           <Field
             label="Mindestersparnis zum Behalten"
-            hint="Ein Encode, der nur 2 % spart, ist den Qualitaetsverlust nicht wert."
+            hint="Ergebnisse unter dieser Ersparnis werden verworfen. H.264 im Umstellungsmodus ist davon ausgenommen."
           >
             <SliderField
               value={draft.output.min_accept_saving_percent}
@@ -1435,7 +1461,7 @@ function QueueTab({ draft, update }: { draft: Settings; update: UpdateFn }) {
           {draft.queue.auto_queue_candidates && (
             <Field
               label="Nur ab dieser Ersparnis automatisch einreihen"
-              hint="Schuetzt davor, dass Grenzfaelle ungefragt Rechenzeit verbrauchen."
+              hint="Schuetzt davor, dass Grenzfaelle ungefragt Rechenzeit verbrauchen. H.264 im Umstellungsmodus wird unabhaengig von dieser Schwelle eingereiht."
             >
               <SliderField
                 value={draft.queue.auto_queue_min_saving_percent}

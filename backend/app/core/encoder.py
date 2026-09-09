@@ -1,10 +1,8 @@
 """Job execution: run the encode, then decide whether to keep the result.
 
-The rule the whole tool is built around - *a file must never come back bigger or
-visibly worse* - is enforced here, not in the analyzer.  The analyzer only makes
-predictions; this module measures what actually came out and throws the result
-away if it does not beat the original.  Nothing overwrites an original until
-every gate has passed.
+The analyzer predicts; this module measures the actual result and enforces the
+configured gates. Explicit H.264 migration allows larger files, while integrity
+and configured quality checks still apply before an original is replaced.
 """
 from __future__ import annotations
 
@@ -382,13 +380,14 @@ async def run_job(
         # ---------------- gate 2: is it actually smaller? ----------------- #
         saved = outcome.input_size - outcome.output_size
         saved_pct = (saved / outcome.input_size * 100) if outcome.input_size else 0.0
-        if settings.output.require_smaller and saved <= 0:
+        migrate = settings.analysis.requires_h264_conversion(info.video_codec)
+        if not migrate and settings.output.require_smaller and saved <= 0:
             return _reject(
                 job_id, file_id, outcome,
                 f"Ergebnis waere groesser gewesen ({_fmt(outcome.output_size)} statt "
                 f"{_fmt(outcome.input_size)}) - Original bleibt unveraendert.",
             )
-        if saved_pct < settings.output.min_accept_saving_percent:
+        if not migrate and saved_pct < settings.output.min_accept_saving_percent:
             return _reject(
                 job_id, file_id, outcome,
                 f"Nur {saved_pct:.1f}% gespart - unter der Annahmeschwelle von "
@@ -414,9 +413,10 @@ async def run_job(
             _commit_output, source, str(temp_out), plan, settings, info
         )
         outcome.ok = True
+        size_change = f"{saved_pct:.0f}% gespart" if saved >= 0 else f"{-saved_pct:.0f}% groesser"
         outcome.reason = (
             f"Fertig: {_fmt(outcome.input_size)} -> {_fmt(outcome.output_size)} "
-            f"({saved_pct:.0f}% gespart)"
+            f"({size_change})"
         )
         await asyncio.to_thread(
             _record_success, job_id, file_id, outcome, final_path, plan, info, settings

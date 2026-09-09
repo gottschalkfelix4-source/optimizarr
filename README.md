@@ -19,6 +19,23 @@ solange das Ergebnis nicht nachweislich besser ist.
 
 ## Wie die Entscheidung zustande kommt
 
+### Ziel: kein H.264 mehr in der Bibliothek
+
+Unter **Einstellungen → Analyse → H.264 vollstaendig nach AV1 konvertieren**
+laesst sich die Codec-Umstellung statt der Speicherersparnis priorisieren.
+Danach einen Scan starten: Bereits uebersprungene H.264-Dateien werden neu bewertet,
+auch wenn sich die Dateien nicht geaendert haben. Kleine und kurze H.264-Dateien
+werden ebenfalls beruecksichtigt. Fuer diese Dateien entfallen Bitraten- und
+Ersparnisschwellen bei Analyse, automatischem Einreihen und Ergebnisannahme.
+**AV1-Ergebnisse duerfen in diesem Modus groesser als die Originale sein.**
+Integritaets- und aktivierte Qualitaetspruefungen bleiben erhalten.
+
+Der Modus ist standardmaessig aus. Ordner-/Dateityp-/Codec-Ausschluesse und
+ignorierte Dateien gelten weiterhin. Automatisches Einreihen muss separat aktiviert
+sein; ansonsten die Kandidaten manuell einreihen. Unter Ausgabe **Ersetzen** verwenden:
+Bei Sidecar oder separatem Ausgabeordner bleibt die H.264-Quelle bestehen.
+Originale im Papierkorb bleiben bis zum Ablauf der Aufbewahrung erhalten.
+
 Für jede Datei laufen bis zu drei Stufen. Was davon zum Einsatz kommt, stellst du in der
 Oberfläche ein.
 
@@ -99,11 +116,22 @@ nicht selbst auffangen. Der Anmelde-Assistent führt deshalb durch drei Schritte
 Feld kopieren. Wer das Codex-CLI schon eingerichtet hat, kann stattdessen den Inhalt von
 `~/.codex/auth.json` einfügen.
 
+Die Codex-Anbindung im Image verwendet den Kompatibilitaetsstand **0.153.4**
+und bietet **GPT-6 Astra** (`gpt-6-astra`) als Standard fuer neue Konfigurationen an.
+Sie ist direkt in Optimizarr implementiert; eine separate Codex-CLI wird nicht gestartet.
+Nach einem Image-Update bleiben gespeicherte Modelleinstellungen erhalten.
+Zum Wechsel unter **Einstellungen → KI-Berater → ChatGPT-Anmeldung** auf
+**GPT-6 Astra verwenden** klicken, speichern und **Testen** ausfuehren.
+**Liste abrufen** aktualisiert die vom Konto gemeldeten Modelle; ob Astra nutzbar ist,
+haengt vom Kontozugang ab. Siehe [Codex-Modelle](https://learn.chatgpt.com/docs/models)
+und [Codex 0.153.4](https://learn.chatgpt.com/docs/changelog).
+
 ---
 
 ## Was garantiert nicht passiert
 
-Bevor ein Original ersetzt wird, muss das Ergebnis **jede** dieser Prüfungen bestehen:
+Bevor ein Original ersetzt wird, gelten die konfigurierten Pruefungen.
+Im H.264-Umstellungsmodus entfallen fuer H.264 nur Groesse und Mindestersparnis:
 
 | Prüfung | Was geprüft wird |
 |---|---|

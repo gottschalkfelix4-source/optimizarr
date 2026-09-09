@@ -583,7 +583,7 @@ function CodexPanel({
                 className="field font-mono text-sm"
                 value={draft.advisor.codex_model}
                 onChange={(e) => update("advisor", { codex_model: e.target.value })}
-                placeholder="gpt-5.6-sol"
+                placeholder="gpt-6-astra"
                 list="codex-model-list"
               />
               <datalist id="codex-model-list">
@@ -604,6 +604,15 @@ function CodexPanel({
                 )}
               </button>
             </div>
+            {draft.advisor.codex_model !== "gpt-6-astra" && (
+              <button
+                type="button"
+                className="mt-2 text-xs text-brand-400 hover:underline"
+                onClick={() => update("advisor", { codex_model: "gpt-6-astra" })}
+              >
+                GPT-6 Astra verwenden
+              </button>
+            )}
           </Field>
           <Field
             label="Denktiefe"

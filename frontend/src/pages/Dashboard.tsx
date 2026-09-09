@@ -226,7 +226,7 @@ export default function Dashboard() {
         </Panel>
 
         {/* ---------------- codec distribution ---------------- */}
-        <Panel title="Codecs in der Bibliothek" subtitle="nach belegtem Speicher">
+        <Panel title="Codecs in der Bibliothek" subtitle="nach belegtem Speicher · inklusive uebersprungener Dateien">
           {stats?.codecs.length ? (
             <div className="space-y-3">
               <ResponsiveContainer width="100%" height={170}>

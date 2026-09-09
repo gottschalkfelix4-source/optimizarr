@@ -133,7 +133,7 @@ class SettingsPatch(BaseModel):
 
 @router.put("/settings")
 def put_settings(patch: dict[str, Any]) -> dict[str, Any]:
-    before = load_settings().analysis.skip_codecs
+    before = load_settings().analysis
     try:
         settings = update_settings(patch)
     except Exception as exc:
@@ -144,7 +144,10 @@ def put_settings(patch: dict[str, Any]) -> dict[str, Any]:
     # analysed - otherwise it would only apply to the next scan and the
     # candidate list the user wanted cleaned up would stay exactly as it was.
     payload["applied"] = {
-        "codec_exclusions": scanner.apply_codec_exclusions(before, settings.analysis.skip_codecs)
+        "h264_reanalysis": scanner.apply_h264_conversion_change(
+            before.convert_all_h264, settings.analysis.convert_all_h264
+        ),
+        "codec_exclusions": scanner.apply_codec_exclusions(before.skip_codecs, settings.analysis.skip_codecs)
     }
     return payload
 
@@ -169,11 +172,14 @@ async def test_advisor(payload: dict[str, Any] | None = None) -> dict[str, Any]:
 
 @router.post("/settings/reset")
 def reset_settings() -> dict[str, Any]:
-    before = load_settings().analysis.skip_codecs
+    before = load_settings().analysis
     settings = save_settings(AppSettings())
     bus.publish("settings.changed", {"reset": True})
     payload = settings.model_dump(mode="json")
     payload["applied"] = {
-        "codec_exclusions": scanner.apply_codec_exclusions(before, settings.analysis.skip_codecs)
+        "h264_reanalysis": scanner.apply_h264_conversion_change(
+            before.convert_all_h264, settings.analysis.convert_all_h264
+        ),
+        "codec_exclusions": scanner.apply_codec_exclusions(before.skip_codecs, settings.analysis.skip_codecs)
     }
     return payload

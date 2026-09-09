@@ -24,6 +24,7 @@ from app.core.advisor import codex_oauth  # noqa: E402
 from app.core.advisor.base import AdvisorUnavailable, extract_json  # noqa: E402
 from app.core.advisor.codex_oauth import TokenSet  # noqa: E402
 from app.core.advisor.provider_codex import (  # noqa: E402
+    CLIENT_VERSION,
     FALLBACK_MODELS,
     CodexProvider,
 )
@@ -122,9 +123,10 @@ def test_secrets_are_redacted_from_text():
 # Request shape for the ChatGPT backend
 # --------------------------------------------------------------------------- #
 
-def test_request_body_obeys_the_backend_constraints():
+@pytest.mark.parametrize("model", ["gpt-6-astra", "gpt-5.6-sol"])
+def test_request_body_obeys_the_backend_constraints(model):
     provider = CodexProvider(
-        AdvisorSettings(provider="openai_codex", codex_model="gpt-5.6-sol")
+        AdvisorSettings(provider="openai_codex", codex_model=model)
     )
     body = provider._build_body("SYS", "USER")
 
@@ -132,7 +134,7 @@ def test_request_body_obeys_the_backend_constraints():
     assert body["stream"] is True           # there is no non-streaming mode
     assert "reasoning.encrypted_content" in body["include"]
     assert "max_output_tokens" not in body  # rejected outright
-    assert body["model"] == "gpt-5.6-sol"
+    assert body["model"] == model
     # Responses API shape, not chat completions.
     assert body["input"][0]["content"][0]["type"] == "input_text"
 
@@ -177,7 +179,56 @@ def test_headers_survive_a_missing_account_id():
 def test_fallback_model_list_has_no_retired_slugs():
     assert "gpt-5-codex" not in FALLBACK_MODELS      # historical slug
     assert "codex-mini-latest" not in FALLBACK_MODELS
-    assert all(m.startswith("gpt-5") for m in FALLBACK_MODELS)
+    assert FALLBACK_MODELS[0] == "gpt-6-astra"
+    assert len(FALLBACK_MODELS) == len(set(FALLBACK_MODELS))
+
+
+def test_astra_default_preserves_an_explicit_saved_model():
+    from app.config import _rows_to_settings
+
+    assert _rows_to_settings({}).advisor.codex_model == "gpt-6-astra"
+    assert _rows_to_settings({"advisor": {"codex_model": "gpt-5.6-terra"}}).advisor.codex_model == "gpt-5.6-terra"
+    body = CodexProvider(AdvisorSettings(codex_model=" "))._build_body("sys", "user")
+    assert body["model"] == "gpt-6-astra"
+
+
+@pytest.mark.anyio
+async def test_astra_model_discovery_and_request_use_updated_client(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    calls = []
+
+    def handler(request):
+        calls.append(request.method)
+        assert request.headers["version"] == "0.153.4" == CLIENT_VERSION
+        assert f"/{CLIENT_VERSION} " in request.headers["User-Agent"]
+        if request.method == "GET":
+            assert request.url.params["client_version"] == CLIENT_VERSION
+            return httpx.Response(200, json={"models": [{"slug": "gpt-6-astra"}]})
+        body = json.loads(request.content)
+        assert body["model"] == "gpt-6-astra"
+        assert body["reasoning"]["effort"] == "low"
+        event = {"type": "response.completed", "response": {
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": json.dumps(GOOD)}]}],
+            "usage": {"input_tokens": 10, "output_tokens": 20},
+        }}
+        return httpx.Response(200, text=f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n")
+
+    provider = CodexProvider(AdvisorSettings(provider="openai_codex"))
+    provider._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(provider, "_valid_tokens", AsyncMock(return_value=TokenSet(access_token="test-token")))
+    try:
+        models, _ = await provider.list_models()
+        assert models == ["gpt-6-astra"]
+        await provider.list_models()  # cached
+        await provider.list_models(force=True)
+        raw = await provider.complete("sys", "user", 30)
+        assert raw.model == "gpt-6-astra"
+        assert extract_json(raw.text) == GOOD
+        assert (raw.input_tokens, raw.output_tokens) == (10, 20)
+        assert calls == ["GET", "GET", "POST"]
+    finally:
+        await provider.aclose()
 
 
 def test_model_not_found_is_explained_as_gating():

@@ -73,7 +73,12 @@ def walk_paths(
     """Yield (library_id, path, size, mtime) for every eligible video file."""
     extensions = {f".{e.lower().lstrip('.')}" for e in settings.library.extensions}
     excludes = settings.library.exclude_patterns
-    min_size = settings.library.min_file_size_mb * 1024 * 1024
+    # The codec is unknown until probing, so small files must reach that stage
+    # too when migrating H.264. Other codecs still face the normal precheck.
+    min_size = (
+        0 if settings.analysis.requires_h264_conversion("h264")
+        else settings.library.min_file_size_mb * 1024 * 1024
+    )
     follow = settings.library.follow_symlinks
     seen_dirs: set[tuple[int, int]] = set()
 
@@ -486,10 +491,14 @@ def _auto_queue(settings: AppSettings) -> int:
             select(MediaFile).where(
                 MediaFile.state == FileState.CANDIDATE.value,
                 MediaFile.ignored.is_(False),
-                MediaFile.estimated_saving_pct >= threshold,
             )
         ).scalars().all()
         for row in rows:
+            if (
+                not settings.analysis.requires_h264_conversion(row.video_codec)
+                and row.estimated_saving_pct < threshold
+            ):
+                continue
             active = s.execute(
                 select(Job).where(
                     Job.file_id == row.id,
@@ -515,6 +524,34 @@ def cancel_scan() -> bool:
         state.cancel.set()
         return True
     return False
+
+
+def apply_h264_conversion_change(before: bool, after: bool) -> int:
+    """Re-evaluate stored decisions once when the migration mode changes."""
+    from . import codecs
+
+    if before == after:
+        return 0
+    count = 0
+    with session_scope() as s:
+        rows = s.execute(select(MediaFile).where(
+            MediaFile.state.in_([FileState.CANDIDATE.value, FileState.SKIPPED.value]),
+            MediaFile.ignored.is_(False),
+        )).scalars().all()
+        for row in rows:
+            if codecs.normalise(row.video_codec) != "h264":
+                continue
+            row.state = FileState.PROBED.value
+            row.analyzed_at = None
+            row.decision_reason = "H.264-Modus geaendert - Neubewertung beim naechsten Scan."
+            row.plan = None
+            row.estimated_size = 0
+            row.estimated_saving_bytes = 0
+            row.estimated_saving_pct = 0.0
+            count += 1
+    if count:
+        bus.publish("library.changed", {"h264_reanalysis": count})
+    return count
 
 
 # --------------------------------------------------------------------------- #

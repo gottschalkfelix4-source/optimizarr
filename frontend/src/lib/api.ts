@@ -398,6 +398,7 @@ export interface Settings {
     reanalyze_after_days: number;
   };
   analysis: {
+    convert_all_h264: boolean;
     mode: "quick" | "sample" | "vmaf";
     sample_count: number;
     sample_duration: number;
@@ -531,7 +532,7 @@ export interface CodecExclusionResult {
 }
 
 export type SettingsSaveResult = Settings & {
-  applied?: { codec_exclusions?: CodecExclusionResult };
+  applied?: { codec_exclusions?: CodecExclusionResult; h264_reanalysis?: number };
 };
 
 /** One video codec the library contains, or one that is excluded by hand. */
