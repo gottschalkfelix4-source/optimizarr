@@ -98,9 +98,15 @@ def test_place_reads_sonarr_style_paths(rel, expected):
     assert (spot.series, spot.season, spot.episode) == expected
 
 
-def test_files_outside_the_root_or_loose_movies_are_not_placed():
+def test_files_outside_the_root_are_not_placed():
     assert series.place("/media/tv-old/Show/Show S01E01.mkv", ROOT) is None
-    assert series.place(f"{ROOT}/Some Movie (2020).mkv", ROOT) is None
+
+
+def test_a_loose_file_is_a_group_of_its_own():
+    spot = series.place(f"{ROOT}/Some.Movie.2020.mkv", ROOT)
+    assert (spot.series, spot.folder, spot.season, spot.episode) == (
+        "Some Movie 2020", "", None, None,
+    )
 
 
 def test_windows_separators_are_understood():

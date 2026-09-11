@@ -592,6 +592,36 @@ export interface SeriesDetail extends SeriesSummary {
   seasons: SeriesSeason[];
 }
 
+export interface MovieFile {
+  id: number;
+  path: string;
+  name: string;
+  state: FileState;
+  bucket: SeriesBucket;
+  ignored: boolean;
+  video_codec: string;
+  width: number;
+  height: number;
+  size: number;
+  original_size: number;
+  estimated_saving_bytes: number;
+  decision_reason: string;
+  error: string;
+}
+
+/** A movie folder; ``episodes`` from the tally is its file count. */
+export interface MovieSummary extends SeriesTally {
+  key: string;
+  library_id: number;
+  library: string;
+  name: string;
+  title: string;
+  year: number | null;
+  path: string;
+  /** Largest first: the film itself, then other versions and extras. */
+  files: MovieFile[];
+}
+
 export interface EnqueueResult {
   added: number;
   skipped: string[];
@@ -697,6 +727,7 @@ export const endpoints = {
     api.get<SeriesDetail>(`/series/detail?key=${encodeURIComponent(key)}`),
   enqueueSeries: (payload: { key: string; season?: number; force?: boolean }) =>
     api.post<EnqueueResult>("/series/enqueue", payload),
+  movies: () => api.get<{ items: MovieSummary[]; totals: SeriesTally }>("/movies"),
 
   stats: () => api.get<Stats>("/stats"),
   modelStats: () =>

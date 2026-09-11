@@ -17,34 +17,41 @@ from . import serializers
 router = APIRouter()
 
 # Only what the grouping needs - stream lists and plans stay in the database.
-_COLUMNS = (
+COLUMNS = (
     MediaFile.id, MediaFile.path, MediaFile.library_id, MediaFile.state,
     MediaFile.video_codec, MediaFile.ignored, MediaFile.size, MediaFile.original_size,
     MediaFile.estimated_saving_bytes, MediaFile.converted_at,
 )
 
 
-def _groups(session: Session, library_id: int | None = None) -> list[series.SeriesGroup]:
+def load_groups(
+    session: Session, library_id: int | None = None, columns: tuple[Any, ...] = COLUMNS,
+) -> list[series.SeriesGroup]:
+    """Every folder group, series and movies alike."""
     libraries = {
         row.id: (row.path, row.name or Path(row.path).name or row.path)
         for row in session.execute(select(LibraryPath)).scalars()
     }
-    query = select(*_COLUMNS).where(MediaFile.library_id.is_not(None))
+    query = select(*columns).where(MediaFile.library_id.is_not(None))
     if library_id is not None:
         query = query.where(MediaFile.library_id == library_id)
     return series.group(session.execute(query).all(), libraries)
 
 
+def _series(session: Session, library_id: int | None = None) -> list[series.SeriesGroup]:
+    return [g for g in load_groups(session, library_id) if g.looks_like_series]
+
+
 def _find(session: Session, key: str) -> series.SeriesGroup:
     parsed = series.split_key(key)
     if parsed is not None:
-        for entry in _groups(session, parsed[0]):
+        for entry in _series(session, parsed[0]):
             if entry.key == key:
                 return entry
     raise HTTPException(status_code=404, detail="Serie nicht gefunden")
 
 
-def _tally(tally: series.Tally) -> dict[str, Any]:
+def tally_dict(tally: series.Tally) -> dict[str, Any]:
     return {**tally.as_dict(), "last_converted": serializers.iso(tally.last_converted)}
 
 
@@ -56,17 +63,17 @@ def _summary(entry: series.SeriesGroup) -> dict[str, Any]:
         "name": entry.name,
         "path": entry.path,
         "season_count": sum(1 for s in entry.seasons if s),
-        **_tally(entry.tally),
+        **tally_dict(entry.tally),
     }
 
 
 @router.get("/series")
 def list_series(session: Session = Depends(get_session)) -> dict[str, Any]:
-    entries = _groups(session)
+    entries = _series(session)
     totals = series.Tally()
     for entry in entries:
         totals.merge(entry.tally)
-    return {"items": [_summary(e) for e in entries], "totals": _tally(totals)}
+    return {"items": [_summary(e) for e in entries], "totals": tally_dict(totals)}
 
 
 @router.get("/series/detail")
@@ -87,7 +94,7 @@ def series_detail(key: str, session: Session = Depends(get_session)) -> dict[str
         seasons.append({
             "season": number,
             "label": series.season_label(number),
-            **_tally(entry.seasons[number]),
+            **tally_dict(entry.seasons[number]),
             # Not "episodes": that is the count from the tally.
             "files": [
                 {

@@ -8,8 +8,8 @@ layout Sonarr produces (and most people keep by hand) is
 so the series is the first folder below the library root, season and episode
 come from ``S01E01`` (or ``1x01``) in the file name, and a season folder fills
 in the season when the name has none.  A folder only counts as a series when at
-least one file in it looks like an episode - a movie library stays out of the
-list instead of turning every film into a one-episode series.
+least one file in it looks like an episode; every other folder - and every loose
+file that does not look like an episode - is a movie (see ``movies``).
 """
 from __future__ import annotations
 
@@ -72,10 +72,9 @@ def _series_from_name(stem: str, marker_at: int) -> str:
 
 
 def place(path: str, library_root: str) -> Placement | None:
-    """Series, season and episode of one file.
+    """Group, season and episode of one file; None when it is not below the root.
 
-    None when the file is not below ``library_root``, or lies loose in the root
-    without looking like an episode.
+    A file lying loose in the root is a group of its own, named after the file.
     """
     norm = path.replace("\\", "/")
     root = library_root.replace("\\", "/").rstrip("/")
@@ -94,8 +93,6 @@ def place(path: str, library_root: str) -> Placement | None:
                 break
 
     if len(parts) == 1:
-        if episode is None:
-            return None
         return Placement(_series_from_name(stem, marker_at), "", season, episode)
     return Placement(parts[0], parts[0], season, episode)
 
@@ -203,6 +200,7 @@ class Episode:
     season: int | None
     episode: int | None
     bucket: str
+    row: Any = field(default=None, repr=False, compare=False)   # the columns it was grouped from
 
 
 @dataclass
@@ -225,7 +223,7 @@ class SeriesGroup:
 
 
 def group(rows: Iterable[Any], libraries: dict[int, tuple[str, str]]) -> list[SeriesGroup]:
-    """Sort files into series.
+    """Sort files into folder groups - series and movies alike.
 
     ``rows`` need ``id``, ``path``, ``library_id``, ``state``, ``video_codec``,
     ``ignored``, ``size``, ``original_size``, ``estimated_saving_bytes`` and
@@ -249,10 +247,9 @@ def group(rows: Iterable[Any], libraries: dict[int, tuple[str, str]]) -> list[Se
                 path=f"{base}/{spot.folder}" if spot.folder else (base or "/"),
             )
         kind = bucket(row.state, row.video_codec, bool(row.ignored))
-        entry.episodes.append(Episode(row.id, spot.season, spot.episode, kind))
+        entry.episodes.append(Episode(row.id, spot.season, spot.episode, kind, row))
         entry.tally.add(kind, row)
         entry.seasons.setdefault(spot.season, Tally()).add(kind, row)
 
-    result = [g for g in found.values() if g.looks_like_series]
-    result.sort(key=lambda g: (g.name.casefold(), g.library_id))
-    return result
+    # Callers pick: ``looks_like_series`` for the series view, the rest are movies.
+    return sorted(found.values(), key=lambda g: (g.name.casefold(), g.library_id))

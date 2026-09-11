@@ -1,34 +1,29 @@
 /** Series overview: the library grouped by series and season, Sonarr style. */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, Play, Search, Tv, Zap } from "lucide-react";
-import { useMemo, useState, type ReactNode } from "react";
+import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
+import {
+  BucketBar,
+  FileAction,
+  ForceConfirm,
+  IconButton,
+  Legend,
+  Stat,
+  countFor,
+  fileReason,
+  share,
+} from "../components/groups";
+import { EmptyState, Panel, Select, Skeleton, StateBadge } from "../components/ui";
 import {
   endpoints,
   type EnqueueResult,
-  type SeriesBucket,
   type SeriesEpisode,
   type SeriesSeason,
   type SeriesSummary,
-  type SeriesTally,
 } from "../lib/api";
 import { bytes, number, relativeTime, resolutionLabel, STATE_LABELS } from "../lib/format";
 import { useToast } from "../lib/live";
-import { EmptyState, Modal, Panel, Select, Skeleton, Spinner, StateBadge, cn } from "../components/ui";
-
-/** Bar segments, left to right. */
-const BUCKETS: { key: SeriesBucket; label: string; className: string }[] = [
-  { key: "converted", label: "Konvertiert", className: "bg-save-500" },
-  { key: "av1", label: "War schon AV1", className: "bg-save-500/45" },
-  { key: "active", label: "In Arbeit", className: "bg-brand-500" },
-  { key: "pending", label: "Kandidat", className: "bg-info-500/70" },
-  { key: "excluded", label: "Ausgeschlossen / uebersprungen", className: "bg-ink-400" },
-  { key: "failed", label: "Fehler", className: "bg-danger-500" },
-  { key: "other", label: "Noch offen", className: "bg-ink-600" },
-];
-
-/** Same rule as the backend: a forced series or season run leaves AV1 files alone. */
-const FORCEABLE: SeriesBucket[] = ["pending", "excluded", "failed", "other"];
 
 const FILTERS = [
   { value: "all", label: "Alle Serien" },
@@ -46,13 +41,6 @@ const SORTS = [
   { value: "saved", label: "Gespart" },
   { value: "potential", label: "Noch moeglich" },
 ];
-
-const share = (t: SeriesTally) => (t.episodes ? t.in_av1 / t.episodes : 0);
-
-const countFor = (episodes: SeriesEpisode[], force: boolean) =>
-  episodes.filter((e) =>
-    force ? FORCEABLE.includes(e.bucket) && e.state !== "missing" : e.bucket === "pending",
-  ).length;
 
 export default function SeriesPage() {
   const [search, setSearch] = useState("");
@@ -189,100 +177,6 @@ export default function SeriesPage() {
 
 /* -------------------------------------------------------------------------- */
 
-function Stat({
-  label,
-  value,
-  hint,
-  tone,
-}: {
-  label: string;
-  value: string;
-  hint?: string;
-  tone?: "save";
-}) {
-  return (
-    <div className="panel px-4 py-3">
-      <p className="text-xs text-ink-400">{label}</p>
-      <p
-        className={cn(
-          "mt-1 text-xl font-semibold tracking-tight",
-          tone === "save" ? "text-save-400" : "text-ink-100",
-        )}
-      >
-        {value}
-      </p>
-      {hint && <p className="mt-0.5 text-[11px] text-ink-500">{hint}</p>}
-    </div>
-  );
-}
-
-function Legend() {
-  return (
-    <div className="flex flex-wrap gap-x-4 gap-y-1 border-b border-ink-800/80 px-5 py-2.5 text-[11px] text-ink-400">
-      {BUCKETS.map((b) => (
-        <span key={b.key} className="flex items-center gap-1.5">
-          <span className={cn("size-2 rounded-full", b.className)} />
-          {b.label}
-        </span>
-      ))}
-    </div>
-  );
-}
-
-function BucketBar({ tally, className }: { tally: SeriesTally; className?: string }) {
-  const title = BUCKETS.filter((b) => tally.counts[b.key])
-    .map((b) => `${b.label}: ${tally.counts[b.key]}`)
-    .join(" · ");
-  return (
-    <div className={cn("flex h-2 overflow-hidden rounded-full bg-ink-800", className)} title={title}>
-      {tally.episodes > 0 &&
-        BUCKETS.map((b) =>
-          tally.counts[b.key] ? (
-            <div
-              key={b.key}
-              className={b.className}
-              style={{ width: `${(tally.counts[b.key] / tally.episodes) * 100}%` }}
-            />
-          ) : null,
-        )}
-    </div>
-  );
-}
-
-function IconButton({
-  title,
-  onClick,
-  disabled,
-  tone = "brand",
-  children,
-}: {
-  title: string;
-  onClick: () => void;
-  disabled?: boolean;
-  tone?: "brand" | "warn";
-  children: ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      title={title}
-      aria-label={title}
-      onClick={onClick}
-      disabled={disabled}
-      className={cn(
-        "rounded-md p-1.5 text-ink-400 transition-colors disabled:cursor-not-allowed disabled:opacity-30",
-        tone === "warn"
-          ? "hover:bg-warn-500/15 hover:text-warn-400"
-          : "hover:bg-brand-600/20 hover:text-brand-400",
-      )}
-    >
-      {children}
-    </button>
-  );
-}
-
-/* -------------------------------------------------------------------------- */
-
 function SeriesRow({
   series,
   open,
@@ -354,7 +248,7 @@ function SeriesDetailView({ seriesKey }: { seriesKey: string }) {
 
   const onResult = (result: EnqueueResult) => {
     push(result.message, result.added ? "success" : "info");
-    ["series", "jobs", "files"].forEach((key) =>
+    ["series", "movies", "jobs", "files"].forEach((key) =>
       queryClient.invalidateQueries({ queryKey: [key] }),
     );
   };
@@ -430,51 +324,18 @@ function SeriesDetailView({ seriesKey }: { seriesKey: string }) {
         ))}
       </div>
 
-      <Modal
+      <ForceConfirm
         open={confirm !== null}
-        onClose={() => setConfirm(null)}
-        title="Trotz Ausschluss konvertieren?"
+        count={confirm?.count ?? 0}
+        noun="Folgen"
         subtitle={confirm?.season ? `${data.name} · ${confirm.season.label}` : data.name}
-        footer={
-          <>
-            <button className="btn-ghost" onClick={() => setConfirm(null)}>
-              Abbrechen
-            </button>
-            <button
-              className="btn-primary"
-              disabled={enqueueGroup.isPending}
-              onClick={() =>
-                confirm &&
-                enqueueGroup.mutate({ season: confirm.season?.season ?? undefined, force: true })
-              }
-            >
-              {enqueueGroup.isPending ? <Spinner className="size-4" /> : <Zap className="size-4" />}
-              {confirm?.count} Folgen einreihen
-            </button>
-          </>
+        pending={enqueueGroup.isPending}
+        onClose={() => setConfirm(null)}
+        onConfirm={() =>
+          confirm &&
+          enqueueGroup.mutate({ season: confirm.season?.season ?? undefined, force: true })
         }
-      >
-        <div className="space-y-3 text-sm leading-relaxed text-ink-300">
-          <p>
-            {confirm?.count} Folgen kommen in die Warteschlange - auch solche, deren Codec
-            ausgeschlossen ist, die ignoriert werden oder die als nicht lohnend eingestuft wurden.
-          </p>
-          <ul className="list-disc space-y-1 pl-5 text-ink-400">
-            <li>
-              Folgen, die schon AV1 sind, bleiben unberuehrt. Einzelne lassen sich in ihrer Zeile
-              trotzdem erzwingen.
-            </li>
-            <li>
-              Die Mindestersparnis gilt fuer diese Jobs nicht. Waere ein Ergebnis groesser als das
-              Original, wird es wie gewohnt verworfen.
-            </li>
-            <li>
-              Folgen, die vor der Analyse ausgeschlossen wurden, bekommen ihren Plan erst beim
-              Start - mit den Werten des Profils statt einer Testkodierung.
-            </li>
-          </ul>
-        </div>
-      </Modal>
+      />
     </div>
   );
 }
@@ -583,12 +444,7 @@ function EpisodeRow({
   onForce: () => void;
 }) {
   const saved = ep.state === "done" && ep.original_size > ep.size ? ep.original_size - ep.size : 0;
-  const reason =
-    ep.bucket === "failed" ? ep.error : ep.bucket === "excluded" ? ep.decision_reason : "";
-  const canForce =
-    (FORCEABLE.includes(ep.bucket) || ep.bucket === "av1") &&
-    ep.bucket !== "pending" &&
-    ep.state !== "missing";
+  const reason = fileReason(ep);
 
   return (
     <tr className="table-row last:border-0">
@@ -626,24 +482,7 @@ function EpisodeRow({
         <StateBadge state={ep.state} label={STATE_LABELS[ep.state] ?? ep.state} />
       </td>
       <td className="w-12 whitespace-nowrap px-3 py-2 text-right">
-        {ep.bucket === "pending" ? (
-          <IconButton title="Zur Warteschlange hinzufuegen" disabled={busy} onClick={onQueue}>
-            <Play className="size-3.5" />
-          </IconButton>
-        ) : canForce ? (
-          <IconButton
-            tone="warn"
-            title={
-              ep.bucket === "av1"
-                ? "Ist bereits AV1 - trotzdem neu kodieren"
-                : "Trotz Ausschluss konvertieren"
-            }
-            disabled={busy}
-            onClick={onForce}
-          >
-            <Zap className="size-3.5" />
-          </IconButton>
-        ) : null}
+        <FileAction file={ep} busy={busy} onQueue={onQueue} onForce={onForce} />
       </td>
     </tr>
   );

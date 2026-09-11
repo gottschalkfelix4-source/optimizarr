@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
   Cpu,
+  Film,
   Gauge,
   HardDrive,
   History,
@@ -29,6 +30,7 @@ const NAV = [
   { to: "/", label: "Uebersicht", icon: Gauge, end: true },
   { to: "/library", label: "Bibliothek", icon: ListVideo },
   { to: "/series", label: "Serien", icon: Tv },
+  { to: "/movies", label: "Filme", icon: Film },
   { to: "/queue", label: "Warteschlange", icon: Layers },
   { to: "/insights", label: "Analyse & Modell", icon: Activity },
   { to: "/history", label: "Verlauf", icon: History },
