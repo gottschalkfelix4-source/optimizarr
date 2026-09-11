@@ -46,13 +46,13 @@ const LiveContext = createContext<LiveContextValue>({
 /** Which queries to refresh when a given event arrives. */
 const INVALIDATION_MAP: Record<string, string[]> = {
   "scan.started": ["scan", "system"],
-  "scan.finished": ["scan", "files", "stats", "system", "history"],
+  "scan.finished": ["scan", "files", "series", "stats", "system", "history"],
   "file.analyzed": ["files", "stats"],
-  "job.started": ["jobs", "files", "system"],
-  "job.finished": ["jobs", "files", "stats", "history", "system", "model"],
-  "queue.changed": ["jobs", "files", "system"],
+  "job.started": ["jobs", "files", "series", "system"],
+  "job.finished": ["jobs", "files", "series", "stats", "history", "system", "model"],
+  "queue.changed": ["jobs", "files", "series", "system"],
   "settings.changed": ["settings", "system"],
-  "library.changed": ["library", "files", "stats"],
+  "library.changed": ["library", "files", "series", "stats"],
   "hardware.detected": ["system"],
   "model.updated": ["model", "system"],
   history: ["history"],

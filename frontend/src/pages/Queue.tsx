@@ -83,8 +83,10 @@ export default function Queue() {
   );
   const worker = data?.worker;
 
+  // Forced jobs for files that were never analysed have no prediction; counting
+  // them as "input minus 0" would promise their whole size as a saving.
   const queuedSaving = queued.reduce(
-    (sum, j) => sum + Math.max(0, j.input_size - j.predicted_size),
+    (sum, j) => sum + (j.predicted_size > 0 ? Math.max(0, j.input_size - j.predicted_size) : 0),
     0,
   );
   const queuedEta = queued.reduce((sum, j) => sum + (j.eta_seconds || 0), 0);
@@ -165,7 +167,10 @@ export default function Queue() {
                   {index + 1}
                 </span>
                 <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm text-ink-100">{job.name}</p>
+                  <p className="flex min-w-0 items-center gap-2 text-sm text-ink-100">
+                    <span className="truncate">{job.name}</span>
+                    {job.forced && <ForcedChip />}
+                  </p>
                   <p className="mt-0.5 text-xs text-ink-500">
                     {job.resolution} · {bytes(job.input_size)}
                     {job.predicted_size > 0 && (
@@ -251,7 +256,10 @@ function RunningJob({
     <div className="rounded-lg border border-brand-600/25 bg-brand-600/5 p-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0 flex-1">
-          <p className="truncate font-medium text-ink-100">{job.name}</p>
+          <p className="flex min-w-0 items-center gap-2 font-medium text-ink-100">
+            <span className="truncate">{job.name}</span>
+            {job.forced && <ForcedChip />}
+          </p>
           <p className="mt-0.5 truncate text-xs text-ink-500">
             {job.resolution} · {job.plan?.encoder} · CRF {job.plan?.crf}
             {job.plan?.film_grain ? ` · Filmkorn ${job.plan.film_grain}` : ""}
@@ -330,6 +338,7 @@ function FinishedJob({
       <div className="min-w-0 flex-1">
         <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
           <p className="min-w-0 flex-1 truncate text-sm text-ink-100">{job.name}</p>
+          {job.forced && <ForcedChip />}
           <StateBadge state={job.state} label={JOB_STATE_LABELS[job.state] ?? job.state} />
         </div>
         {job.state === "done" && saved > 0 ? (
@@ -367,6 +376,17 @@ function FinishedJob({
         )}
       </div>
     </li>
+  );
+}
+
+function ForcedChip() {
+  return (
+    <span
+      className="chip shrink-0 bg-warn-500/15 text-warn-400"
+      title="Trotz Ausschluss oder Skip-Urteil von Hand eingereiht - die Mindestersparnis gilt hier nicht"
+    >
+      Erzwungen
+    </span>
   );
 }
 

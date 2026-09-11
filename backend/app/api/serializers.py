@@ -5,6 +5,7 @@ import datetime as dt
 from pathlib import Path
 from typing import Any
 
+from ..core import planner
 from ..models import HistoryEntry, Job, LibraryPath, MediaFile, ScanRun
 
 
@@ -83,7 +84,8 @@ def job(row: Job, include_log: bool = False) -> dict[str, Any]:
         "created_at": iso(row.created_at),
         "started_at": iso(row.started_at),
         "finished_at": iso(row.finished_at),
-        "plan": row.plan,
+        "plan": planner.plan_fields(row.plan),
+        "forced": planner.is_forced(row.plan),
     }
     if row.file is not None:
         data["path"] = row.file.path

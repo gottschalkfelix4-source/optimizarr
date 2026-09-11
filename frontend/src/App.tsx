@@ -6,6 +6,7 @@ import HistoryPage from "./pages/History";
 import Insights from "./pages/Insights";
 import Library from "./pages/Library";
 import Queue from "./pages/Queue";
+import SeriesPage from "./pages/Series";
 import SettingsPage from "./pages/Settings";
 
 export default function App() {
@@ -15,6 +16,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/library" element={<Library />} />
+          <Route path="/series" element={<SeriesPage />} />
           <Route path="/queue" element={<Queue />} />
           <Route path="/insights" element={<Insights />} />
           <Route path="/history" element={<HistoryPage />} />

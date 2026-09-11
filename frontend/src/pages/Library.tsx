@@ -10,6 +10,7 @@ import {
   Search,
   TerminalSquare,
   SlidersHorizontal,
+  Zap,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
@@ -48,6 +49,9 @@ const STATE_FILTERS = [
   { value: "ignored", label: "Ignoriert" },
   { value: "new", label: "Noch nicht analysiert" },
 ];
+
+/** States the rules keep out of the queue; a click can still force them in. */
+const FORCEABLE_STATES = new Set(["skipped", "ignored", "failed", "new", "probed"]);
 
 const SORT_OPTIONS = [
   { value: "saving", label: "Ersparnis (absolut)" },
@@ -470,7 +474,7 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
   });
 
   const enqueue = useMutation({
-    mutationFn: () => endpoints.enqueue({ file_ids: [fileId!] }),
+    mutationFn: (force: boolean) => endpoints.enqueue({ file_ids: [fileId!], force }),
     onSuccess: (result) => {
       push(result.message, result.added ? "success" : "info");
       queryClient.invalidateQueries({ queryKey: ["files"] });
@@ -524,14 +528,26 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
             )}
             Trockenlauf
           </button>
-          <button
-            className="btn-primary"
-            onClick={() => enqueue.mutate()}
-            disabled={enqueue.isPending || !plan}
-          >
-            <Play className="size-4" />
-            Konvertieren
-          </button>
+          {file && FORCEABLE_STATES.has(file.state) ? (
+            <button
+              className="btn-primary"
+              onClick={() => enqueue.mutate(true)}
+              disabled={enqueue.isPending}
+              title="Ausschluss und Mindestersparnis fuer diese Datei uebergehen"
+            >
+              <Zap className="size-4" />
+              Trotzdem konvertieren
+            </button>
+          ) : (
+            <button
+              className="btn-primary"
+              onClick={() => enqueue.mutate(false)}
+              disabled={enqueue.isPending || !plan}
+            >
+              <Play className="size-4" />
+              Konvertieren
+            </button>
+          )}
         </>
       }
     >

@@ -13,7 +13,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session, selectinload
 
 from ..config import load_settings, update_settings
-from ..core import predictor, scanner, worker
+from ..core import planner, predictor, scanner, worker
 from ..core.events import bus
 from ..db import get_session, session_scope
 from ..models import (
@@ -35,6 +35,8 @@ class EnqueueRequest(BaseModel):
     all_candidates: bool = False
     min_saving_pct: float | None = None
     limit: int | None = None
+    # Queue despite exclusions and skip verdicts - see worker.enqueue_files.
+    force: bool = False
 
 
 @router.post("/jobs")
@@ -54,7 +56,7 @@ def enqueue(payload: EnqueueRequest, session: Session = Depends(get_session)) ->
 
     if not file_ids:
         return {"added": 0, "skipped": [], "message": "Keine passenden Dateien gefunden."}
-    added, skipped = worker.enqueue_files(file_ids, payload.priority)
+    added, skipped = worker.enqueue_files(file_ids, payload.priority, force=payload.force)
     return {
         "added": added,
         "skipped": skipped[:20],
@@ -130,7 +132,11 @@ def cancel_job(job_id: int, session: Session = Depends(get_session)) -> dict[str
         row.finished_at = utcnow()
         media = session.get(MediaFile, row.file_id)
         if media and media.state == FileState.QUEUED.value:
-            media.state = FileState.CANDIDATE.value
+            # A forced job goes back to wherever the file was - calling an
+            # excluded file a candidate would have auto-queue pick it up.
+            media.state = (
+                (row.plan or {}).get(planner.RESTORE_STATE) or FileState.CANDIDATE.value
+            )
         session.commit()
         bus.publish("queue.changed", {})
         return {"ok": True, "message": "Aus der Warteschlange entfernt."}
@@ -154,7 +160,7 @@ def retry_job(job_id: int, session: Session = Depends(get_session)) -> dict[str,
         raise HTTPException(status_code=404, detail="Job nicht gefunden")
     if row.state in (JobState.QUEUED.value, JobState.RUNNING.value):
         raise HTTPException(status_code=409, detail="Job laeuft bereits.")
-    added, skipped = worker.enqueue_files([row.file_id])
+    added, skipped = worker.enqueue_files([row.file_id], force=planner.is_forced(row.plan))
     if not added:
         raise HTTPException(status_code=409, detail=skipped[0] if skipped else "Nicht moeglich.")
     return {"ok": True, "message": "Erneut eingereiht."}

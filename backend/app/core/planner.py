@@ -91,6 +91,9 @@ class EncodePlan:
         if not data:
             return None
         known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
+        if not known:
+            # Only job markers (see JOB_MARKERS) - no plan was ever stored.
+            return None
         return cls(**known)
 
     @property
@@ -245,6 +248,33 @@ def choose_encoder(settings: AppSettings, hw: HardwareReport | None) -> tuple[st
     return "libsvtav1", [
         "GPU kann AV1 nicht in Hardware encodieren - SVT-AV1 auf der CPU"
     ]
+
+
+# --------------------------------------------------------------------------- #
+# Job markers
+# --------------------------------------------------------------------------- #
+# A job keeps its plan as JSON.  A few facts about the *job* ride along in the
+# same dict, because the jobs table has no column for them and there are no
+# migrations.  ``EncodePlan.from_dict`` ignores them.
+
+FORCED = "forced"                  # queued by hand despite an exclusion or skip verdict
+RESTORE_STATE = "restore_state"    # file state to go back to if that job is cancelled
+JOB_MARKERS = (FORCED, RESTORE_STATE)
+
+
+def job_markers(data: dict[str, Any] | None) -> dict[str, Any]:
+    """The markers in a stored plan, so they survive the plan being rewritten."""
+    return {k: data[k] for k in JOB_MARKERS if data and k in data}
+
+
+def plan_fields(data: dict[str, Any] | None) -> dict[str, Any] | None:
+    """A stored plan without the markers; None when nothing else is in it."""
+    rest = {k: v for k, v in (data or {}).items() if k not in JOB_MARKERS}
+    return rest or None
+
+
+def is_forced(data: dict[str, Any] | None) -> bool:
+    return bool(data and data.get(FORCED))
 
 
 def build_plan(

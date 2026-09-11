@@ -249,6 +249,7 @@ async def run_job(
             return outcome
         source = media.path
         plan_data = job.plan or media.plan
+        forced = planner.is_forced(job.plan)
         file_id = media.id
         job.state = JobState.RUNNING.value
         job.started_at = utcnow()
@@ -258,7 +259,7 @@ async def run_job(
     bus.publish("job.started", {"job_id": job_id, "file_id": file_id, "path": source})
 
     plan = EncodePlan.from_dict(plan_data)
-    if plan is None:
+    if plan is None and not forced:
         return _fail(job_id, file_id, outcome, "Kein Encoding-Plan hinterlegt.")
 
     if not os.path.exists(source):
@@ -282,7 +283,9 @@ async def run_job(
         return _fail(job_id, file_id, outcome, f"Datei nicht lesbar: {exc}")
 
     outcome.input_size = info.size or os.path.getsize(source)
-    temp_out = workdir / f"optimizarr-{job_id}-{os.getpid()}.{plan.container}"
+    if plan is None:
+        plan = _plan_forced_job(job_id, info, settings, hw)
+    temp_out =workdir / f"optimizarr-{job_id}-{os.getpid()}.{plan.container}"
 
     try:
         code, log_tail = await _run_encode(plan, info, str(temp_out), job_id, settings, cancel)
@@ -387,7 +390,10 @@ async def run_job(
                 f"Ergebnis waere groesser gewesen ({_fmt(outcome.output_size)} statt "
                 f"{_fmt(outcome.input_size)}) - Original bleibt unveraendert.",
             )
-        if not migrate and saved_pct < settings.output.min_accept_saving_percent:
+        # A forced job was queued knowing the analysis expected little or
+        # nothing; the saving threshold would reject exactly what was asked
+        # for.  "Never bigger than the original" above still applies.
+        if not migrate and not forced and saved_pct < settings.output.min_accept_saving_percent:
             return _reject(
                 job_id, file_id, outcome,
                 f"Nur {saved_pct:.1f}% gespart - unter der Annahmeschwelle von "
@@ -427,13 +433,16 @@ async def run_job(
         outcome.reason = "Job abgebrochen"
         with session_scope() as s:
             job = s.get(Job, job_id)
+            # A forced job goes back to wherever the file was, not to "candidate".
+            restore = FileState.CANDIDATE.value
             if job:
                 job.state = JobState.CANCELLED.value
                 job.finished_at = utcnow()
                 job.error = "Abgebrochen"
+                restore = (job.plan or {}).get(planner.RESTORE_STATE) or restore
             media = s.get(MediaFile, file_id)
             if media:
-                media.state = FileState.CANDIDATE.value
+                media.state = restore
         bus.publish("job.finished", {"job_id": job_id, "state": "cancelled"})
         return outcome
     except Exception as exc:  # pragma: no cover - defensive
@@ -543,7 +552,7 @@ def _record_success(
             job.output_size = outcome.output_size
             job.input_size = outcome.input_size
             job.vmaf = outcome.vmaf
-            job.plan = plan.to_dict()
+            job.plan = {**plan.to_dict(), **planner.job_markers(job.plan)}
             job.error = ""
         if media:
             media.state = FileState.DONE.value
@@ -616,6 +625,21 @@ def _record_success(
         "saved_bytes": outcome.input_size - outcome.output_size,
         "message": outcome.reason,
     })
+
+
+def _plan_forced_job(
+    job_id: int, info: ffmpeg.MediaInfo, settings: AppSettings, hw: HardwareReport | None,
+) -> EncodePlan:
+    """Plan a forced job whose file was excluded before the analysis built one
+    (codec, size, bitrate floor) - from the probe just taken, the way the dry
+    run does.  Stored on the job so the queue can show it."""
+    plan = planner.build_plan(info, settings, hw)
+    with session_scope() as s:
+        job = s.get(Job, job_id)
+        if job:
+            job.plan = {**plan.to_dict(), **planner.job_markers(job.plan)}
+    _append_log(job_id, f"Erzwungen ohne Analyse - Plan beim Start erstellt: {plan.describe()}")
+    return plan
 
 
 def _append_log(job_id: int, message: str) -> None:

@@ -11,7 +11,7 @@ from sqlalchemy import func, select
 from ..config import AppSettings, load_settings
 from ..db import session_scope
 from ..models import Job, JobState, LearningSample, MediaFile, FileState
-from . import encoder, hwaccel, predictor, scanner
+from . import encoder, hwaccel, planner, predictor, scanner
 from .events import bus
 
 log = logging.getLogger(__name__)
@@ -287,8 +287,15 @@ queue_worker = QueueWorker()
 scheduler = Scheduler()
 
 
-def enqueue_files(file_ids: list[int], priority: int | None = None) -> tuple[int, list[str]]:
-    """Add files to the queue.  Returns (count, skipped_reasons)."""
+def enqueue_files(
+    file_ids: list[int], priority: int | None = None, force: bool = False,
+) -> tuple[int, list[str]]:
+    """Add files to the queue.  Returns (count, skipped_reasons).
+
+    ``force`` queues a file whatever the analysis said about it - excluded
+    codec, too small, not worth it, ignored.  A file excluded before a plan was
+    built gets one when its job starts (see ``encoder.run_job``).
+    """
     added = 0
     skipped: list[str] = []
     with session_scope() as s:
@@ -297,7 +304,10 @@ def enqueue_files(file_ids: list[int], priority: int | None = None) -> tuple[int
             if media is None:
                 skipped.append(f"#{file_id}: nicht gefunden")
                 continue
-            if media.plan is None:
+            if media.state == FileState.MISSING.value:
+                skipped.append(f"{media.path}: fehlt auf der Platte")
+                continue
+            if media.plan is None and not force:
                 skipped.append(f"{media.path}: noch nicht analysiert")
                 continue
             existing = s.execute(
@@ -309,11 +319,18 @@ def enqueue_files(file_ids: list[int], priority: int | None = None) -> tuple[int
             if existing:
                 skipped.append(f"{media.path}: steht bereits in der Warteschlange")
                 continue
+            plan = media.plan
+            if force:
+                plan = {
+                    **(media.plan or {}),
+                    planner.FORCED: True,
+                    planner.RESTORE_STATE: media.state,
+                }
             prio = priority if priority is not None else 100 - min(
                 99, int(media.estimated_saving_pct)
             )
             s.add(Job(
-                file_id=file_id, plan=media.plan, input_size=media.size,
+                file_id=file_id, plan=plan, input_size=media.size,
                 predicted_size=media.estimated_size, priority=prio,
             ))
             media.state = FileState.QUEUED.value

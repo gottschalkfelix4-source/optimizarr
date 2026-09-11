@@ -196,6 +196,8 @@ export interface Job {
   started_at: string | null;
   finished_at: string | null;
   plan: EncodePlan | null;
+  /** Queued by hand despite an exclusion or a skip verdict. */
+  forced?: boolean;
   path?: string;
   name?: string;
   duration?: number;
@@ -550,6 +552,52 @@ export interface LibraryCodecs {
   known: { codec: string; label: string }[];
 }
 
+/** Progress-bar segment of one episode, in display order. */
+export type SeriesBucket =
+  | "converted" | "av1" | "active" | "pending" | "excluded" | "failed" | "other";
+
+export interface SeriesTally {
+  episodes: number;
+  /** Converted by Optimizarr plus files that were AV1 already. */
+  in_av1: number;
+  total_size: number;
+  saved_bytes: number;
+  potential_saving: number;
+  counts: Record<SeriesBucket, number>;
+  last_converted: string | null;
+}
+
+export interface SeriesSummary extends SeriesTally {
+  key: string;
+  library_id: number;
+  library: string;
+  name: string;
+  path: string;
+  season_count: number;
+}
+
+export type SeriesEpisode = MediaFile & {
+  season: number | null;
+  episode: number | null;
+  bucket: SeriesBucket;
+};
+
+export interface SeriesSeason extends SeriesTally {
+  season: number | null;
+  label: string;
+  files: SeriesEpisode[];
+}
+
+export interface SeriesDetail extends SeriesSummary {
+  seasons: SeriesSeason[];
+}
+
+export interface EnqueueResult {
+  added: number;
+  skipped: string[];
+  message: string;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Endpoints                                                                  */
 /* -------------------------------------------------------------------------- */
@@ -637,11 +685,18 @@ export const endpoints = {
     all_candidates?: boolean;
     min_saving_pct?: number;
     limit?: number;
-  }) => api.post<{ added: number; skipped: string[]; message: string }>("/jobs", payload),
+    force?: boolean;
+  }) => api.post<EnqueueResult>("/jobs", payload),
   cancelJob: (id: number) => api.post<{ ok: boolean; message: string }>(`/jobs/${id}/cancel`),
   retryJob: (id: number) => api.post<{ ok: boolean; message: string }>(`/jobs/${id}/retry`),
   clearFinished: () => api.del<{ removed: number }>("/jobs/finished"),
   pauseQueue: (paused: boolean) => api.post<{ paused: boolean }>("/queue/pause", { paused }),
+
+  series: () => api.get<{ items: SeriesSummary[]; totals: SeriesTally }>("/series"),
+  seriesDetail: (key: string) =>
+    api.get<SeriesDetail>(`/series/detail?key=${encodeURIComponent(key)}`),
+  enqueueSeries: (payload: { key: string; season?: number; force?: boolean }) =>
+    api.post<EnqueueResult>("/series/enqueue", payload),
 
   stats: () => api.get<Stats>("/stats"),
   modelStats: () =>

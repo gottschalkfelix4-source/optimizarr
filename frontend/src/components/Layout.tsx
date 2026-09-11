@@ -15,6 +15,7 @@ import {
   ScanLine,
   Settings2,
   Sparkles,
+  Tv,
   X,
 } from "lucide-react";
 import { useState } from "react";
@@ -27,6 +28,7 @@ import { cn, ProgressBar, Spinner } from "./ui";
 const NAV = [
   { to: "/", label: "Uebersicht", icon: Gauge, end: true },
   { to: "/library", label: "Bibliothek", icon: ListVideo },
+  { to: "/series", label: "Serien", icon: Tv },
   { to: "/queue", label: "Warteschlange", icon: Layers },
   { to: "/insights", label: "Analyse & Modell", icon: Activity },
   { to: "/history", label: "Verlauf", icon: History },
