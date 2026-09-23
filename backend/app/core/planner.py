@@ -504,14 +504,26 @@ def build_ffmpeg_args(
             args += ["-extra_hw_frames", str(max(0, plan.extra_hw_frames))]
             hw_frames_in = True
     elif plan.encoder == "av1_vaapi":
-        args += ["-vaapi_device", plan.hw_device]
+        # One named device for decoder, filters and encoder.  `-vaapi_device`
+        # plus `-hwaccel_device <path>` opened the render node twice, and ffmpeg
+        # then hands the filters "vaapi1" while the frames live on the other one.
+        args += ["-init_hw_device", f"vaapi=va:{plan.hw_device}", "-filter_hw_device", "va"]
         if plan.hw_decode:
-            args += ["-hwaccel", "vaapi", "-hwaccel_device", plan.hw_device,
+            args += ["-hwaccel", "vaapi", "-hwaccel_device", "va",
                      "-hwaccel_output_format", "vaapi"]
             hw_frames_in = True
     elif plan.hw_decode:
         args += ["-hwaccel", "vaapi", "-hwaccel_device", plan.hw_device,
                  "-hwaccel_output_format", "nv12"]
+
+    if hw_frames_in and plan.is_hardware:
+        # Many MKVs only tag their colour space a few frames in ("video
+        # parameters changed to vaapi(tv, bt709)").  ffmpeg then rebuilds the
+        # filter graph, and a GPU-only graph cannot be rebuilt against an encoder
+        # that is already open - the job died after ~20 frames and went to the
+        # CPU.  The frame size does not change, so the rebuild buys nothing.
+        # Input option: must precede -i.
+        args += ["-reinit_filter", "0"]
 
     if start_offset:
         args += ["-ss", f"{start_offset:.3f}"]

@@ -139,6 +139,37 @@ def test_vaapi_also_converts_without_scaling():
     assert "format=p010" in chain and "p010le" not in chain
 
 
+def _vaapi_args(hw_decode: bool = True) -> list[str]:
+    settings = AppSettings()
+    settings.encoding.encoder = "av1_vaapi"
+    info = make_info()
+    plan = planner.build_plan(info, settings, hw=arc_report())
+    plan.hw_decode = hw_decode
+    return planner.build_ffmpeg_args(plan, info, info.path, "/tmp/out.mkv")
+
+
+def test_vaapi_opens_the_render_node_only_once():
+    """Two devices ("There are 2 hardware devices") left the filters on the
+    wrong one; the rebuilt filter graph then failed and the job went to the CPU."""
+    args = _vaapi_args()
+    assert "-vaapi_device" not in args
+    assert args.count("-init_hw_device") == 1
+    assert args[args.index("-hwaccel_device") + 1] == "va"
+    assert args[args.index("-filter_hw_device") + 1] == "va"
+
+
+def test_gpu_frames_do_not_rebuild_the_filter_graph():
+    """A colour tag appearing mid-stream must not tear down the GPU graph."""
+    for args in (_vaapi_args(), qsv_command().split()):
+        assert "-reinit_filter" in args
+        assert args[args.index("-reinit_filter") + 1] == "0"
+        assert args.index("-reinit_filter") < args.index("-i")
+
+
+def test_software_frames_may_still_rebuild_the_filter_graph():
+    assert "-reinit_filter" not in _vaapi_args(hw_decode=False)
+
+
 def test_software_decode_path_still_converts_before_upload():
     settings = AppSettings()
     settings.hardware.hw_decode = False
