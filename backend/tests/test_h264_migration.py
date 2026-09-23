@@ -185,3 +185,47 @@ def test_job_accepts_larger_h264_only_in_migration_mode(monkeypatch, tmp_path, e
     assert bool(commit.call_count) is accepted
     verify.assert_awaited_once()
     assert source.read_bytes() == b"x" * 100
+
+
+def test_failed_gpu_decode_retries_with_cpu_decode_before_leaving_the_gpu(monkeypatch, tmp_path):
+    """The decoder re-initialising mid-stream must cost the GPU decode, not the GPU encode."""
+    source = tmp_path / "source.mkv"
+    source.write_bytes(b"x" * 100)
+    plan = planner.EncodePlan(encoder="av1_vaapi", pix_fmt="p010le", hw_decode=True,
+                              hw_device="/dev/dri/renderD128")
+    with db.session_scope() as s:
+        media = MediaFile(path=str(source), video_codec="h264", state="queued")
+        s.add(media)
+        s.flush()
+        job = Job(file_id=media.id, plan=plan.to_dict())
+        s.add(job)
+        s.flush()
+        job_id = job.id
+    cfg = settings()
+    cfg.queue.min_free_disk_gb = 0
+    monkeypatch.setattr(encoder, "TRANSCODE_DIR", tmp_path)
+    monkeypatch.setattr(encoder.ffmpeg, "probe", AsyncMock(return_value=info(path=str(source), size=100)))
+
+    attempts = []
+
+    async def fake_encode(plan, source_info, dest, *args):
+        attempts.append((plan.encoder, plan.hw_decode))
+        if plan.hw_decode:
+            return 1, ("[vf#0:0 @ 0x1] Reconfiguring filter graph because hwaccel changed\n"
+                       "Impossible to convert between the formats supported by the filter "
+                       "'Parsed_scale_vaapi_0' and the filter 'auto_scale_0'\n"
+                       "[vf#0:0 @ 0x1] Error reinitializing filters!\n"
+                       "Conversion failed!")
+        Path(dest).write_bytes(b"y" * 50)
+        return 0, ""
+
+    monkeypatch.setattr(encoder, "_run_encode", fake_encode)
+    monkeypatch.setattr(encoder.quality, "verify_output", AsyncMock(return_value=(True, "")))
+    monkeypatch.setattr(encoder, "_spot_check_quality",
+                        AsyncMock(return_value=quality.QualityScore(96, "vmaf", 96)))
+    monkeypatch.setattr(encoder, "_commit_output", Mock(return_value=str(tmp_path / "result.mkv")))
+    monkeypatch.setattr(encoder, "_record_success", Mock())
+    outcome = asyncio.run(encoder.run_job(job_id, cfg, None, asyncio.Event()))
+    assert attempts == [("av1_vaapi", True), ("av1_vaapi", False)]
+    assert outcome.ok
+    assert not outcome.fell_back_to_cpu

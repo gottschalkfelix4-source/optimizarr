@@ -166,8 +166,17 @@ def test_gpu_frames_do_not_rebuild_the_filter_graph():
         assert args.index("-reinit_filter") < args.index("-i")
 
 
-def test_software_frames_may_still_rebuild_the_filter_graph():
-    assert "-reinit_filter" not in _vaapi_args(hw_decode=False)
+def test_uploaded_frames_do_not_rebuild_the_filter_graph_either():
+    """hwupload ends on the GPU too - the CPU-decode retry must not hit the same wall."""
+    assert "-reinit_filter" in _vaapi_args(hw_decode=False)
+
+
+def test_cpu_encodes_may_still_rebuild_the_filter_graph():
+    settings = AppSettings()
+    settings.encoding.encoder = "svt_av1"
+    info = make_info()
+    plan = planner.build_plan(info, settings, hw=arc_report())
+    assert "-reinit_filter" not in planner.build_ffmpeg_args(plan, info, info.path, "/tmp/out.mkv")
 
 
 def test_software_decode_path_still_converts_before_upload():

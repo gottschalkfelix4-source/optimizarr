@@ -319,6 +319,35 @@ async def run_job(
                 "(nicht der Video-Encoder - ein Neuversuch auf der CPU wuerde genauso enden)"
             ))
 
+        if code != 0 and plan.is_hardware and plan.hw_decode:
+            # Cheap middle step before giving up the GPU: decode on the CPU and
+            # keep encoding on the GPU.  Some streams make the hardware decoder
+            # re-initialise a few frames in ("Reconfiguring filter graph because
+            # hwaccel changed"), and an all-GPU filter graph cannot be rebuilt
+            # against an encoder that is already open.  Decoding 8-bit H.264 on
+            # the CPU costs little; encoding AV1 there costs hours.
+            reason = ffmpeg.first_error_line(log_tail)
+            log.warning("hardware decode path failed for %s: %s", source, reason)
+            _append_log(job_id, (
+                f"GPU-Decoding fehlgeschlagen - Wiederholung mit CPU-Decoding, "
+                f"Encoding bleibt auf der GPU ({plan.encoder}).\n"
+                f"  Grund: {reason}\n"
+                f"  Vollstaendige Ausgabe:\n"
+                + "\n".join(f"    {line}" for line in log_tail.strip().splitlines()[-15:])
+            ))
+            bus.publish("job.log", {
+                "job_id": job_id,
+                "message": f"GPU-Decoding fehlgeschlagen ({reason}) - Neuversuch mit CPU-Decoding.",
+            })
+            plan.hw_decode = False
+            temp_out.unlink(missing_ok=True)
+            code, log_tail = await _run_encode(
+                plan, info, str(temp_out), job_id, settings, cancel
+            )
+            outcome.log_tail = log_tail
+            if cancel.is_set():
+                raise JobCancelled()
+
         if code != 0 and plan.is_hardware and settings.hardware.fallback_to_cpu:
             # Record *why* it failed.  A bare "fell back to CPU" is useless: the
             # GPU is then quietly unused for every future job and the reason is

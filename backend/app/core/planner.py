@@ -516,12 +516,15 @@ def build_ffmpeg_args(
         args += ["-hwaccel", "vaapi", "-hwaccel_device", plan.hw_device,
                  "-hwaccel_output_format", "nv12"]
 
-    if hw_frames_in and plan.is_hardware:
+    if plan.is_hardware:
         # Many MKVs only tag their colour space a few frames in ("video
         # parameters changed to vaapi(tv, bt709)").  ffmpeg then rebuilds the
-        # filter graph, and a GPU-only graph cannot be rebuilt against an encoder
-        # that is already open - the job died after ~20 frames and went to the
-        # CPU.  The frame size does not change, so the rebuild buys nothing.
+        # filter graph, and a graph ending on the GPU - scale_vaapi or hwupload
+        # alike - cannot be rebuilt against an encoder that is already open: the
+        # job died after ~20 frames and went to the CPU.  The frame size does not
+        # change, so the rebuild buys nothing.  A decoder re-initialising itself
+        # ("hwaccel changed") still forces one; the encoder retries that case
+        # with CPU decoding.
         # Input option: must precede -i.
         args += ["-reinit_filter", "0"]
 
