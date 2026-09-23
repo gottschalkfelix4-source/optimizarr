@@ -287,4 +287,8 @@ async def verify_output(
         )
     if Path(output_path).stat().st_size < 1024:
         return False, "Ergebnisdatei ist leer"
+    if source_info.audio_streams and not out.audio_streams:
+        # Language and commentary rules can drop every track; a silent file
+        # must never replace one with sound.
+        return False, "Ergebnis hat keine Tonspur mehr"
     return True, ""

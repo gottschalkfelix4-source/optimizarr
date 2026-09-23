@@ -96,13 +96,15 @@ function HistoryRow({ item }: { item: HistoryItem }) {
               {detail.crf !== undefined && ` @ CRF ${detail.crf}`}
             </span>
           )}
-          {detail?.input_size && detail?.output_size && (
+          {!!detail?.input_size && !!detail?.output_size && (
             <span className="text-save-400">
               {bytes(detail.input_size)} → {bytes(detail.output_size)}
             </span>
           )}
-          {detail?.vmaf && <span>VMAF {detail.vmaf.toFixed(1)}</span>}
-          {detail?.seconds && <span>{Math.round(detail.seconds / 60)} Min Rechenzeit</span>}
+          {detail?.vmaf != null && detail.vmaf > 0 && <span>VMAF {detail.vmaf.toFixed(1)}</span>}
+          {detail?.seconds != null && detail.seconds > 0 && (
+            <span>{Math.max(1, Math.round(detail.seconds / 60))} Min Rechenzeit</span>
+          )}
         </div>
       </div>
     </li>

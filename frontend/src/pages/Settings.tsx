@@ -20,7 +20,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { AdvisorSettings } from "../components/AdvisorSettings";
 import { endpoints, type Settings, type SettingsPatch } from "../lib/api";
 import { bytes, number } from "../lib/format";
@@ -54,6 +54,19 @@ const TABS = [
 
 type TabId = (typeof TABS)[number]["id"];
 
+/** Three-way merge: apply the edits made on top of `base` to `next`. */
+function rebase<T>(base: T, draft: T, next: T): T {
+  if (JSON.stringify(draft) === JSON.stringify(base)) return structuredClone(next);
+  const isObject = (v: unknown): v is Record<string, unknown> =>
+    typeof v === "object" && v !== null && !Array.isArray(v);
+  if (!isObject(draft) || !isObject(base) || !isObject(next)) return draft;
+  const out: Record<string, unknown> = { ...next };
+  for (const key of Object.keys(draft)) {
+    out[key] = rebase(base[key], draft[key], next[key]);
+  }
+  return out as T;
+}
+
 export default function SettingsPage() {
   const { push } = useToast();
   const queryClient = useQueryClient();
@@ -65,9 +78,15 @@ export default function SettingsPage() {
     queryFn: endpoints.settings,
   });
 
+  // The draft follows the server.  When the saved settings change underneath it
+  // (queue paused from the header, reset, Codex login), untouched fields take the
+  // new value and only real edits survive - saving a stale copy used to undo them.
+  const base = useRef<Settings | null>(null);
   useEffect(() => {
-    if (saved && !draft) setDraft(structuredClone(saved));
-  }, [saved, draft]);
+    if (!saved) return;
+    setDraft((prev) => (prev && base.current ? rebase(base.current, prev, saved) : structuredClone(saved)));
+    base.current = saved;
+  }, [saved]);
 
   const dirty = useMemo(() => {
     if (!saved || !draft) return false;

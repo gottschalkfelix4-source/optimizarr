@@ -281,6 +281,9 @@ export interface ScanState {
   progress: number;
   started_at: string | null;
   candidates?: number;
+  /** Walk phase only: files found so far / new ones among them. */
+  seen?: number;
+  new?: number;
 }
 
 export interface QueueStatus {

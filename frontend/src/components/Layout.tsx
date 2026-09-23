@@ -67,6 +67,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
       push(data.paused ? "Warteschlange pausiert." : "Warteschlange laeuft.", "info");
       queryClient.invalidateQueries({ queryKey: ["system"] });
       queryClient.invalidateQueries({ queryKey: ["jobs"] });
+      queryClient.invalidateQueries({ queryKey: ["settings"] });
     },
   });
 
@@ -208,10 +209,17 @@ function ScanBanner({ scan }: { scan: NonNullable<ReturnType<typeof useLive>["sc
           <Spinner className="size-3.5" />
           {phaseLabel[scan.phase] ?? "Scan laeuft"}
         </span>
-        {scan.total > 0 && (
+        {scan.phase === "walk" && typeof scan.seen === "number" && scan.seen > 0 ? (
           <span className="text-ink-400">
-            {scan.done} / {scan.total}
+            {scan.seen} Dateien gefunden
+            {typeof scan.new === "number" && scan.new > 0 && ` · ${scan.new} neu`}
           </span>
+        ) : (
+          scan.total > 0 && (
+            <span className="text-ink-400">
+              {scan.done} / {scan.total}
+            </span>
+          )
         )}
         {typeof scan.candidates === "number" && scan.candidates > 0 && (
           <span className="text-save-400">{scan.candidates} Kandidaten</span>

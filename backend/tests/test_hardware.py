@@ -491,3 +491,14 @@ def test_persisting_progress_survives_a_missing_job():
     from app.core.encoder import _persist_progress
 
     _persist_progress(999_999, {"progress": 0.5})  # must not raise
+
+
+def test_progress_falls_back_to_frames_when_ffmpeg_reports_no_time():
+    """`out_time=N/A` for the whole run left the bar at 0% while encoding at 200 fps."""
+    from app.core import encoder
+    from app.core.ffmpeg import Progress
+
+    assert encoder.source_position(Progress(frame=2500, fps=200), 25.0) == 100.0
+    assert encoder.source_position(Progress(out_time=42.0, frame=2500), 25.0) == 42.0
+    assert encoder.source_position(Progress(), 25.0) == 0.0
+    assert encoder.source_position(Progress(frame=10), 0.0) == 0.0

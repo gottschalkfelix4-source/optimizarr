@@ -50,13 +50,28 @@ const INVALIDATION_MAP: Record<string, string[]> = {
   "file.analyzed": ["files", "stats"],
   "job.started": ["jobs", "files", "series", "movies", "system"],
   "job.finished": ["jobs", "files", "series", "movies", "stats", "history", "system", "model"],
-  "queue.changed": ["jobs", "files", "series", "movies", "system"],
+  "queue.changed": ["jobs", "files", "series", "movies", "system", "settings"],
   "settings.changed": ["settings", "system"],
   "library.changed": ["library", "files", "series", "movies", "stats"],
   "hardware.detected": ["system"],
   "model.updated": ["model", "system"],
   history: ["history"],
 };
+
+/** Scan state at the start of a run, before any progress has arrived. */
+function freshScan(): ScanState {
+  return {
+    run_id: null,
+    running: true,
+    phase: "walk",
+    total: 0,
+    done: 0,
+    current: "",
+    progress: 0,
+    started_at: new Date().toISOString(),
+    seen: 0,
+  };
+}
 
 export function LiveProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient();
@@ -86,14 +101,22 @@ export function LiveProvider({ children }: { children: ReactNode }) {
       if (event.type === "hello") {
         const payload = event.data as { scan?: ScanState };
         if (payload.scan) setScan(payload.scan);
+        // A (re)connect starts from scratch: progress kept from before a server
+        // restart belongs to runs that no longer exist.
+        setJobProgress({});
         return;
       }
       if (event.type === "scan.progress") {
-        setScan(event.data as unknown as ScanState);
+        // The walk phase only sends {phase, seen, new, current}; later phases
+        // send a full snapshot.  Merge so running/total/done survive either way.
+        const d = event.data as unknown as Partial<ScanState>;
+        setScan((prev) => ({ ...(prev ?? freshScan()), running: true, ...d }));
         return;
       }
       if (event.type === "scan.started") {
-        setScan((prev) => (prev ? { ...prev, running: true } : prev));
+        // A new run: counters of the previous run must not leak into this one.
+        const d = event.data as { run_id?: number };
+        setScan({ ...freshScan(), run_id: d.run_id ?? null });
       }
       if (event.type === "scan.finished") {
         setScan((prev) => (prev ? { ...prev, running: false, phase: "idle" } : prev));

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -19,7 +20,7 @@ from .config import CONFIG_DIR, TRANSCODE_DIR, load_settings, save_settings
 from .core import hwaccel, scanner, worker
 from .core.events import bus
 from .db import engine, session_scope
-from .models import Base, HistoryEntry, Job, JobState, MediaFile, FileState
+from .models import Base, HistoryEntry, Job, JobState, MediaFile, FileState, ScanRun, utcnow
 from .version import __version__
 
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
@@ -47,12 +48,41 @@ def _recover_orphans() -> None:
             media.state = FileState.QUEUED.value if any(
                 j.file_id == media.id for j in stuck_jobs
             ) else FileState.CANDIDATE.value
+        # A scan cut off by the restart would otherwise read "running" forever.
+        for run in s.query(ScanRun).filter(ScanRun.state == "running").all():
+            run.state = "failed"
+            run.error = "Durch Neustart unterbrochen"
+            run.finished_at = utcnow()
         if stuck_jobs or stuck_files:
             s.add(HistoryEntry(
                 level="warning", category="system",
                 message=f"Nach Neustart aufgeraeumt: {len(stuck_jobs)} Job(s) neu eingereiht.",
             ))
             log.info("recovered %d orphaned jobs", len(stuck_jobs))
+
+
+def _clean_transcode_dir() -> None:
+    """Remove temporary encodes and probe folders a crash left behind.
+
+    Runs before the worker starts, so nothing in here can still be in use.
+    Only our own prefix is touched - the directory may be shared.
+    """
+    if not TRANSCODE_DIR.is_dir():
+        return
+    removed = 0
+    for entry in TRANSCODE_DIR.iterdir():
+        if not entry.name.startswith("optimizarr-"):
+            continue
+        try:
+            if entry.is_dir():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+            removed += 1
+        except OSError as exc:
+            log.warning("could not remove leftover %s: %s", entry, exc)
+    if removed:
+        log.info("removed %d leftover temporary file(s) from %s", removed, TRANSCODE_DIR)
 
 
 @asynccontextmanager
@@ -67,6 +97,7 @@ async def lifespan(app: FastAPI):
 
     bus.bind_loop(asyncio.get_running_loop())
     _recover_orphans()
+    _clean_transcode_dir()
 
     # Fit the predictor on whatever history already exists.
     try:
@@ -162,8 +193,10 @@ if STATIC_DIR.is_dir():
         """Serve the single-page app, letting the client router own the URLs."""
         if full_path.startswith("api/"):
             return JSONResponse(status_code=404, content={"detail": "Not found"})
-        candidate = STATIC_DIR / full_path
-        if full_path and candidate.is_file():
+        root = STATIC_DIR.resolve()
+        candidate = (root / full_path).resolve()
+        # "/..%2F..%2Fconfig/optimizarr.db" must not walk out of the bundle.
+        if full_path and candidate.is_relative_to(root) and candidate.is_file():
             return FileResponse(str(candidate))
         index = STATIC_DIR / "index.html"
         if index.is_file():

@@ -229,3 +229,50 @@ def test_failed_gpu_decode_retries_with_cpu_decode_before_leaving_the_gpu(monkey
     assert attempts == [("av1_vaapi", True), ("av1_vaapi", False)]
     assert outcome.ok
     assert not outcome.fell_back_to_cpu
+
+
+def test_trash_retention_counts_from_the_move_not_from_the_file_date(tmp_path):
+    source = tmp_path / "lib" / "Old.mkv"
+    source.parent.mkdir()
+    source.write_bytes(b"x")
+    os.utime(source, (0, 0))  # a file from 1970
+    cfg = AppSettings()
+    cfg.output.trash_dir = str(tmp_path / "trash")
+    cfg.output.trash_retention_days = 14
+    trashed = Path(encoder._move_to_trash(str(source), cfg))
+    assert encoder.purge_trash(cfg) == 0
+    assert trashed.exists()
+
+
+def test_replace_never_overwrites_an_unrelated_file(tmp_path):
+    source = tmp_path / "Film.avi"
+    source.write_bytes(b"original")
+    neighbour = tmp_path / "Film.mkv"
+    neighbour.write_bytes(b"someone else")
+    temp_out = tmp_path / "out.mkv"
+    temp_out.write_bytes(b"encoded")
+    cfg = AppSettings()
+    cfg.output.mode = "replace"
+    cfg.output.original_action = "delete"
+    with pytest.raises(FileExistsError):
+        encoder._commit_output(str(source), str(temp_out), planner.EncodePlan(container="mkv"),
+                               cfg, info(path=str(source)))
+    assert source.read_bytes() == b"original"
+    assert neighbour.read_bytes() == b"someone else"
+    assert not list(tmp_path.glob(".optimizarr-staging-*"))
+
+
+def test_failed_commit_leaves_no_staging_copy_in_the_library(tmp_path, monkeypatch):
+    source = tmp_path / "Film.mkv"
+    source.write_bytes(b"original")
+    temp_out = tmp_path / "out.mkv"
+    temp_out.write_bytes(b"encoded")
+    cfg = AppSettings()
+    cfg.output.mode = "replace"
+    cfg.output.original_action = "trash"
+    monkeypatch.setattr(encoder, "_move_to_trash", Mock(side_effect=OSError("no space")))
+    with pytest.raises(OSError):
+        encoder._commit_output(str(source), str(temp_out), planner.EncodePlan(container="mkv"),
+                               cfg, info(path=str(source)))
+    assert source.read_bytes() == b"original"
+    assert not list(tmp_path.glob(".optimizarr-staging-*"))

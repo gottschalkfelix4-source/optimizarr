@@ -104,6 +104,11 @@ def walk_paths(
                 if not d.startswith(".") and not _matches_exclude(os.path.join(dirpath, d), excludes)
             ]
             for name in filenames:
+                # Hidden files are never media: our own .optimizarr-staging-*
+                # leftovers, macOS "._" resource forks.
+                if name.startswith(".") or Path(name).stem.endswith(".original"):
+                    # ".original" marks an original kept after conversion.
+                    continue
                 if Path(name).suffix.lower() not in extensions:
                     continue
                 full = os.path.join(dirpath, name)
@@ -144,6 +149,13 @@ def _sync_disk_to_db(settings: AppSettings, run_id: int) -> tuple[int, int, list
             seen_paths.add(path)
             row = existing.get(path)
             if row is None:
+                # `existing` is a snapshot.  An encode finishing mid-walk renames
+                # its row (Film.mp4 -> Film.mkv); inserting that path again broke
+                # the UNIQUE constraint and failed the whole scan.
+                row = s.execute(
+                    select(MediaFile).where(MediaFile.path == path)
+                ).scalar_one_or_none()
+            if row is None:
                 row = MediaFile(
                     path=path, library_id=lib_id, size=size, mtime=mtime,
                     container=Path(path).suffix.lstrip(".").lower(),
@@ -154,13 +166,22 @@ def _sync_disk_to_db(settings: AppSettings, run_id: int) -> tuple[int, int, list
                 new_count += 1
                 needs_probe.append(row.id)
             else:
+                def is_changed() -> bool:
+                    return (
+                        abs(row.mtime - mtime) > 1.0
+                        or row.size != size
+                        or row.state in (FileState.NEW.value, FileState.MISSING.value)
+                    )
+
+                changed = is_changed()
+                if changed:
+                    # Re-read before acting on it: a job may have replaced the
+                    # file since the snapshot, and the stale row would reset a
+                    # freshly converted file from "done" to "new".
+                    s.refresh(row)
+                    changed = is_changed()
                 row.last_seen = utcnow()
                 row.library_id = lib_id
-                changed = (
-                    abs(row.mtime - mtime) > 1.0
-                    or row.size != size
-                    or row.state in (FileState.NEW.value, FileState.MISSING.value)
-                )
                 if changed and row.state != FileState.ENCODING.value:
                     row.size = size
                     row.mtime = mtime
@@ -195,6 +216,9 @@ def _sync_disk_to_db(settings: AppSettings, run_id: int) -> tuple[int, int, list
         # Anything in the DB we did not see is gone from disk.
         for path, row in existing.items():
             if path in seen_paths:
+                continue
+            s.refresh(row)  # may have been renamed by a finished encode
+            if row.path in seen_paths:
                 continue
             if row.state not in (FileState.MISSING.value, FileState.ENCODING.value):
                 row.state = FileState.MISSING.value
@@ -242,7 +266,11 @@ def _store_probe(file_id: int, info: ffmpeg.MediaInfo) -> None:
         row.interlaced = info.interlaced
         row.audio_streams = info.audio_streams
         row.subtitle_streams = info.subtitle_streams
-        row.state = FileState.PROBED.value
+        # A queued or running job owns the state; a manual re-analysis turned
+        # an encoding file into a candidate and _store_analysis then no longer
+        # recognised it as busy.
+        if row.state not in (FileState.QUEUED.value, FileState.ENCODING.value):
+            row.state = FileState.PROBED.value
         row.error = ""
 
 

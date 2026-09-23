@@ -12,6 +12,7 @@ import logging
 import os
 import shutil
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -93,6 +94,12 @@ def _apply_ownership(path: str, settings: AppSettings) -> None:
             log.debug("chown failed for %s: %s", path, exc)
 
 
+def original_backup_path(source: str) -> Path:
+    """Where a kept original is parked: ``Film.mkv`` -> ``Film.original.mkv``."""
+    src = Path(source)
+    return src.with_suffix(f".original{src.suffix}")
+
+
 def _move_to_trash(source: str, settings: AppSettings) -> str:
     """Move the original into the recycle folder, keeping its directory shape."""
     trash_root = Path(settings.output.trash_dir or "/config/trash")
@@ -108,6 +115,12 @@ def _move_to_trash(source: str, settings: AppSettings) -> str:
         dest = dest_dir / f"{src.stem}.{counter}{src.suffix}"
         counter += 1
     shutil.move(str(src), str(dest))
+    # The retention clock starts now.  A move keeps the original's mtime, so a
+    # file from 2019 looked years overdue and was purged within a day.
+    try:
+        os.utime(dest)
+    except OSError as exc:
+        log.warning("could not stamp %s for the trash retention: %s", dest, exc)
     return str(dest)
 
 
@@ -160,6 +173,20 @@ def _target_path(source: str, plan: EncodePlan, settings: AppSettings) -> str:
     return str(src.with_suffix(suffix))
 
 
+def source_position(p: ffmpeg.Progress, fps: float) -> float:
+    """Seconds of source encoded so far.
+
+    ffmpeg reports `out_time=N/A` for some files for the whole run - seen with
+    copied ASS subtitles and font attachments - while the frame counter keeps
+    going.  Counting frames is then just as accurate for a constant-rate source.
+    """
+    if p.out_time > 0:
+        return p.out_time
+    if p.frame > 0 and fps > 0:
+        return p.frame / fps
+    return 0.0
+
+
 async def _run_encode(
     plan: EncodePlan,
     info: ffmpeg.MediaInfo,
@@ -191,19 +218,21 @@ async def _run_encode(
             return
         last_push = now
 
-        progress = min(1.0, p.out_time / duration) if duration else 0.0
         elapsed = now - started
+        position = source_position(p, info.fps)
+        speed = p.speed or (position / elapsed if elapsed > 0 else 0.0)
+        progress = min(1.0, position / duration) if duration else 0.0
         eta = int(elapsed / progress - elapsed) if progress > 0.01 else 0
         bus.publish("job.progress", {
             "job_id": job_id,
             "progress": progress,
             "fps": p.fps,
-            "speed": p.speed,
+            "speed": speed,
             "eta_seconds": eta,
             "current_size": p.total_size,
             # The client extrapolates between updates; it needs to know how far
             # along the source we are and how fast that is moving.
-            "out_time": p.out_time,
+            "out_time": position,
             "duration": duration,
         })
 
@@ -211,7 +240,7 @@ async def _run_encode(
             return
         last_persist = now
         snapshot = {
-            "progress": progress, "fps": p.fps, "speed": p.speed,
+            "progress": progress, "fps": p.fps, "speed": speed,
             "eta_seconds": eta, "current_size": p.total_size,
         }
         # Off the event loop: a blocked write must never stall the stream.
@@ -499,8 +528,8 @@ async def _spot_check_quality(
             ref = workdir / f"ref{i}.mkv"
             dist = workdir / f"dist{i}.mkv"
             try:
-                await ffmpeg.extract_segment(source, start, 10.0, str(ref), timeout=180)
-                await ffmpeg.extract_segment(output, start, 10.0, str(dist), timeout=180)
+                await ffmpeg.extract_segment(source, start, 10.0, str(ref), timeout=180, exact=True)
+                await ffmpeg.extract_segment(output, start, 10.0, str(dist), timeout=180, exact=True)
             except ffmpeg.FFmpegError:
                 continue
             score = await quality.measure_quality(str(ref), str(dist), threads=4, timeout=900)
@@ -528,10 +557,32 @@ def _commit_output(
     the original and the replacement.
     """
     target = _target_path(source, plan, settings)
+    if (settings.output.mode == "replace"
+            and os.path.abspath(target) != os.path.abspath(source)
+            and os.path.exists(target)):
+        # Film.avi -> Film.mkv next to an unrelated Film.mkv: os.replace would
+        # destroy that file without it ever reaching the trash.  (Sidecar and
+        # separate-dir targets are our own earlier output and may be replaced.)
+        raise FileExistsError(
+            f"Ziel {target} existiert bereits und ist nicht die Quelle - nichts ersetzt."
+        )
     target_dir = Path(target).parent
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    staging = target_dir / f".optimizarr-staging-{os.getpid()}-{Path(target).name}"
+    # Unique per call: two concurrent jobs can share a target name.
+    staging = target_dir / f".optimizarr-staging-{os.getpid()}-{uuid.uuid4().hex[:8]}-{Path(target).name}"
+    try:
+        _stage_and_replace(source, temp_out, staging, target, settings)
+    except BaseException:
+        # Never leave a full-size hidden copy in the library.
+        staging.unlink(missing_ok=True)
+        raise
+    return target
+
+
+def _stage_and_replace(
+    source: str, temp_out: str, staging: Path, target: str, settings: AppSettings,
+) -> None:
     try:
         shutil.move(temp_out, str(staging))
     except OSError:
@@ -556,14 +607,15 @@ def _commit_output(
             _move_to_trash(source, settings)
         elif action == "delete":
             os.unlink(source)
-        elif os.path.abspath(source) == os.path.abspath(target):
-            # Keeping the original while writing to the same name is impossible;
-            # park it beside the result instead of destroying it.
-            backup = Path(source).with_suffix(f".original{Path(source).suffix}")
+        else:
+            # Kept originals always get the ".original" marker - also when the
+            # container changes and the name would not clash.  The scanner skips
+            # the marker; without it the kept copy came back as a new candidate
+            # on the next scan and was converted again.
+            backup = original_backup_path(source)
             shutil.move(source, str(backup))
 
     os.replace(str(staging), target)
-    return target
 
 
 def _record_success(

@@ -183,8 +183,15 @@ class QueueWorker:
                     job.state = JobState.CANCELLED.value
                     job.error = "Abgebrochen"
             raise
-        except Exception:
+        except Exception as exc:
+            # run_job only guards the encode itself; anything before it (an
+            # unwritable /transcode, a locked database) used to leave the job
+            # "running" and the file "encoding" until the next container restart.
             log.exception("job %s raised", job_id)
+            try:
+                await asyncio.to_thread(_fail_crashed_job, job_id, exc)
+            except Exception:
+                log.exception("could not mark job %s as failed", job_id)
         finally:
             self._running.pop(job_id, None)
             self._cancels.pop(job_id, None)
@@ -193,6 +200,16 @@ class QueueWorker:
                 await asyncio.to_thread(refit_predictor)
             except Exception:
                 log.debug("predictor refit failed", exc_info=True)
+
+
+def _fail_crashed_job(job_id: int, exc: BaseException) -> None:
+    """Close out a job whose run_job raised instead of returning."""
+    with session_scope() as s:
+        job = s.get(Job, job_id)
+        if job is None or job.state != JobState.RUNNING.value:
+            return
+        file_id = job.file_id
+    encoder._fail(job_id, file_id, encoder.EncodeOutcome(), f"Unerwarteter Fehler: {exc}")
 
 
 def refit_predictor() -> dict[str, Any]:

@@ -89,7 +89,8 @@ export default function Queue() {
     (sum, j) => sum + (j.predicted_size > 0 ? Math.max(0, j.input_size - j.predicted_size) : 0),
     0,
   );
-  const queuedEta = queued.reduce((sum, j) => sum + (j.eta_seconds || 0), 0);
+  // No compute-time total here: eta_seconds only exists for a running encode,
+  // so for waiting jobs it is 0 or stale and the sum would be made up.
 
   if (isLoading) {
     return (
@@ -152,7 +153,7 @@ export default function Queue() {
         title={`Warteschlange (${queued.length})`}
         subtitle={
           queued.length
-            ? `${bytes(queuedSaving)} erwartete Ersparnis · geschaetzt ${humanDuration(queuedEta)} Rechenzeit`
+            ? `${bytes(queuedSaving)} erwartete Ersparnis`
             : undefined
         }
         bodyClassName="p-0"
@@ -347,7 +348,7 @@ function FinishedJob({
             <span className="text-save-400">
               (-{bytes(saved)}, {percent((saved / job.input_size) * 100)})
             </span>
-            {job.vmaf && ` · VMAF ${job.vmaf.toFixed(1)}`}
+            {job.vmaf != null && job.vmaf > 0 && ` · VMAF ${job.vmaf.toFixed(1)}`}
             {" · "}
             {relativeTime(job.finished_at)}
           </p>

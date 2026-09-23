@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { endpoints, type DryRunResult, type MediaFile } from "../lib/api";
+import { endpoints, type AnalysisResult, type DryRunResult, type MediaFile } from "../lib/api";
 import {
   bytes,
   bitrate,
@@ -120,8 +120,13 @@ export default function Library() {
       endpoints.ignoreFile(id, ignored),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["files"] });
+      queryClient.invalidateQueries({ queryKey: ["stats"] });
+      queryClient.invalidateQueries({ queryKey: ["series"] });
+      queryClient.invalidateQueries({ queryKey: ["movies"] });
+      queryClient.invalidateQueries({ queryKey: ["jobs"] });
       push("Status geaendert.", "success");
     },
+    onError: (e: Error) => push(e.message, "error"),
   });
 
   const items = data?.items ?? [];
@@ -443,9 +448,21 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
     enabled: fileId !== null,
   });
 
+  // Results of actions taken in this dialog.  Only POST /analyze returns the
+  // reasoning (GET /files/{id} does not), so it is kept here.  Both are tagged
+  // with their file so a late answer never shows up on another file.
+  const [analysis, setAnalysis] = useState<{ fileId: number; result: AnalysisResult } | null>(null);
+  const [dryState, setDryState] = useState<{ fileId: number; result: DryRunResult } | null>(null);
+
+  useEffect(() => {
+    setAnalysis(null);
+    setDryState(null);
+  }, [fileId]);
+
   const analyze = useMutation({
-    mutationFn: () => endpoints.analyzeFile(fileId!, analysisDepth),
-    onSuccess: (result) => {
+    mutationFn: (id: number) => endpoints.analyzeFile(id, analysisDepth),
+    onSuccess: (result, id) => {
+      if (result.analysis) setAnalysis({ fileId: id, result: result.analysis });
       push(
         result.analysis?.decision === "convert"
           ? "Analyse fertig - lohnt sich."
@@ -457,12 +474,10 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
     onError: (e: Error) => push(e.message, "error"),
   });
 
-  const [dry, setDry] = useState<DryRunResult | null>(null);
-
   const dryRun = useMutation({
-    mutationFn: () => endpoints.dryRun(fileId!, 15),
-    onSuccess: (result) => {
-      setDry(result);
+    mutationFn: (id: number) => endpoints.dryRun(id, 15),
+    onSuccess: (result, id) => {
+      setDryState({ fileId: id, result });
       push(
         result.ok
           ? "Trockenlauf erfolgreich - der Plan funktioniert auf dieser Datei."
@@ -486,6 +501,12 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
 
   const plan = file?.plan;
   const conf = file ? confidenceLabel(file.confidence) : null;
+  const freshAnalysis = analysis && analysis.fileId === fileId ? analysis.result : file?.analysis;
+  const dry = dryState && dryState.fileId === fileId ? dryState.result : null;
+  // Converting a finished file would re-encode the AV1 result; queued or
+  // running files are already on their way.
+  const alreadyHandled =
+    file?.state === "done" || file?.state === "encoding" || file?.state === "queued";
 
   return (
     <Modal
@@ -509,7 +530,7 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
           </div>
           <button
             className="btn-ghost"
-            onClick={() => analyze.mutate()}
+            onClick={() => fileId !== null && analyze.mutate(fileId)}
             disabled={analyze.isPending}
           >
             {analyze.isPending ? <Spinner className="size-4" /> : <Microscope className="size-4" />}
@@ -517,7 +538,7 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
           </button>
           <button
             className="btn-ghost"
-            onClick={() => dryRun.mutate()}
+            onClick={() => fileId !== null && dryRun.mutate(fileId)}
             disabled={dryRun.isPending || !plan}
             title="Den geplanten Befehl 15 Sekunden lang wirklich ausfuehren"
           >
@@ -542,7 +563,14 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
             <button
               className="btn-primary"
               onClick={() => enqueue.mutate(false)}
-              disabled={enqueue.isPending || !plan}
+              disabled={enqueue.isPending || !plan || alreadyHandled}
+              title={
+                file?.state === "done"
+                  ? "Bereits nach AV1 konvertiert"
+                  : alreadyHandled
+                    ? "Steht schon in der Warteschlange"
+                    : undefined
+              }
             >
               <Play className="size-4" />
               Konvertieren
@@ -636,7 +664,7 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
           </div>
 
           {/* --- streams --- */}
-          {(file.audio_streams?.length || file.subtitle_streams?.length) && (
+          {(file.audio_streams?.length ?? 0) + (file.subtitle_streams?.length ?? 0) > 0 && (
             <div className="rounded-lg border border-ink-700/70 bg-ink-850/40 p-4">
               <h4 className="mb-3 text-xs font-semibold uppercase tracking-wide text-ink-400">
                 Spuren
@@ -708,13 +736,13 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
           )}
 
           {/* --- reasoning from a fresh analysis --- */}
-          {file.analysis?.reasons?.length ? (
+          {freshAnalysis?.reasons?.length ? (
             <div className="rounded-lg border border-ink-700/70 bg-ink-850/40 p-4">
               <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink-400">
                 Wie Optimizarr zu dieser Einschaetzung kommt
               </h4>
               <ul className="space-y-1.5 text-sm text-ink-300">
-                {file.analysis.reasons.map((reason, i) => (
+                {freshAnalysis.reasons.map((reason, i) => (
                   <li key={i} className="flex gap-2">
                     <span className="mt-1.5 size-1 shrink-0 rounded-full bg-ink-500" />
                     <span className="leading-relaxed">{reason}</span>

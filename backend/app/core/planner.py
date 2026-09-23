@@ -19,8 +19,13 @@ _QSV_PRESET_MAP = {
     0: 1, 1: 1, 2: 1, 3: 2, 4: 2, 5: 3, 6: 4, 7: 4, 8: 5, 9: 5, 10: 6, 11: 6, 12: 7, 13: 7,
 }
 
-# Subtitle codecs that survive a remux into mp4.
-_MP4_SAFE_SUBS = {"mov_text", "subrip", "text"}
+# Subtitle handling per target container.  A codec the muxer cannot store
+# fails the whole job at the very end ("Subtitle codec ... is not supported"),
+# so every source codec is copied, converted to a text format the container
+# takes, or dropped.
+_MP4_TEXT_SUBS = {"subrip", "srt", "ass", "ssa", "webvtt", "text"}   # -> mov_text
+_MKV_CONVERT_SUBS = {"mov_text": "srt"}                             # tx3g from mp4 sources
+_MKV_UNSUPPORTED_SUBS = {"dvb_teletext", "eia_608", "arib_caption"}
 
 
 @dataclass
@@ -40,9 +45,10 @@ class AudioAction:
 @dataclass
 class SubtitleAction:
     index: int
-    action: str            # copy | drop
+    action: str            # copy | convert | drop
     codec: str = ""
     language: str = ""
+    target: str = ""       # codec to convert to when action == "convert"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -193,6 +199,17 @@ def plan_audio(info: MediaInfo, settings: AppSettings) -> tuple[list[AudioAction
                                        "bereits sparsam - wird kopiert"))
             total_bitrate += src_bitrate or channels * 96_000
 
+    if actions and all(a.action == "drop" for a in actions):
+        # The rules left nothing to hear.  Keep the default track (or the first)
+        # rather than produce a silent file.
+        keep = next((i for i, s in enumerate(info.audio_streams) if s.get("default")), 0)
+        a = actions[keep]
+        src = info.audio_streams[keep]
+        actions[keep] = AudioAction(a.index, "copy", a.codec, a.channels,
+                                    int(src.get("bitrate") or 0), a.language,
+                                    "einzige Tonspur - trotz Regeln behalten")
+        total_bitrate += actions[keep].bitrate or a.channels * 96_000
+
     return actions, total_bitrate
 
 
@@ -214,8 +231,19 @@ def plan_subtitles(info: MediaInfo, settings: AppSettings, container: str) -> li
         if keep_langs and lang not in keep_langs and lang != "und" and not stream.get("forced"):
             actions.append(SubtitleAction(idx, "drop", codec, lang))
             continue
-        if container == "mp4" and codec not in _MP4_SAFE_SUBS:
+        if container == "mp4":
+            if codec == "mov_text":
+                actions.append(SubtitleAction(idx, "copy", codec, lang))
+            elif codec in _MP4_TEXT_SUBS:
+                actions.append(SubtitleAction(idx, "convert", codec, lang, "mov_text"))
+            else:
+                actions.append(SubtitleAction(idx, "drop", codec, lang))
+            continue
+        if codec in _MKV_UNSUPPORTED_SUBS:
             actions.append(SubtitleAction(idx, "drop", codec, lang))
+            continue
+        if codec in _MKV_CONVERT_SUBS:
+            actions.append(SubtitleAction(idx, "convert", codec, lang, _MKV_CONVERT_SUBS[codec]))
             continue
         actions.append(SubtitleAction(idx, "copy", codec, lang))
     return actions
@@ -607,8 +635,13 @@ def build_ffmpeg_args(
             out_index += 1
 
         # --- subtitles / metadata ---
-        if any(s.get("action") != "drop" for s in plan.subtitles):
-            args += ["-c:s", "copy"]
+        sub_index = 0
+        for s in plan.subtitles:
+            if s.get("action") == "drop":
+                continue
+            codec = s.get("target") if s.get("action") == "convert" else "copy"
+            args += [f"-c:s:{sub_index}", codec or "copy"]
+            sub_index += 1
         if plan.copy_attachments and info.attachments:
             args += ["-c:t", "copy"]
         args += ["-map_metadata", "0"]

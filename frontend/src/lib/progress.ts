@@ -39,9 +39,15 @@ export function useSmoothProgress(sample: ProgressSample | null | undefined): nu
     const duration = sample.duration ?? 0;
     const rate = duration > 0 && sample.speed && sample.speed > 0 ? sample.speed / duration : 0;
 
+    // How far the estimate can have run ahead of reality.  A drop larger than
+    // that is not jitter but a restart - the GPU-decode retry, the CPU fallback,
+    // a job resumed after a container restart - and the bar has to follow it.
+    const overshoot = anchor.current.rate * MAX_EXTRAPOLATION + 0.01;
+    const restarted = progress < shown.current - overshoot;
+
     anchor.current = { at: performance.now(), progress, rate };
-    // Never step backwards on a re-anchor; wait for reality to catch up.
-    if (progress >= shown.current || progress === 0) {
+    // Otherwise never step backwards on a re-anchor; wait for reality to catch up.
+    if (progress >= shown.current || progress === 0 || restarted) {
       shown.current = progress;
       setDisplay(progress);
     }

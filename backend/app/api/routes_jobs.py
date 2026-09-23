@@ -125,7 +125,13 @@ def cancel_job(job_id: int, session: Session = Depends(get_session)) -> dict[str
         # Running in the DB but not in the worker: a restart lost it.
         row.state = JobState.CANCELLED.value
         row.finished_at = utcnow()
+        media = session.get(MediaFile, row.file_id)
+        if media and media.state == FileState.ENCODING.value:
+            media.state = (
+                (row.plan or {}).get(planner.RESTORE_STATE) or FileState.CANDIDATE.value
+            )
         session.commit()
+        bus.publish("queue.changed", {})
         return {"ok": True, "message": "Verwaister Job aufgeraeumt."}
     if row.state == JobState.QUEUED.value:
         row.state = JobState.CANCELLED.value
@@ -209,12 +215,16 @@ def stats(session: Session = Depends(get_session)) -> dict[str, Any]:
         .where(MediaFile.state == FileState.CANDIDATE.value, MediaFile.ignored.is_(False))
     ).first()
 
+    # Counted from the files, not from the jobs: "clear finished" deletes the
+    # jobs and took the whole saving with it.  original_size is only set when
+    # the new file replaced the old one, so sidecar output claims nothing.
+    replaced = (MediaFile.state == FileState.DONE.value) & (MediaFile.original_size > 0)
     realised = session.execute(
         select(
-            func.sum(Job.input_size - Job.output_size),
-            func.count(Job.id),
-            func.avg(Job.vmaf),
-        ).where(Job.state == JobState.DONE.value)
+            func.sum(MediaFile.original_size - MediaFile.size),
+            func.count(MediaFile.id),
+            func.avg(MediaFile.measured_vmaf),
+        ).where(replaced)
     ).first()
 
     codecs = session.execute(
@@ -234,13 +244,13 @@ def stats(session: Session = Depends(get_session)) -> dict[str, Any]:
     # Saved bytes per day for the sparkline.
     daily = session.execute(
         select(
-            func.date(Job.finished_at),
-            func.sum(Job.input_size - Job.output_size),
-            func.count(Job.id),
+            func.date(MediaFile.converted_at),
+            func.sum(MediaFile.original_size - MediaFile.size),
+            func.count(MediaFile.id),
         )
-        .where(Job.state == JobState.DONE.value, Job.finished_at.isnot(None))
-        .group_by(func.date(Job.finished_at))
-        .order_by(func.date(Job.finished_at).desc())
+        .where(replaced, MediaFile.converted_at.isnot(None))
+        .group_by(func.date(MediaFile.converted_at))
+        .order_by(func.date(MediaFile.converted_at).desc())
         .limit(60)
     ).all()
 

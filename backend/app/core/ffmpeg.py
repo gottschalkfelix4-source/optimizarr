@@ -548,15 +548,24 @@ async def version() -> str:
 
 
 async def extract_segment(
-    source: str, start: float, duration: float, dest: str, timeout: float = 300.0
+    source: str, start: float, duration: float, dest: str, timeout: float = 300.0,
+    exact: bool = False,
 ) -> None:
-    """Cut a lossless slice used for trial encodes and VMAF probes."""
+    """Cut a lossless slice used for trial encodes and VMAF probes.
+
+    ``exact`` decodes instead of stream-copying.  A copied slice starts at the
+    keyframe before ``start``, and two files with different keyframe grids -
+    a source and its encode - then yield slices that do not line up, which
+    scores a good encode as a bad one.
+    """
+    code, err = 1, ""
     args = [
         "-y", "-ss", f"{start:.3f}", "-i", source, "-t", f"{duration:.3f}",
         "-map", "0:v:0", "-c:v", "copy", "-an", "-sn", "-dn",
         "-avoid_negative_ts", "make_zero", "-f", "matroska", dest,
     ]
-    code, _, err = await run_simple(args, timeout=timeout)
+    if not exact:
+        code, _, err = await run_simple(args, timeout=timeout)
     if code != 0 or not os.path.exists(dest) or os.path.getsize(dest) < 1024:
         # Stream copy can land between keyframes: re-cut by decoding instead.
         args = [

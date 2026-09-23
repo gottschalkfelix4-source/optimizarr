@@ -219,7 +219,10 @@ class SeriesGroup:
 
     @property
     def looks_like_series(self) -> bool:
-        return any(e.season is not None or e.episode is not None for e in self.episodes)
+        # Season 0 on its own only means a "Specials" folder - movies have those
+        # too (Film (2020)/Specials/Making of.mkv).  It takes an episode number
+        # or a real season to make a series.
+        return any(e.episode is not None or e.season not in (None, 0) for e in self.episodes)
 
 
 def group(rows: Iterable[Any], libraries: dict[int, tuple[str, str]]) -> list[SeriesGroup]:
