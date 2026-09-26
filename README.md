@@ -348,7 +348,9 @@ nach). Sie gilt für die Oberfläche, die API und die Live-Verbindung; frei blei
 Port erreicht, Optimizarr bedienen – und damit Dateien ersetzen lassen. Das Passwort wird
 nur als PBKDF2-SHA256-Hash gespeichert. Basic Auth überträgt das Passwort bei jeder
 Anfrage; wer Optimizarr außerhalb des Heimnetzes erreichbar macht, sollte einen
-Reverse-Proxy mit HTTPS davorschalten.
+Reverse-Proxy mit HTTPS davorschalten. Der Proxy muss den `Host`-Header durchreichen
+oder `X-Forwarded-Host` setzen (bei nginx, Nginx Proxy Manager, SWAG und Traefik der
+Standard), sonst lehnt der Server die Live-Verbindung wegen fremder Herkunft ab.
 
 **Passwort vergessen?** Den Container einmal mit der Umgebungsvariable
 `OPTIMIZARR_RESET_AUTH=1` starten. Die Anmeldung ist dann abgeschaltet (das Protokoll
