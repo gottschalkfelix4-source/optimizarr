@@ -11,6 +11,7 @@ import {
 } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import type { ScanState } from "./api";
+import { InvalidationBatcher, type FlushTarget } from "./invalidation";
 
 export interface LiveEvent {
   type: string;
@@ -33,18 +34,16 @@ interface LiveContextValue {
   connected: boolean;
   scan: ScanState | null;
   jobProgress: Record<number, JobProgress>;
-  lastEvent: LiveEvent | null;
 }
 
 const LiveContext = createContext<LiveContextValue>({
   connected: false,
   scan: null,
   jobProgress: {},
-  lastEvent: null,
 });
 
 /** Which queries to refresh when a given event arrives. */
-const INVALIDATION_MAP: Record<string, string[]> = {
+export const INVALIDATION_MAP: Record<string, string[]> = {
   "scan.started": ["scan", "system"],
   "scan.finished": ["scan", "files", "series", "movies", "stats", "system", "history"],
   "file.analyzed": ["files", "stats"],
@@ -78,25 +77,39 @@ export function LiveProvider({ children }: { children: ReactNode }) {
   const [connected, setConnected] = useState(false);
   const [scan, setScan] = useState<ScanState | null>(null);
   const [jobProgress, setJobProgress] = useState<Record<number, JobProgress>>({});
-  const [lastEvent, setLastEvent] = useState<LiveEvent | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const retryRef = useRef(0);
   const timerRef = useRef<number | undefined>(undefined);
+  // Set after the first successful connect: every later open is a reconnect.
+  const connectedBefore = useRef(false);
+
+  // Events only mark queries stale; the refetches run once per window.  A
+  // refetch already in flight is left alone instead of being restarted.
+  const batcher = useMemo(
+    () =>
+      new InvalidationBatcher((target: FlushTarget) => {
+        if (target === "all") {
+          queryClient.invalidateQueries(undefined, { cancelRefetch: false });
+          return;
+        }
+        target.forEach((key) =>
+          queryClient.invalidateQueries({ queryKey: [key] }, { cancelRefetch: false }),
+        );
+      }),
+    [queryClient],
+  );
+  useEffect(() => () => batcher.dispose(), [batcher]);
 
   const handleEvent = useCallback(
     (event: LiveEvent) => {
       if (event.type === "ping") return;
 
-      // Progress arrives several times a second.  Storing it in `lastEvent`
-      // too would re-render every consumer of the context for a value only the
-      // progress bars care about.
+      // Progress arrives several times a second; only the progress bars care.
       if (event.type === "job.progress") {
         const d = event.data as unknown as { job_id: number } & JobProgress;
         setJobProgress((prev) => ({ ...prev, [d.job_id]: d }));
         return;
       }
-
-      setLastEvent(event);
 
       if (event.type === "hello") {
         const payload = event.data as { scan?: ScanState };
@@ -131,11 +144,9 @@ export function LiveProvider({ children }: { children: ReactNode }) {
       }
 
       const keys = INVALIDATION_MAP[event.type];
-      if (keys) {
-        keys.forEach((key) => queryClient.invalidateQueries({ queryKey: [key] }));
-      }
+      if (keys) batcher.add(keys);
     },
-    [queryClient],
+    [batcher],
   );
 
   useEffect(() => {
@@ -150,6 +161,11 @@ export function LiveProvider({ children }: { children: ReactNode }) {
       socket.onopen = () => {
         setConnected(true);
         retryRef.current = 0;
+        // Whatever happened while the connection was down arrived nowhere, so
+        // after a reconnect every cached answer is suspect.  The first connect
+        // needs nothing: the queries have only just been fetched.
+        if (connectedBefore.current) batcher.addAll();
+        connectedBefore.current = true;
       };
       socket.onmessage = (message) => {
         try {
@@ -175,12 +191,9 @@ export function LiveProvider({ children }: { children: ReactNode }) {
       if (timerRef.current) window.clearTimeout(timerRef.current);
       socketRef.current?.close();
     };
-  }, [handleEvent]);
+  }, [handleEvent, batcher]);
 
-  const value = useMemo(
-    () => ({ connected, scan, jobProgress, lastEvent }),
-    [connected, scan, jobProgress, lastEvent],
-  );
+  const value = useMemo(() => ({ connected, scan, jobProgress }), [connected, scan, jobProgress]);
 
   return <LiveContext.Provider value={value}>{children}</LiveContext.Provider>;
 }

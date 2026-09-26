@@ -10,7 +10,7 @@ export const BUCKETS: { key: SeriesBucket; label: string; className: string }[] 
   { key: "av1", label: "War schon AV1", className: "bg-save-500/45" },
   { key: "active", label: "In Arbeit", className: "bg-brand-500" },
   { key: "pending", label: "Kandidat", className: "bg-info-500/70" },
-  { key: "excluded", label: "Ausgeschlossen / uebersprungen", className: "bg-ink-400" },
+  { key: "excluded", label: "Ausgeschlossen / übersprungen", className: "bg-ink-400" },
   { key: "failed", label: "Fehler", className: "bg-danger-500" },
   { key: "other", label: "Noch offen", className: "bg-ink-600" },
 ];
@@ -140,7 +140,7 @@ export function FileAction({
 }) {
   if (file.bucket === "pending") {
     return (
-      <IconButton title="Zur Warteschlange hinzufuegen" disabled={busy} onClick={onQueue}>
+      <IconButton title="Zur Warteschlange hinzufügen" disabled={busy} onClick={onQueue}>
         <Play className="size-3.5" />
       </IconButton>
     );
@@ -152,7 +152,7 @@ export function FileAction({
     <IconButton
       tone="warn"
       title={
-        file.bucket === "av1" ? "Ist bereits AV1 - trotzdem neu kodieren" : "Trotz Ausschluss konvertieren"
+        file.bucket === "av1" ? "Ist bereits AV1 – trotzdem neu kodieren" : "Trotz Ausschluss konvertieren"
       }
       disabled={busy}
       onClick={onForce}
@@ -200,20 +200,20 @@ export function ForceConfirm({
     >
       <div className="space-y-3 text-sm leading-relaxed text-ink-300">
         <p>
-          {count} {noun} kommen in die Warteschlange - auch solche, deren Codec ausgeschlossen ist,
+          {count} {noun} kommen in die Warteschlange – auch solche, deren Codec ausgeschlossen ist,
           die ignoriert werden oder die als nicht lohnend eingestuft wurden.
         </p>
         <ul className="list-disc space-y-1 pl-5 text-ink-400">
           <li>
-            {noun}, die schon AV1 sind, bleiben unberuehrt. Einzelne lassen sich in ihrer Zeile
+            {noun}, die schon AV1 sind, bleiben unberührt. Einzelne lassen sich in ihrer Zeile
             trotzdem erzwingen.
           </li>
           <li>
-            Die Mindestersparnis gilt fuer diese Jobs nicht. Waere ein Ergebnis groesser als das
+            Die Mindestersparnis gilt für diese Jobs nicht. Wäre ein Ergebnis größer als das
             Original, wird es wie gewohnt verworfen.
           </li>
           <li>
-            {noun}, die vor der Analyse ausgeschlossen wurden, bekommen ihren Plan erst beim Start -
+            {noun}, die vor der Analyse ausgeschlossen wurden, bekommen ihren Plan erst beim Start –
             mit den Werten des Profils statt einer Testkodierung.
           </li>
         </ul>

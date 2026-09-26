@@ -18,10 +18,10 @@ import {
 import { endpoints } from "../lib/api";
 import { number, percent, relativeTime } from "../lib/format";
 import { useToast } from "../lib/live";
-import { Callout, EmptyState, Panel, ProgressBar, Skeleton, cn } from "../components/ui";
+import { Callout, EmptyState, ErrorState, Panel, ProgressBar, Skeleton, cn } from "../components/ui";
 
 const FEATURE_LABELS: Record<string, string> = {
-  log_pixels: "Aufloesung x Bildrate",
+  log_pixels: "Auflösung x Bildrate",
   crf: "CRF-Wert",
   preset: "Encoder-Preset",
   log_source_bpp: "Bits pro Pixel der Quelle",
@@ -36,7 +36,7 @@ export default function Insights() {
   const { push } = useToast();
   const queryClient = useQueryClient();
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: ["model"],
     queryFn: endpoints.modelStats,
     refetchInterval: 30000,
@@ -54,6 +54,7 @@ export default function Insights() {
       );
       queryClient.invalidateQueries({ queryKey: ["model"] });
     },
+    onError: (e: Error) => push(e.message, "error"),
   });
 
   const detect = useMutation({
@@ -68,6 +69,14 @@ export default function Insights() {
   const stats = data?.stats;
   const samples = data?.samples ?? [];
   const hw = info?.hardware;
+
+  if (isError && !data) {
+    return (
+      <Panel>
+        <ErrorState error={error} onRetry={() => refetch()} title="Lernmodell konnte nicht geladen werden" />
+      </Panel>
+    );
+  }
 
   if (isLoading) {
     return (
@@ -91,7 +100,7 @@ export default function Insights() {
       {/* ---------------- model state ---------------- */}
       <Panel
         title="Lernmodell"
-        subtitle="Korrigiert die Groessenvorhersage anhand deiner bisherigen Konvertierungen"
+        subtitle="Korrigiert die Größenvorhersage anhand deiner bisherigen Konvertierungen"
         actions={
           <button
             className="btn-ghost btn-sm"
@@ -115,7 +124,7 @@ export default function Insights() {
               <ProgressBar value={stats?.maturity ?? 0} tone="warn" className="mt-2" />
               <p className="hint">
                 {stats?.trained && (stats?.maturity ?? 0) >= 1
-                  ? "Das Modell greift voll - Schaetzungen werden aktiv korrigiert."
+                  ? "Das Modell greift voll – Schätzungen werden aktiv korrigiert."
                   : "Bis zur vollen Reife mischt Optimizarr die gelernte Korrektur nur anteilig bei. So kann ein halb trainiertes Modell keinen Unsinn produzieren."}
               </p>
             </div>
@@ -136,7 +145,7 @@ export default function Insights() {
             {stats?.top_signals?.length ? (
               <div>
                 <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink-400">
-                  Wichtigste Einflussgroessen
+                  Wichtigste Einflussgrößen
                 </p>
                 <ul className="space-y-1.5">
                   {stats.top_signals.map((signal) => (
@@ -184,7 +193,7 @@ export default function Insights() {
                     <YAxis
                       type="number"
                       dataKey="actual"
-                      name="tatsaechlich"
+                      name="tatsächlich"
                       unit=" kbit/s"
                       domain={[0, maxKbps]}
                       tick={{ fill: "#6b7ba0", fontSize: 11 }}
@@ -212,15 +221,15 @@ export default function Insights() {
                   </ScatterChart>
                 </ResponsiveContainer>
                 <p className="hint text-center">
-                  Punkte auf der gestrichelten Linie bedeuten: die Schaetzung lag genau richtig.
-                  Oberhalb wurde die Datei groesser als erwartet, unterhalb kleiner.
+                  Punkte auf der gestrichelten Linie bedeuten: die Schätzung lag genau richtig.
+                  Oberhalb wurde die Datei größer als erwartet, unterhalb kleiner.
                 </p>
               </>
             ) : (
               <EmptyState
                 icon={<TrendingUp className="size-8" />}
                 title="Noch zu wenig Daten"
-                description="Nach den ersten Konvertierungen zeigt dieser Bereich, wie genau die Groessenvorhersage trifft - und das Modell korrigiert sich selbst."
+                description="Nach den ersten Konvertierungen zeigt dieser Bereich, wie genau die Größenvorhersage trifft – und das Modell korrigiert sich selbst."
               />
             )}
           </div>
@@ -229,7 +238,7 @@ export default function Insights() {
 
       {/* ---------------- error over time ---------------- */}
       {samples.length >= 5 && (
-        <Panel title="Schaetzfehler im Zeitverlauf" subtitle="je naeher an 0 %, desto besser">
+        <Panel title="Schätzfehler im Zeitverlauf" subtitle="je näher an 0 %, desto besser">
           <ResponsiveContainer width="100%" height={220}>
             <LineChart
               data={samples.map((s, i) => ({ ...s, index: i + 1 }))}
@@ -271,7 +280,7 @@ export default function Insights() {
       {/* ---------------- hardware ---------------- */}
       <Panel
         title="Hardware"
-        subtitle="Was diese Maschine wirklich kann - per Testkodierung geprueft"
+        subtitle="Was diese Maschine wirklich kann – per Testkodierung geprüft"
         actions={
           <button
             className="btn-ghost btn-sm"
@@ -317,7 +326,7 @@ export default function Insights() {
                         <span className="ml-2 text-xs text-ink-500">
                           {enc.verified
                             ? "getestet und einsatzbereit"
-                            : enc.reason || "nicht verfuegbar"}
+                            : enc.reason || "nicht verfügbar"}
                         </span>
                       </span>
                     </li>
@@ -351,12 +360,12 @@ export default function Insights() {
                   ))}
                 </ul>
                 <p className="mt-3 border-t border-ink-800 pt-3 text-xs text-ink-500">
-                  Qualitaetsmessung:{" "}
+                  Qualitätsmessung:{" "}
                   {hw.quality_metric === "vmaf"
                     ? "VMAF (libvmaf vorhanden)"
                     : hw.quality_metric === "ssim"
                       ? "SSIM, auf die VMAF-Skala umgerechnet"
-                      : "nicht verfuegbar"}
+                      : "nicht verfügbar"}
                 </p>
               </div>
             </div>
@@ -372,7 +381,11 @@ export default function Insights() {
             icon={<Cpu className="size-8" />}
             title="Hardware noch nicht erkannt"
             action={
-              <button className="btn-primary btn-sm" onClick={() => detect.mutate()}>
+              <button
+                className="btn-primary btn-sm"
+                onClick={() => detect.mutate()}
+                disabled={detect.isPending}
+              >
                 Jetzt erkennen
               </button>
             }
@@ -391,7 +404,7 @@ export default function Insights() {
                   <th className="px-3 py-3 font-medium">Quelle</th>
                   <th className="px-3 py-3 font-medium">Encoder</th>
                   <th className="px-3 py-3 text-right font-medium">Vorhergesagt</th>
-                  <th className="px-3 py-3 text-right font-medium">Tatsaechlich</th>
+                  <th className="px-3 py-3 text-right font-medium">Tatsächlich</th>
                   <th className="px-5 py-3 text-right font-medium">Abweichung</th>
                 </tr>
               </thead>
