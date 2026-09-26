@@ -247,12 +247,50 @@ def _bit_depth(stream: dict[str, Any]) -> int:
     return 8
 
 
+DOLBY_VISION = "dolby_vision"
+
+
+def _dolby_vision_profile(stream: dict[str, Any]) -> int | None:
+    """DV profile from the DOVI configuration record; 0 = DV of unknown profile.
+
+    ffprobe names the side data "DOVI configuration record" - older code looked
+    for "dolby vision" and never matched, so profile 5 (no HDR10 fallback, IPT
+    colour) was treated as SDR and came out green/purple.
+    """
+    for sd in stream.get("side_data_list") or []:
+        kind = str(sd.get("side_data_type", "")).lower()
+        if "dovi" in kind or "dolby vision" in kind:
+            try:
+                return int(sd.get("dv_profile") or 0)
+            except (TypeError, ValueError):
+                return 0
+    tag = str(stream.get("codec_tag_string") or "").lower()
+    if tag in ("dvh1", "dvhe", "dav1", "dva1", "dvav"):
+        return 0
+    return None
+
+
+def is_dolby_vision(hdr_format: str | None) -> bool:
+    return bool(hdr_format) and str(hdr_format).startswith(DOLBY_VISION)
+
+
+def dolby_vision_profile(hdr_format: str | None) -> int | None:
+    """Profile encoded in ``hdr_format`` ("dolby_vision_p8" -> 8), 0 if unknown,
+    None if the file is not Dolby Vision at all."""
+    if not is_dolby_vision(hdr_format):
+        return None
+    m = re.search(r"_p(\d+)$", str(hdr_format))
+    return int(m.group(1)) if m else 0
+
+
 def _detect_hdr(stream: dict[str, Any]) -> tuple[bool, str]:
+    """(is_hdr, hdr_format).  Dolby Vision is reported as ``dolby_vision_p<N>``."""
     transfer = (stream.get("color_transfer") or "").lower()
     side_data = stream.get("side_data_list") or []
     types = {str(sd.get("side_data_type", "")).lower() for sd in side_data}
-    if any("dolby vision" in t for t in types):
-        return True, "dolby_vision"
+    dv = _dolby_vision_profile(stream)
+    if dv is not None:
+        return True, f"{DOLBY_VISION}_p{dv}" if dv else DOLBY_VISION
     if transfer in ("smpte2084", "smpte st 2084"):
         if any("hdr dynamic metadata" in t for t in types):
             return True, "hdr10plus"

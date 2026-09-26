@@ -78,6 +78,14 @@ class AnalysisSettings(BaseModel):
         0, ge=0, description="0 = auto (derived from resolution); already-lean files are skipped"
     )
     analysis_workers: int = Field(2, ge=1, le=16)
+    dolby_vision: Literal["skip", "hdr10_fallback"] = Field(
+        "skip",
+        description=(
+            "skip = Dolby-Vision-Dateien nie konvertieren; hdr10_fallback = Profil 7/8 "
+            "als HDR10 kodieren (die DV-Ebene geht verloren). Profil 5 hat keine "
+            "HDR10-Basis und wird immer uebersprungen."
+        ),
+    )
     use_learning_model: bool = True
     trust_learning_after_samples: int = Field(15, ge=3, le=500)
 
@@ -155,9 +163,21 @@ class OutputSettings(BaseModel):
     original_action: Literal["delete", "trash", "keep"] = Field(
         "trash", description="trash moves the source into the recycle folder below"
     )
-    trash_dir: str = "/config/trash"
+    trash_dir: str = Field(
+        "",
+        description=(
+            "Leer = Ordner .optimizarr-trash im jeweiligen Bibliotheksordner (gleiches "
+            "Dateisystem, nur Umbenennen statt Kopieren)"
+        ),
+    )
     trash_retention_days: int = Field(14, ge=0, le=365, description="0 = keep forever")
-    preserve_mtime: bool = True
+    preserve_mtime: bool = Field(
+        False,
+        description=(
+            "Aenderungsdatum des Originals uebernehmen. Aus = Plex/Jellyfin erkennen die "
+            "neue Datei sicher und lesen die Stream-Infos neu ein"
+        ),
+    )
     set_permissions: bool = True
     file_mode: str = "0664"
     uid: int = Field(99, ge=0)
@@ -279,6 +299,27 @@ class NotificationSettings(BaseModel):
     notify_on_scan_done: bool = False
 
 
+# Secrets never leave the server in clear text: GET /api/settings replaces a set
+# value with SECRET_MASK, and a PUT carrying SECRET_MASK keeps the stored value.
+SECRET_MASK = "********"
+SECRET_FIELDS: tuple[tuple[str, str], ...] = (
+    ("advisor", "api_key"),
+    ("advisor", "openai_api_key"),
+    ("notifications", "webhook_url"),
+    ("security", "password"),
+)
+
+
+class SecuritySettings(BaseModel):
+    """Optional HTTP Basic auth for the web UI and the API (off by default)."""
+
+    auth_enabled: bool = Field(False, description="Benutzername und Passwort verlangen")
+    username: str = Field("admin", min_length=1, max_length=64)
+    password: str = Field(
+        "", description="Wird nur als Hash gespeichert (pbkdf2_sha256$...)"
+    )
+
+
 class UiSettings(BaseModel):
     theme: Literal["dark", "light", "system"] = "dark"
     language: Literal["de", "en"] = "de"
@@ -299,6 +340,7 @@ class AppSettings(BaseModel):
     hardware: HardwareSettings = Field(default_factory=HardwareSettings)
     advisor: AdvisorSettings = Field(default_factory=AdvisorSettings)
     notifications: NotificationSettings = Field(default_factory=NotificationSettings)
+    security: SecuritySettings = Field(default_factory=SecuritySettings)
     ui: UiSettings = Field(default_factory=UiSettings)
 
     @field_validator("library")
