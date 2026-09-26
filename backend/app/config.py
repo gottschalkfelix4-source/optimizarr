@@ -1,8 +1,18 @@
 """Application settings.
 
-Everything is configured through the web UI and stored in SQLite - there are no
-environment variables for behaviour.  The only env vars used at all are the two
-paths the container needs before a database exists (config dir, transcode dir).
+Behaviour is configured through the web UI and stored in SQLite, not through
+environment variables.  The environment only supplies what has to be known
+before a database exists, plus a few container and escape-hatch switches:
+
+* ``PUID``, ``PGID``, ``UMASK`` - user, group and umask the entrypoint drops to
+* ``TZ`` - time zone for the schedule and the logs
+* ``OPTIMIZARR_CONFIG_DIR`` (``/config``) - database and settings
+* ``OPTIMIZARR_TRANSCODE_DIR`` (``/transcode``) - scratch space for encodes
+* ``OPTIMIZARR_MEDIA_ROOT`` (``/media``) - where the folder picker starts
+* ``OPTIMIZARR_STATIC_DIR`` (``/app/static``) - the built web UI
+* ``OPTIMIZARR_FFMPEG`` / ``OPTIMIZARR_FFPROBE`` - override the ffmpeg binaries
+* ``OPTIMIZARR_RESET_AUTH=1`` - switch the login off at startup (forgotten password)
+* ``CODEX_*`` - overrides for the ChatGPT sign-in endpoints (development only)
 
 The Pydantic models below are the single source of truth: they define the
 defaults, the validation rules and, via ``model_json_schema()``, the contract the
@@ -11,14 +21,19 @@ frontend renders against.  Each top-level group is persisted as one row in the
 """
 from __future__ import annotations
 
+import copy
+import logging
 import os
 import threading
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, ValidationInfo, field_validator
 
+from . import security
 from .core.codecs import is_excluded, normalise, normalise_list as _normalise_codecs
+
+log = logging.getLogger(__name__)
 
 CONFIG_DIR = Path(os.environ.get("OPTIMIZARR_CONFIG_DIR", "/config"))
 TRANSCODE_DIR = Path(os.environ.get("OPTIMIZARR_TRANSCODE_DIR", "/transcode"))
@@ -129,8 +144,19 @@ class EncodingSettings(BaseModel):
     copy_chapters: bool = True
     copy_attachments: bool = True
     container: Literal["mkv", "mp4"] = "mkv"
-    extra_ffmpeg_args: str = Field("", description="Appended verbatim - power users only")
+    extra_ffmpeg_args: str = Field(
+        "",
+        description=(
+            "Appended to the output options - power users only. Only encoder and "
+            "muxer options are accepted (see security.check_extra_ffmpeg_args)"
+        ),
+    )
     max_encode_hours: int = Field(12, ge=1, le=72, description="Abort an encode that runs this long")
+
+    @field_validator("extra_ffmpeg_args")
+    @classmethod
+    def _check_extra_args(cls, v: str) -> str:
+        return security.check_extra_ffmpeg_args(v)
 
 
 class AudioSettings(BaseModel):
@@ -191,6 +217,21 @@ class OutputSettings(BaseModel):
     max_duration_drift_seconds: float = Field(2.0, ge=0.1, le=60.0)
     verify_vmaf: bool = Field(False, description="Measure VMAF on the finished file before accepting")
     min_accept_vmaf: float = Field(90.0, ge=50.0, le=100.0)
+
+    @field_validator("output_dir")
+    @classmethod
+    def _check_output_dir(cls, v: str) -> str:
+        return security.check_directory_setting(v, "Ausgabeordner")
+
+    @field_validator("trash_dir")
+    @classmethod
+    def _check_trash_dir(cls, v: str) -> str:
+        return security.check_directory_setting(v, "Papierkorb-Ordner")
+
+    @field_validator("file_mode")
+    @classmethod
+    def _check_file_mode(cls, v: str) -> str:
+        return security.check_file_mode(v)
 
 
 class QueueSettings(BaseModel):
@@ -316,13 +357,26 @@ class SecuritySettings(BaseModel):
     auth_enabled: bool = Field(False, description="Benutzername und Passwort verlangen")
     username: str = Field("admin", min_length=1, max_length=64)
     password: str = Field(
-        "", description="Wird nur als Hash gespeichert (pbkdf2_sha256$...)"
+        "",
+        description="Wird nur als Hash gespeichert (pbkdf2_sha256$...)",
+        validate_default=True,
     )
+
+    @field_validator("password")
+    @classmethod
+    def _hash_password(cls, v: str, info: ValidationInfo) -> str:
+        """Plain text never reaches the database; a stored hash is kept as is."""
+        if v and not security.is_password_hash(v):
+            v = security.hash_password(v)
+        if info.data.get("auth_enabled") and not v:
+            raise ValueError(
+                "Ohne Passwort kann die Anmeldung nicht aktiviert werden. "
+                "Bitte ein Passwort vergeben."
+            )
+        return v
 
 
 class UiSettings(BaseModel):
-    theme: Literal["dark", "light", "system"] = "dark"
-    language: Literal["de", "en"] = "de"
     size_unit: Literal["binary", "decimal"] = "binary"
     dashboard_refresh_seconds: int = Field(3, ge=1, le=60)
 
@@ -380,27 +434,34 @@ _lock = threading.RLock()
 _cache: AppSettings | None = None
 
 
+def _validate_group(name: str, model: type[BaseModel], value: dict[str, Any]) -> BaseModel:
+    """Validate one stored group, dropping only the fields that do not pass.
+
+    A single bad value (an old enum member, a value a newer version rejects)
+    must not reset the whole group to its defaults.
+    """
+    data = dict(value)
+    while True:
+        try:
+            return model.model_validate(data)
+        except ValidationError as exc:
+            bad = {e["loc"][0] for e in exc.errors() if e.get("loc")} & set(data)
+            if not bad:
+                log.warning("settings group %s is unusable, using defaults", name)
+                return model()
+            log.warning("ignoring invalid stored setting(s) %s.%s", name, ", ".join(sorted(map(str, bad))))
+            for key in bad:
+                data.pop(key, None)
+
+
 def _rows_to_settings(rows: dict[str, Any]) -> AppSettings:
     """Build AppSettings from stored rows, tolerating missing/renamed fields."""
     payload: dict[str, Any] = {}
-    for name in AppSettings.model_fields:
+    for name, field in AppSettings.model_fields.items():
         value = rows.get(name)
         if isinstance(value, dict):
-            payload[name] = value
-    try:
-        return AppSettings.model_validate(payload)
-    except Exception:
-        # A corrupt group must never take the app down - fall back per group.
-        safe: dict[str, Any] = {}
-        for name, field in AppSettings.model_fields.items():
-            value = rows.get(name)
-            if not isinstance(value, dict):
-                continue
-            try:
-                safe[name] = field.annotation.model_validate(value)  # type: ignore[union-attr]
-            except Exception:
-                continue
-        return AppSettings.model_validate(safe)
+            payload[name] = _validate_group(name, field.annotation, value)  # type: ignore[arg-type]
+    return AppSettings.model_validate(payload)
 
 
 def load_settings(force: bool = False) -> AppSettings:
@@ -442,17 +503,63 @@ def save_settings(settings: AppSettings) -> AppSettings:
         return _cache
 
 
-def update_settings(patch: dict[str, Any]) -> AppSettings:
-    """Merge a partial update (group -> fields) into the stored settings."""
-    current = load_settings().model_dump(mode="json")
-    for group, values in patch.items():
-        if group not in current:
-            continue
-        if isinstance(values, dict):
-            current[group].update(values)
+def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    """Only what the patch names changes; nested dicts merge instead of replacing."""
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
         else:
-            current[group] = values
-    return save_settings(AppSettings.model_validate(current))
+            base[key] = value
+    return base
+
+
+def _drop_masked_secrets(patch: dict[str, Any]) -> dict[str, Any]:
+    """A secret sent back as SECRET_MASK (or null) means "unchanged"."""
+    for group, field in SECRET_FIELDS:
+        values = patch.get(group)
+        if isinstance(values, dict) and field in values:
+            if values[field] is None or values[field] == SECRET_MASK:
+                values.pop(field)
+    return patch
+
+
+def update_settings(patch: dict[str, Any]) -> AppSettings:
+    """Merge a partial update (group -> fields) into the stored settings.
+
+    Read, merge and write happen under one lock, so two concurrent updates of
+    different fields cannot undo each other.  Unknown groups are ignored.
+    """
+    patch = copy.deepcopy(patch)
+    with _lock:
+        current = load_settings().model_dump(mode="json")
+        known = {k: v for k, v in _drop_masked_secrets(patch).items() if k in current}
+        for group, values in known.items():
+            if not isinstance(values, dict):
+                raise ValueError(f"{group}: erwartet ein Objekt mit Feldern")
+        _deep_merge(current, known)
+        return save_settings(AppSettings.model_validate(current))
+
+
+def public_settings(settings: AppSettings) -> dict[str, Any]:
+    """The settings as the API hands them out: secrets replaced by SECRET_MASK."""
+    data = settings.model_dump(mode="json")
+    for group, field in SECRET_FIELDS:
+        values = data.get(group)
+        if isinstance(values, dict) and field in values:
+            values[field] = SECRET_MASK if values[field] else ""
+    return data
+
+
+def describe_validation_error(exc: Exception) -> str:
+    """A readable German summary of a settings validation error."""
+    if not isinstance(exc, ValidationError):
+        return str(exc)
+    parts = []
+    for err in exc.errors():
+        loc = ".".join(str(p) for p in err.get("loc", ()))
+        msg = str(err.get("msg", "")).removeprefix("Value error, ")
+        parts.append(f"{loc}: {msg}" if loc else msg)
+    return "; ".join(parts)
 
 
 def apply_profile(settings: AppSettings, profile: str | None = None) -> AppSettings:

@@ -17,10 +17,11 @@ from .api import (
     routes_advisor, routes_jobs, routes_library, routes_movies, routes_series, routes_system,
 )
 from .config import CONFIG_DIR, TRANSCODE_DIR, load_settings, save_settings
-from .core import hwaccel, scanner, worker
+from .core import hwaccel, notify, scanner, worker
 from .core.events import bus
 from .db import engine, session_scope
 from .models import Base, HistoryEntry, Job, JobState, MediaFile, FileState, ScanRun, utcnow
+from .security import SecurityMiddleware, reset_auth_requested
 from .version import __version__
 
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
@@ -85,6 +86,18 @@ def _clean_transcode_dir() -> None:
         log.info("removed %d leftover temporary file(s) from %s", removed, TRANSCODE_DIR)
 
 
+# Background tasks started by the lifespan.  asyncio only keeps weak
+# references to tasks, so an unreferenced one can vanish mid-run.
+_background: set[asyncio.Task] = set()
+
+
+def _spawn(coro, name: str) -> asyncio.Task:
+    task = asyncio.create_task(coro, name=name)
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+    return task
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Optimizarr %s starting", __version__)
@@ -93,6 +106,10 @@ async def lifespan(app: FastAPI):
 
     Base.metadata.create_all(engine())
     settings = load_settings(force=True)
+    if reset_auth_requested() and settings.security.auth_enabled:
+        settings.security.auth_enabled = False
+        log.warning("OPTIMIZARR_RESET_AUTH is set: login switched off. "
+                    "Set a new password in the settings and remove the variable.")
     save_settings(settings)  # materialise defaults on first run
 
     bus.bind_loop(asyncio.get_running_loop())
@@ -115,26 +132,35 @@ async def lifespan(app: FastAPI):
                 bus.publish("hardware.detected", {"summary": report.summary})
             except Exception:
                 log.warning("hardware detection failed", exc_info=True)
-        asyncio.create_task(detect())
+        _spawn(detect(), "optimizarr-detect")
 
+    _spawn(notify.run(bus), "optimizarr-notify")
     worker.queue_worker.start()
     worker.scheduler.start()
 
     if settings.library.scan_on_start:
         async def initial_scan() -> None:
             await asyncio.sleep(5)  # let hardware detection settle first
-            with session_scope() as s:
-                from .models import LibraryPath
-                has_paths = s.query(LibraryPath).filter(LibraryPath.enabled.is_(True)).count()
+
+            def enabled_paths() -> int:
+                with session_scope() as s:
+                    from .models import LibraryPath
+                    return s.query(LibraryPath).filter(LibraryPath.enabled.is_(True)).count()
+
+            has_paths = await asyncio.to_thread(enabled_paths)
             if has_paths and not scanner.state.running:
                 await scanner.run_scan(trigger="startup")
-        asyncio.create_task(initial_scan())
+        _spawn(initial_scan(), "optimizarr-initial-scan")
 
     try:
         yield
     finally:
         log.info("shutting down")
         scanner.cancel_scan()
+        for task in list(_background):
+            task.cancel()
+        if _background:
+            await asyncio.gather(*_background, return_exceptions=True)
         await worker.queue_worker.stop()
         await worker.scheduler.stop()
 
@@ -147,6 +173,10 @@ app = FastAPI(
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
 )
+
+# Basic auth (optional), the CSRF header and the WebSocket origin check.  Added
+# before CORS so that CORS ends up outermost and answers preflights itself.
+app.add_middleware(SecurityMiddleware, get_security=lambda: load_settings().security)
 
 # The UI is served from the same origin; CORS only matters for `npm run dev`.
 app.add_middleware(
@@ -168,9 +198,10 @@ app.include_router(routes_advisor.router, prefix="/api", tags=["advisor"])
 @app.exception_handler(Exception)
 async def unhandled_error(request: Request, exc: Exception) -> JSONResponse:
     log.exception("unhandled error on %s %s", request.method, request.url.path)
+    # The exception text can carry paths and internals - it goes to the log only.
     return JSONResponse(
         status_code=500,
-        content={"detail": f"Interner Fehler: {type(exc).__name__}: {exc}"},
+        content={"detail": "Interner Fehler. Details stehen im Protokoll des Containers."},
     )
 
 

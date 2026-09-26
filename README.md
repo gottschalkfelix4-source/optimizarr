@@ -144,8 +144,32 @@ Fällt eine Prüfung durch, wird das Ergebnis gelöscht, das Original bleibt **b
 erhalten, und die Datei wird mit einer nachvollziehbaren Begründung als „übersprungen"
 markiert – damit derselbe Versuch nicht beim nächsten Scan wieder Rechenzeit kostet.
 
-Originale wandern standardmäßig in einen Papierkorb-Ordner statt gelöscht zu werden. Das
-Änderungsdatum bleibt erhalten, damit Plex und Jellyfin die Datei nicht als neu behandeln.
+Originale wandern standardmäßig in einen Papierkorb statt gelöscht zu werden. Ist unter
+**Einstellungen → Ausgabe** kein eigener Papierkorb-Ordner eingetragen, landet das Original
+im Ordner `.optimizarr-trash` direkt im jeweiligen Bibliotheksordner. Der liegt auf
+demselben Dateisystem wie die Datei, das Verschieben ist also nur ein Umbenennen statt
+einer Kopie über Laufwerksgrenzen. Der Scanner überspringt diesen Ordner. Nach Ablauf der
+Aufbewahrungszeit (Standard 14 Tage) wird er geleert.
+
+Die neue Datei bekommt standardmäßig **ein neues Änderungsdatum** (`preserve_mtime` ist
+aus). So erkennen Plex und Jellyfin sicher, dass sich die Datei geändert hat, und lesen die
+Stream-Infos (Codec, Bitrate) neu ein. Wer das alte Datum behalten will, schaltet
+*Änderungsdatum übernehmen* ein – dann muss die Mediathek unter Umständen von Hand neu
+eingelesen werden.
+
+### Dolby Vision
+
+Dolby Vision wird erkannt und gesondert behandelt, weil ein AV1-Encode die
+Dolby-Vision-Ebene nicht mitnehmen kann:
+
+| Quelle | Standard (`Überspringen`) | Einstellung `Als HDR10 kodieren` |
+|---|---|---|
+| DV Profil 5 (keine HDR10-Basis) | übersprungen | übersprungen – auch beim Erzwingen |
+| DV Profil 7/8 (HDR10-Basis) | übersprungen | als HDR10 kodiert, die DV-Ebene entfällt |
+
+Profil 5 hat kein normales HDR-Bild, das man behalten könnte – ohne die DV-Verarbeitung
+wären die Farben falsch. Deshalb wird es nie konvertiert, auch nicht über *Erzwingen*.
+Profil 7/8 lässt sich per *Erzwingen* auch einzeln als HDR10 kodieren.
 
 ---
 
@@ -170,6 +194,13 @@ Befehl im Job-Protokoll, damit nachvollziehbar bleibt, warum.
 Encoden und Dekodieren auf der GPU werden **getrennt** geprüft. Kann die GPU zwar
 encodieren, aber ihre eigenen Frames nicht zuverlässig entgegennehmen, verliert nur das
 Dekodieren die Beschleunigung — die teure Hälfte bleibt auf der GPU.
+
+**Qualität auf der GPU:** Die Encoder kennen keinen CRF-Wert wie SVT-AV1. Optimizarr
+rechnet den eingestellten bzw. pro Datei ermittelten CRF deshalb auf die Qualitätsskala des
+jeweiligen Encoders um. Beim VAAPI-Encoder (`av1_vaapi`) läuft das über den
+Konstant-Quantisierer-Modus (`-rc_mode CQP` mit `-global_quality`), sodass ein höherer CRF
+auch dort eine kleinere Datei ergibt. Die Werte sind nicht eins zu eins mit SVT-AV1
+vergleichbar – das Lernmodell gleicht die Unterschiede mit jedem fertigen Job weiter aus.
 
 ### Wenn trotzdem auf die CPU zurückgefallen wird
 
@@ -196,7 +227,7 @@ Detail vom Prüflauf.
 
 | Pfad | Empfehlung |
 |---|---|
-| `/config` | `/mnt/user/appdata/optimizarr` – Datenbank, Einstellungen, Papierkorb |
+| `/config` | `/mnt/user/appdata/optimizarr` – Datenbank und Einstellungen |
 | `/transcode` | Auf **SSD oder Cache-Pool**. Hier entsteht die komplette Ausgabedatei, bevor sie umzieht. Mindestens 50 GB freihalten. |
 | `/media` | Deine Bibliothek, mit **Schreibrechten** |
 | `/dev/dri` | Als *Device* eintragen – ohne das läuft alles auf der CPU |
@@ -235,10 +266,25 @@ umstellst.
 
 ## Einstellungen
 
-Alles wird in der Oberfläche eingestellt – es gibt **keine Konfigurationsdateien und keine
-Umgebungsvariablen** für das Verhalten. Die einzigen Umgebungsvariablen sind `PUID`,
-`PGID`, `UMASK` und `TZ`, weil die schon feststehen müssen, bevor die Anwendung überhaupt
-startet.
+Alles wird in der Oberfläche eingestellt – es gibt **keine Konfigurationsdateien**, und das
+Verhalten hängt nicht von Umgebungsvariablen ab. Die Umgebungsvariablen legen nur fest, was
+schon vor dem ersten Start feststehen muss, dazu ein Notausgang:
+
+| Variable | Standard | Wofür |
+|---|---|---|
+| `PUID` / `PGID` | `99` / `100` | Benutzer und Gruppe, unter denen Optimizarr läuft (`0` = root) |
+| `UMASK` | `002` | Rechte neu angelegter Dateien und Ordner |
+| `TZ` | `Europe/Berlin` | Zeitzone für Zeitfenster und Protokoll |
+| `OPTIMIZARR_CONFIG_DIR` | `/config` | Datenbank und Einstellungen |
+| `OPTIMIZARR_TRANSCODE_DIR` | `/transcode` | Arbeitsordner für laufende Encodes |
+| `OPTIMIZARR_MEDIA_ROOT` | `/media` | Startordner der Ordnerauswahl |
+| `OPTIMIZARR_STATIC_DIR` | `/app/static` | Die gebaute Weboberfläche |
+| `OPTIMIZARR_FFMPEG` / `OPTIMIZARR_FFPROBE` | – | Eigene ffmpeg-/ffprobe-Binärdatei statt der mitgelieferten |
+| `OPTIMIZARR_RESET_AUTH` | – | `1` schaltet die Anmeldung beim Start ab (siehe [Sicherheit](#sicherheit)) |
+| `CODEX_*` | – | Überschreibt Endpunkte der ChatGPT-Anmeldung, nur für die Entwicklung |
+
+Die `OPTIMIZARR_*_DIR`-Pfade sind im Image passend gesetzt und müssen normalerweise nicht
+angefasst werden.
 
 Die drei Qualitätsprofile setzen CRF, Preset und Qualitätsziel gemeinsam:
 
@@ -251,6 +297,81 @@ Die drei Qualitätsprofile setzen CRF, Preset und Qualitätsziel gemeinsam:
 Alles Weitere lässt sich einzeln nachjustieren: Tonspur-Behandlung (verlustfreie Spuren
 nach Opus, das spart bei Blu-ray-Rips oft mehr als das Video selbst), Untertitel-Sprachen,
 Zeitplan, Dateirechte, Schwellenwerte.
+
+Einige Felder werden beim Speichern geprüft, weil sie auf der Kommandozeile oder im
+Dateisystem landen:
+
+* **Zusätzliche ffmpeg-Argumente** nehmen nur Encoder- und Muxer-Optionen mit je einem
+  Wert an, z. B. `-svtav1-params tune=0`, `-g 240`, `-maxrate:v 8M`, `-metadata title=…`.
+  Abgelehnt werden alles, was keine Option ist (ffmpeg würde es als zusätzliche
+  Ausgabedatei schreiben), Pfade und URLs in Werten sowie `-y`, `-f`, `-i`, Filter
+  (`-vf`, `-filter_complex` …), `-map`, `-c`, `-attach` und Optionen, die die Ausgabe
+  kürzen. Die vollständige Liste steht in `backend/app/security.py`.
+* **Dateirechte** oktal zwischen `0600` und `0777`, ohne setuid/setgid/Sticky-Bit.
+* **Ausgabe- und Papierkorb-Ordner** müssen absolute Pfade sein und dürfen nicht `/` oder
+  ein Systemordner (`/etc`, `/usr`, `/proc` …) sein.
+
+---
+
+## Benachrichtigungen
+
+Unter **Einstellungen → Benachrichtigungen** lässt sich eine Webhook-URL eintragen.
+Optimizarr schickt dorthin bei den gewählten Ereignissen – Job fertig, Job
+fehlgeschlagen oder verworfen, Scan abgeschlossen – einen `POST` mit JSON:
+
+```json
+{
+  "event": "job.finished",
+  "title": "Konvertierung abgeschlossen: Film.mkv",
+  "message": "…",
+  "data": {"job_id": 12, "state": "done", "saved_bytes": 5368709120, "name": "Film.mkv"},
+  "content": "Konvertierung abgeschlossen: Film.mkv: …",
+  "text": "Konvertierung abgeschlossen: Film.mkv: …"
+}
+```
+
+`content` und `text` enthalten dieselbe Zusammenfassung als eine Zeile, damit ein
+Discord- (`content`) oder Slack-/Mattermost-Webhook (`text`) ohne Zwischenstück etwas
+Lesbares anzeigt. Die Zustellung wartet höchstens 10 Sekunden; schlägt sie fehl, steht das
+im Protokoll, am Job ändert sich nichts. **Test senden** in den Einstellungen schickt eine
+Probenachricht. Die Webhook-URL enthält meist ein Token und wird deshalb wie ein Passwort
+behandelt: Die Oberfläche zeigt sie nach dem Speichern nur noch als `********`.
+
+---
+
+## Sicherheit
+
+**Anmeldung (optional).** Unter **Einstellungen → Sicherheit** lässt sich eine Anmeldung
+mit Benutzername und Passwort einschalten (HTTP Basic Auth – der Browser fragt einmal
+nach). Sie gilt für die Oberfläche, die API und die Live-Verbindung; frei bleibt nur
+`/api/health` für den Docker-Healthcheck. Ohne Anmeldung kann jeder im Netzwerk, der den
+Port erreicht, Optimizarr bedienen – und damit Dateien ersetzen lassen. Das Passwort wird
+nur als PBKDF2-SHA256-Hash gespeichert. Basic Auth überträgt das Passwort bei jeder
+Anfrage; wer Optimizarr außerhalb des Heimnetzes erreichbar macht, sollte einen
+Reverse-Proxy mit HTTPS davorschalten.
+
+**Passwort vergessen?** Den Container einmal mit der Umgebungsvariable
+`OPTIMIZARR_RESET_AUTH=1` starten. Die Anmeldung ist dann abgeschaltet (das Protokoll
+meldet es), in den Einstellungen lässt sich ein neues Passwort setzen. Danach die Variable
+wieder entfernen – solange sie gesetzt ist, wird die Anmeldung bei jedem Start erneut
+abgeschaltet.
+
+**Eigene Skripte.** Jede schreibende API-Anfrage (`POST`, `PUT`, `PATCH`, `DELETE`) muss
+den Header `X-Optimizarr: 1` mitschicken, sonst antwortet der Server mit 403. Das
+verhindert, dass eine fremde Webseite im Browser unbemerkt Aktionen auslöst. Die
+Oberfläche sendet ihn automatisch; in eigenen Skripten:
+
+```bash
+curl -u admin:PASSWORT -H 'X-Optimizarr: 1' -X POST http://tower:8474/api/scan
+```
+
+Lesende Anfragen brauchen den Header nicht. Die Live-Verbindung (`/api/ws`) nimmt nur
+Verbindungen von der eigenen Seite an.
+
+**Schlüssel.** API-Schlüssel, die Webhook-URL und das Passwort verlassen den Server nie
+im Klartext: Die Einstellungen liefern für gesetzte Werte `********`. Wird `********`
+unverändert zurückgeschickt, bleibt der gespeicherte Wert erhalten; ein leeres Feld
+löscht ihn.
 
 ---
 
@@ -277,7 +398,9 @@ das den Intel-QSV-Stack fertig verdrahtet mitbringt.
 
 ```
 backend/app/
+  security.py      Anmeldung, CSRF-Header, Pruefung riskanter Einstellungen
   core/
+    notify.py      Webhook-Benachrichtigungen
     ffmpeg.py      ffprobe/ffmpeg-Wrapper mit Fortschritts-Parsing
     hwaccel.py     Intel-GPU-Erkennung per echter Testkodierung
     predictor.py   Heuristik + gelerntes Korrekturmodell

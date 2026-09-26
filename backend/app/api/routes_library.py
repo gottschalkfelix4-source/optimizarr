@@ -12,12 +12,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
+from .. import security
 from ..config import DEFAULT_MEDIA_ROOT, TRANSCODE_DIR, load_settings
-from ..core import analyzer, codecs, ffmpeg, hwaccel, planner, scanner
+from ..core import analyzer, codecs, ffmpeg, hwaccel, planner, scanner, worker
 from ..core.advisor import get_advisor
 from ..core.events import bus
 from ..db import get_session, session_scope
-from ..models import FileState, Job, LibraryPath, MediaFile, ScanRun
+from ..models import FileState, Job, JobState, LibraryPath, MediaFile, ScanRun, utcnow
 from . import serializers
 
 log = logging.getLogger(__name__)
@@ -29,10 +30,22 @@ router = APIRouter()
 # --------------------------------------------------------------------------- #
 
 class LibraryPathIn(BaseModel):
-    path: str
-    name: str = ""
+    path: str = Field(min_length=1, max_length=1024)
+    name: str = Field("", max_length=255)
     enabled: bool = True
-    profile: str | None = None
+
+
+class LibraryPathPatch(BaseModel):
+    """What can change on an existing library.  The path itself cannot - that
+    would silently orphan every file row below the old one.
+
+    ``LibraryPath.profile`` is no longer offered: nothing ever read it, and a
+    per-library profile would need the planner to take it into account.  The
+    column stays in SQLite so existing databases need no migration.
+    """
+
+    name: str | None = Field(None, max_length=255)
+    enabled: bool | None = None
 
 
 @router.get("/library/paths")
@@ -60,7 +73,16 @@ def list_paths(session: Session = Depends(get_session)) -> list[dict[str, Any]]:
 
 @router.post("/library/paths")
 def add_path(payload: LibraryPathIn, session: Session = Depends(get_session)) -> dict[str, Any]:
-    path = payload.path.rstrip("/") or "/"
+    raw = payload.path.strip()
+    if not raw.startswith("/"):
+        raise HTTPException(status_code=422, detail="Bitte einen absoluten Pfad angeben (beginnend mit /).")
+    path = os.path.normpath(raw)
+    if security.is_system_path(path) or security.is_system_path(os.path.realpath(path)):
+        raise HTTPException(
+            status_code=422,
+            detail=f"'{path}' ist das Wurzelverzeichnis oder ein Systemordner und kann "
+                   "keine Bibliothek sein. Bitte den Medienordner waehlen, z. B. /media/Filme.",
+        )
     if not os.path.isdir(path):
         raise HTTPException(
             status_code=400,
@@ -72,10 +94,7 @@ def add_path(payload: LibraryPathIn, session: Session = Depends(get_session)) ->
     ).scalars().first()
     if existing:
         raise HTTPException(status_code=409, detail="Dieser Pfad ist bereits eingetragen.")
-    row = LibraryPath(
-        path=path, name=payload.name or Path(path).name, enabled=payload.enabled,
-        profile=payload.profile,
-    )
+    row = LibraryPath(path=path, name=payload.name or Path(path).name, enabled=payload.enabled)
     session.add(row)
     session.commit()
     bus.publish("library.changed", {"action": "added", "path": path})
@@ -84,14 +103,15 @@ def add_path(payload: LibraryPathIn, session: Session = Depends(get_session)) ->
 
 @router.patch("/library/paths/{path_id}")
 def update_path(
-    path_id: int, payload: dict[str, Any], session: Session = Depends(get_session)
+    path_id: int, payload: LibraryPathPatch, session: Session = Depends(get_session)
 ) -> dict[str, Any]:
     row = session.get(LibraryPath, path_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Pfad nicht gefunden")
-    for field in ("name", "enabled", "profile"):
-        if field in payload:
-            setattr(row, field, payload[field])
+    if payload.name is not None:
+        row.name = payload.name.strip()
+    if payload.enabled is not None:
+        row.enabled = payload.enabled
     session.commit()
     bus.publish("library.changed", {"action": "updated", "path": row.path})
     return serializers.library_path(row)
@@ -101,16 +121,46 @@ def update_path(
 def delete_path(
     path_id: int, keep_files: bool = False, session: Session = Depends(get_session)
 ) -> dict[str, Any]:
+    """Remove a library.  Its jobs go first: a running encode is cancelled and
+    queued ones are dropped, so nothing keeps working on a library that is gone."""
     row = session.get(LibraryPath, path_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Pfad nicht gefunden")
     path = row.path
-    if not keep_files:
-        session.query(MediaFile).filter(MediaFile.library_id == path_id).delete()
+    file_ids = select(MediaFile.id).where(MediaFile.library_id == path_id)
+    jobs = session.execute(
+        select(Job).where(
+            Job.file_id.in_(file_ids),
+            Job.state.in_([JobState.QUEUED.value, JobState.RUNNING.value]),
+        )
+    ).scalars().all()
+    cancelled = removed = 0
+    for job in jobs:
+        media = session.get(MediaFile, job.file_id)
+        restore = (job.plan or {}).get(planner.RESTORE_STATE) or FileState.CANDIDATE.value
+        if job.state == JobState.RUNNING.value:
+            if not worker.queue_worker.cancel_job(job.id):
+                # Running in the DB only: a restart lost the process.
+                job.state = JobState.CANCELLED.value
+                job.finished_at = utcnow()
+            cancelled += 1
+        else:
+            session.delete(job)
+            removed += 1
+        if media is not None and media.state in (FileState.QUEUED.value, FileState.ENCODING.value):
+            media.state = restore
+    session.flush()
+    files = session.query(MediaFile).filter(MediaFile.library_id == path_id)
+    if keep_files:
+        files.update({MediaFile.library_id: None}, synchronize_session=False)
+    else:
+        files.delete(synchronize_session=False)
     session.delete(row)
     session.commit()
+    if jobs:
+        bus.publish("queue.changed", {})
     bus.publish("library.changed", {"action": "removed", "path": path})
-    return {"ok": True}
+    return {"ok": True, "jobs_cancelled": cancelled, "jobs_removed": removed}
 
 
 @router.get("/library/browse")
@@ -120,7 +170,10 @@ def browse(path: str = Query(default="")) -> dict[str, Any]:
     if not target.is_absolute():
         target = Path("/") / target
     if not target.is_dir():
-        target = Path("/")
+        # Falling back to "/" made a typo look like a valid choice.
+        raise HTTPException(
+            status_code=404, detail=f"Der Ordner '{target}' existiert im Container nicht."
+        )
     entries: list[dict[str, Any]] = []
     try:
         for entry in sorted(target.iterdir(), key=lambda p: p.name.lower()):
@@ -232,8 +285,11 @@ def list_files(
     if codec:
         conditions.append(MediaFile.video_codec.in_(codecs.spellings(codec)))
     if search:
-        like = f"%{search.lower()}%"
-        conditions.append(func.lower(MediaFile.path).like(like))
+        # % and _ are wildcards in LIKE - a search for "S01_E01" means the text.
+        escaped = (
+            search.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        conditions.append(func.lower(MediaFile.path).like(f"%{escaped}%", escape="\\"))
     for cond in conditions:
         query = query.where(cond)
         count_query = count_query.where(cond)
@@ -299,6 +355,59 @@ class FileAction(BaseModel):
     file_ids: list[int] = Field(default_factory=list)
 
 
+# States a file may be ignored in, or un-ignored from.  Queued, encoding or
+# analysing files belong to a running process, and a converted file has nothing
+# left to ignore.
+IGNORABLE_STATES = frozenset({
+    FileState.NEW.value, FileState.PROBED.value, FileState.CANDIDATE.value,
+    FileState.SKIPPED.value, FileState.FAILED.value, FileState.IGNORED.value,
+    FileState.MISSING.value,
+})
+_BUSY_MESSAGE = (
+    "Die Datei wird gerade verarbeitet oder ist bereits konvertiert und kann nicht "
+    "ignoriert werden. Bitte erst den Job abbrechen."
+)
+
+
+def _unignored_state(row: MediaFile) -> str:
+    """Where a file goes back to: a converted file stays done, the rest is
+    re-analysed from wherever its metadata allows."""
+    if codecs.normalise(row.video_codec) == "av1" and row.converted_at is not None:
+        return FileState.DONE.value
+    return FileState.PROBED.value if row.video_codec else FileState.NEW.value
+
+
+def _set_ignored(row: MediaFile, ignored: bool) -> None:
+    row.ignored = ignored
+    if ignored:
+        row.state = FileState.IGNORED.value
+    elif row.state == FileState.IGNORED.value:
+        row.state = _unignored_state(row)
+
+
+@router.post("/files/bulk/ignore")
+def bulk_ignore(
+    payload: FileAction, ignored: bool = True, session: Session = Depends(get_session)
+) -> dict[str, Any]:
+    """All or nothing: if one of the files is busy, none is changed.
+
+    Declared before ``/files/{file_id}/ignore``, which would otherwise take
+    "bulk" for a file id and answer 422.
+    """
+    rows = [r for r in (session.get(MediaFile, i) for i in payload.file_ids) if r is not None]
+    busy = [r for r in rows if r.state not in IGNORABLE_STATES]
+    if busy:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{len(busy)} der ausgewaehlten Dateien werden gerade verarbeitet oder "
+                   "sind bereits konvertiert. Es wurde nichts geaendert.",
+        )
+    for row in rows:
+        _set_ignored(row, ignored)
+    session.commit()
+    return {"updated": len(rows)}
+
+
 @router.post("/files/{file_id}/ignore")
 def ignore_file(
     file_id: int, ignored: bool = True, session: Session = Depends(get_session)
@@ -306,24 +415,33 @@ def ignore_file(
     row = session.get(MediaFile, file_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Datei nicht gefunden")
-    row.ignored = ignored
-    if ignored:
-        row.state = FileState.IGNORED.value
-    elif row.state == FileState.IGNORED.value:
-        row.state = FileState.PROBED.value if row.video_codec else FileState.NEW.value
+    if row.state not in IGNORABLE_STATES:
+        raise HTTPException(status_code=409, detail=_BUSY_MESSAGE)
+    _set_ignored(row, ignored)
     session.commit()
     return serializers.media_file(row)
+
+
+def _file_row(file_id: int) -> tuple[str, Any]:
+    """(path, stored plan) - run in a thread from the async routes."""
+    with session_scope() as s:
+        row = s.get(MediaFile, file_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Datei nicht gefunden")
+        return row.path, row.plan
+
+
+def _serialized_file(file_id: int) -> dict[str, Any]:
+    with session_scope() as s:
+        row = s.get(MediaFile, file_id)
+        return serializers.media_file(row, full=True) if row else {}
 
 
 @router.post("/files/{file_id}/analyze")
 async def analyze_file(file_id: int, depth: str | None = None) -> dict[str, Any]:
     """Re-run the analysis for one file, on demand, at any depth."""
     settings = load_settings()
-    with session_scope() as s:
-        row = s.get(MediaFile, file_id)
-        if row is None:
-            raise HTTPException(status_code=404, detail="Datei nicht gefunden")
-        path = row.path
+    path, _ = await asyncio.to_thread(_file_row, file_id)
     if not os.path.exists(path):
         raise HTTPException(status_code=410, detail="Datei existiert nicht mehr auf der Platte.")
 
@@ -342,28 +460,9 @@ async def analyze_file(file_id: int, depth: str | None = None) -> dict[str, Any]
     await asyncio.to_thread(scanner._store_probe, file_id, info)
     await asyncio.to_thread(scanner._store_analysis, file_id, result)
     bus.publish("file.analyzed", {"file_id": file_id, "decision": result.decision})
-    with session_scope() as s:
-        row = s.get(MediaFile, file_id)
-        payload = serializers.media_file(row, full=True) if row else {}
+    payload = await asyncio.to_thread(_serialized_file, file_id)
     payload["analysis"] = result.to_dict()
     return payload
-
-
-@router.post("/files/bulk/ignore")
-def bulk_ignore(
-    payload: FileAction, ignored: bool = True, session: Session = Depends(get_session)
-) -> dict[str, Any]:
-    count = 0
-    for file_id in payload.file_ids:
-        row = session.get(MediaFile, file_id)
-        if row is None:
-            continue
-        row.ignored = ignored
-        if ignored:
-            row.state = FileState.IGNORED.value
-        count += 1
-    session.commit()
-    return {"updated": count}
 
 
 # --------------------------------------------------------------------------- #
@@ -375,25 +474,35 @@ class ScanRequest(BaseModel):
     file_ids: list[int] | None = None
 
 
+# Scans started from the API.  asyncio keeps only weak references to tasks.
+_scan_tasks: set[asyncio.Task] = set()
+
+
+def _enabled_library_count() -> int:
+    with session_scope() as s:
+        return s.execute(
+            select(func.count(LibraryPath.id)).where(LibraryPath.enabled.is_(True))
+        ).scalar() or 0
+
+
 @router.post("/scan")
 async def start_scan(payload: ScanRequest | None = None) -> dict[str, Any]:
     if scanner.state.running:
         raise HTTPException(status_code=409, detail="Es laeuft bereits ein Scan.")
-    with session_scope() as s:
-        count = s.execute(
-            select(func.count(LibraryPath.id)).where(LibraryPath.enabled.is_(True))
-        ).scalar()
+    count = await asyncio.to_thread(_enabled_library_count)
     if not count and not (payload and payload.file_ids):
         raise HTTPException(
             status_code=400,
             detail="Keine Bibliothekspfade konfiguriert. Bitte zuerst unter "
                    "Einstellungen -> Bibliothek einen Ordner hinzufuegen.",
         )
-    asyncio.create_task(scanner.run_scan(
+    task = asyncio.create_task(scanner.run_scan(
         trigger="manual",
         depth=payload.depth if payload else None,
         analyze_only_ids=payload.file_ids if payload else None,
     ))
+    _scan_tasks.add(task)
+    task.add_done_callback(_scan_tasks.discard)
     await asyncio.sleep(0.1)
     return {"ok": True, "status": scanner.state.snapshot()}
 
@@ -445,11 +554,7 @@ async def dry_run(file_id: int, payload: DryRunRequest | None = None) -> dict[st
     payload = payload or DryRunRequest()
     settings = load_settings()
 
-    with session_scope() as s:
-        row = s.get(MediaFile, file_id)
-        if row is None:
-            raise HTTPException(status_code=404, detail="Datei nicht gefunden")
-        path, stored_plan = row.path, row.plan
+    path, stored_plan = await asyncio.to_thread(_file_row, file_id)
     if not os.path.exists(path):
         raise HTTPException(status_code=410, detail="Datei existiert nicht mehr auf der Platte.")
 

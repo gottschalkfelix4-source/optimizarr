@@ -1,28 +1,17 @@
 """Smoke tests: the API answers, the predictor behaves, the planner builds sane args."""
-import os
-import sys
-import tempfile
 from pathlib import Path
 
 import pytest
 
-TMP = Path(tempfile.gettempdir()) / "optimizarr-pytest"
-os.environ.setdefault("OPTIMIZARR_CONFIG_DIR", str(TMP / "config"))
-os.environ.setdefault("OPTIMIZARR_TRANSCODE_DIR", str(TMP / "transcode"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from fastapi.testclient import TestClient  # noqa: E402
-
-from app.config import AppSettings  # noqa: E402
-from app.core import planner, predictor  # noqa: E402
-from app.core.ffmpeg import MediaInfo  # noqa: E402
-from app.main import app  # noqa: E402
+from app.config import AppSettings
+from app.core import planner, predictor
+from app.core.ffmpeg import MediaInfo
 
 
 @pytest.fixture(scope="module")
-def client():
-    with TestClient(app) as c:
-        yield c
+def client(hermetic_client):
+    """The real app, its own in-memory database, no hardware probe, no scan."""
+    return hermetic_client
 
 
 def make_info(**kw):

@@ -65,12 +65,26 @@ def enqueue(payload: EnqueueRequest, session: Session = Depends(get_session)) ->
     }
 
 
+FINISHED_JOB_STATES = (
+    JobState.DONE.value, JobState.FAILED.value, JobState.REJECTED.value, JobState.CANCELLED.value,
+)
+JOB_STATE_FILTERS = frozenset({"all", "active", "finished", *(s.value for s in JobState)})
+
+
 @router.get("/jobs")
 def list_jobs(
     session: Session = Depends(get_session),
     state: str | None = None,
-    limit: int = Query(100, ge=1, le=500),
+    limit: int = Query(100, ge=1, le=1000),
 ) -> dict[str, Any]:
+    """Jobs in queue order.  ``state`` is ``active`` (queued + running),
+    ``finished``, ``all`` or a single job state; ``counts`` always covers
+    every job, whatever the filter and limit."""
+    if state and state not in JOB_STATE_FILTERS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unbekannter Filter '{state}'. Erlaubt: {', '.join(sorted(JOB_STATE_FILTERS))}.",
+        )
     query = (
         select(Job)
         .options(selectinload(Job.file))
@@ -86,17 +100,15 @@ def list_jobs(
         if state == "active":
             query = query.where(Job.state.in_([JobState.QUEUED.value, JobState.RUNNING.value]))
         elif state == "finished":
-            query = query.where(Job.state.in_([
-                JobState.DONE.value, JobState.FAILED.value,
-                JobState.REJECTED.value, JobState.CANCELLED.value,
-            ]))
+            query = query.where(Job.state.in_(FINISHED_JOB_STATES))
         else:
             query = query.where(Job.state == state)
     rows = session.execute(query).scalars().all()
 
-    counts = dict(session.execute(
+    counts = {s.value: 0 for s in JobState}
+    counts.update(dict(session.execute(
         select(Job.state, func.count(Job.id)).group_by(Job.state)
-    ).all())
+    ).all()))
     return {
         "items": [serializers.job(r) for r in rows],
         "counts": counts,
@@ -151,10 +163,9 @@ def cancel_job(job_id: int, session: Session = Depends(get_session)) -> dict[str
 
 @router.delete("/jobs/finished")
 def clear_finished(session: Session = Depends(get_session)) -> dict[str, Any]:
-    removed = session.query(Job).filter(Job.state.in_([
-        JobState.DONE.value, JobState.FAILED.value,
-        JobState.REJECTED.value, JobState.CANCELLED.value,
-    ])).delete(synchronize_session=False)
+    removed = session.query(Job).filter(Job.state.in_(FINISHED_JOB_STATES)).delete(
+        synchronize_session=False
+    )
     session.commit()
     return {"removed": removed}
 
@@ -236,9 +247,11 @@ def stats(session: Session = Depends(get_session)) -> dict[str, Any]:
     ).all()
 
     resolutions = session.execute(
-        select(MediaFile.height, func.count(MediaFile.id), func.sum(MediaFile.size))
-        .where(MediaFile.height > 0)
-        .group_by(MediaFile.height)
+        select(
+            MediaFile.width, MediaFile.height, func.count(MediaFile.id), func.sum(MediaFile.size)
+        )
+        .where((MediaFile.height > 0) | (MediaFile.width > 0))
+        .group_by(MediaFile.width, MediaFile.height)
     ).all()
 
     # Saved bytes per day for the sparkline.
@@ -290,20 +303,32 @@ def stats(session: Session = Depends(get_session)) -> dict[str, Any]:
     }
 
 
+RESOLUTION_CLASSES = ("SD", "720p", "1080p", "1440p", "2160p")
+
+
+def resolution_class(width: int | None, height: int | None) -> str:
+    """By width first, height as fallback - a 1920x800 scope film is 1080p,
+    not 720p.  Must match ``resolutionClass`` in the frontend's format.ts."""
+    w, h = width or 0, height or 0
+    if w >= 3200 or h >= 1800:
+        return "2160p"
+    if w >= 2200 or h >= 1260:
+        return "1440p"
+    if w >= 1700 or h >= 900:
+        return "1080p"
+    if w >= 1100 or h >= 620:
+        return "720p"
+    return "SD"
+
+
 def _bucket_resolutions(rows: list[Any]) -> list[dict[str, Any]]:
-    buckets = [
-        (0, 576, "SD"), (577, 800, "720p"), (801, 1200, "1080p"),
-        (1201, 1600, "1440p"), (1601, 2400, "4K"), (2401, 10000, "8K+"),
-    ]
     out: dict[str, dict[str, Any]] = {
-        label: {"label": label, "count": 0, "size": 0} for _, _, label in buckets
+        label: {"label": label, "count": 0, "size": 0} for label in RESOLUTION_CLASSES
     }
-    for height, count, size in rows:
-        for low, high, label in buckets:
-            if low <= (height or 0) <= high:
-                out[label]["count"] += count
-                out[label]["size"] += size or 0
-                break
+    for width, height, count, size in rows:
+        label = resolution_class(width, height)
+        out[label]["count"] += count
+        out[label]["size"] += size or 0
     return [v for v in out.values() if v["count"]]
 
 

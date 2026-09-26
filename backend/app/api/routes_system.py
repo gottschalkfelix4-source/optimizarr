@@ -13,8 +13,11 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from .. import config as cfg
-from ..config import AppSettings, PROFILE_PRESETS, apply_profile, load_settings, save_settings, update_settings
-from ..core import ffmpeg, hwaccel, predictor, scanner, worker
+from ..config import (
+    SECRET_FIELDS, SECRET_MASK, AppSettings, PROFILE_PRESETS, apply_profile,
+    describe_validation_error, load_settings, public_settings, save_settings, update_settings,
+)
+from ..core import ffmpeg, hwaccel, notify, predictor, scanner, worker
 from ..core.advisor import get_advisor, sdk_available
 from ..core.events import bus
 from ..version import __version__
@@ -43,7 +46,8 @@ async def system_info() -> dict[str, Any]:
         },
         "hardware": hw.to_dict() if hw else None,
         "learning_model": model.stats(),
-        "advisor": _advisor_info(settings),
+        # Readiness may look up stored sign-in tokens - keep the DB off the loop.
+        "advisor": await asyncio.to_thread(_advisor_info, settings),
         "scan": scanner.state.snapshot(),
         "queue": worker.queue_worker.status(),
         "next_scan": worker.scheduler.next_scan.isoformat() if worker.scheduler.next_scan else None,
@@ -115,40 +119,52 @@ async def refit_model() -> dict[str, Any]:
 
 @router.get("/settings")
 def get_settings() -> dict[str, Any]:
-    return load_settings(force=True).model_dump(mode="json")
+    return public_settings(load_settings(force=True))
 
 
 @router.get("/settings/schema")
 def settings_schema() -> dict[str, Any]:
-    """Field metadata so the UI can render help texts and ranges from one source."""
+    """Field metadata so the UI can render help texts and ranges from one source.
+
+    Built from the classes, never from the stored values, so no secret can end
+    up in here; ``secret_fields`` tells the UI which fields come back masked.
+    """
     return {
         "schema": AppSettings.model_json_schema(),
         "profiles": PROFILE_PRESETS,
+        "secret_fields": [f"{group}.{field}" for group, field in SECRET_FIELDS],
+        "secret_mask": SECRET_MASK,
     }
 
 
-class SettingsPatch(BaseModel):
-    model_config = {"extra": "allow"}
-
-
-@router.put("/settings")
-def put_settings(patch: dict[str, Any]) -> dict[str, Any]:
-    before = load_settings().analysis
-    try:
-        settings = update_settings(patch)
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Ungueltige Einstellungen: {exc}") from exc
-    bus.publish("settings.changed", {"groups": list(patch.keys())})
-    payload = settings.model_dump(mode="json")
+def _applied(before: cfg.AnalysisSettings, settings: AppSettings) -> dict[str, Any]:
     # A changed exclusion list has to reach the files that were already
     # analysed - otherwise it would only apply to the next scan and the
     # candidate list the user wanted cleaned up would stay exactly as it was.
-    payload["applied"] = {
+    return {
         "h264_reanalysis": scanner.apply_h264_conversion_change(
             before.convert_all_h264, settings.analysis.convert_all_h264
         ),
         "codec_exclusions": scanner.apply_codec_exclusions(before.skip_codecs, settings.analysis.skip_codecs)
     }
+
+
+@router.put("/settings")
+def put_settings(patch: dict[str, Any]) -> dict[str, Any]:
+    """Partial update: only the groups and fields in the body change.
+
+    Secrets sent back as ``SECRET_MASK`` keep their stored value.
+    """
+    before = load_settings().analysis
+    try:
+        settings = update_settings(patch)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=422, detail=f"Ungueltige Einstellungen: {describe_validation_error(exc)}"
+        ) from exc
+    bus.publish("settings.changed", {"groups": list(patch.keys())})
+    payload = public_settings(settings)
+    payload["applied"] = _applied(before, settings)
     return payload
 
 
@@ -156,10 +172,11 @@ def put_settings(patch: dict[str, Any]) -> dict[str, Any]:
 def set_profile(name: str) -> dict[str, Any]:
     if name not in PROFILE_PRESETS:
         raise HTTPException(status_code=404, detail=f"Unbekanntes Profil: {name}")
-    settings = apply_profile(load_settings(), name)
-    saved = save_settings(settings)
+    with cfg._lock:
+        settings = apply_profile(load_settings().model_copy(deep=True), name)
+        saved = save_settings(settings)
     bus.publish("settings.changed", {"profile": name})
-    return saved.model_dump(mode="json")
+    return public_settings(saved)
 
 
 @router.post("/settings/test-advisor")
@@ -172,14 +189,37 @@ async def test_advisor(payload: dict[str, Any] | None = None) -> dict[str, Any]:
 
 @router.post("/settings/reset")
 def reset_settings() -> dict[str, Any]:
+    """Back to the defaults - except the login, which a reset must not switch off."""
     before = load_settings().analysis
-    settings = save_settings(AppSettings())
+    with cfg._lock:
+        fresh = AppSettings()
+        fresh.security = load_settings().security.model_copy()
+        settings = save_settings(fresh)
     bus.publish("settings.changed", {"reset": True})
-    payload = settings.model_dump(mode="json")
-    payload["applied"] = {
-        "h264_reanalysis": scanner.apply_h264_conversion_change(
-            before.convert_all_h264, settings.analysis.convert_all_h264
-        ),
-        "codec_exclusions": scanner.apply_codec_exclusions(before.skip_codecs, settings.analysis.skip_codecs)
-    }
+    payload = public_settings(settings)
+    payload["applied"] = _applied(before, settings)
     return payload
+
+
+# --------------------------------------------------------------------------- #
+# Notifications
+# --------------------------------------------------------------------------- #
+
+class NotificationTest(BaseModel):
+    # Lets the settings screen test a URL before saving it.  Empty or the mask
+    # means the stored one.
+    webhook_url: str | None = None
+
+
+@router.post("/notifications/test")
+async def test_notification(payload: NotificationTest | None = None) -> dict[str, Any]:
+    url = (payload.webhook_url if payload else None) or ""
+    if not url or url == SECRET_MASK:
+        url = load_settings().notifications.webhook_url
+    if not url:
+        raise HTTPException(status_code=422, detail="Keine Webhook-URL eingetragen.")
+    ok, message = await notify.send(
+        "test", "Optimizarr: Testnachricht",
+        "Wenn du das liest, kommen Benachrichtigungen an.", {}, url=url,
+    )
+    return {"ok": ok, "message": message}

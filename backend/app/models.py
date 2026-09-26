@@ -70,7 +70,8 @@ class LibraryPath(Base):
     path: Mapped[str] = mapped_column(String(1024), unique=True)
     name: Mapped[str] = mapped_column(String(255), default="")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    # Optional per-path override of the global quality profile
+    # Unused and no longer exposed by the API (a per-library profile was never
+    # implemented in the planner).  Kept so existing databases need no migration.
     profile: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow)
 

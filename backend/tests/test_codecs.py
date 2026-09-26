@@ -1,31 +1,20 @@
 """Codec exclusions: spelling, precheck, and what happens to files already analysed."""
-import os
-import sys
-import tempfile
 from pathlib import Path
 
 import pytest
 
-TMP = Path(tempfile.gettempdir()) / "optimizarr-pytest"
-os.environ.setdefault("OPTIMIZARR_CONFIG_DIR", str(TMP / "config"))
-os.environ.setdefault("OPTIMIZARR_TRANSCODE_DIR", str(TMP / "transcode"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from fastapi.testclient import TestClient  # noqa: E402
-
-from app.config import AppSettings  # noqa: E402
-from app.core import codecs, predictor, scanner  # noqa: E402
-from app.core.analyzer import precheck  # noqa: E402
-from app.core.ffmpeg import MediaInfo  # noqa: E402
-from app.db import engine, session_scope  # noqa: E402
-from app.main import app  # noqa: E402
-from app.models import Base, FileState, MediaFile  # noqa: E402
+from app.config import AppSettings
+from app.core import codecs, predictor, scanner
+from app.core.analyzer import precheck
+from app.core.ffmpeg import MediaInfo
+from app.db import engine, session_scope
+from app.models import Base, FileState, MediaFile
 
 
 @pytest.fixture(scope="module")
-def client():
-    with TestClient(app) as c:
-        yield c
+def client(hermetic_client):
+    """The real app, its own in-memory database, no hardware probe, no scan."""
+    return hermetic_client
 
 
 def make_info(**kw):
@@ -132,10 +121,9 @@ def test_hevc_is_a_candidate_when_it_is_not_excluded():
 # --------------------------------------------------------------------------- #
 
 @pytest.fixture(scope="module", autouse=True)
-def _schema():
-    """The tables normally appear when the app starts up.  Most tests here do
-    not need a running app, so create them explicitly instead of depending on
-    another test having gone first."""
+def _schema(hermetic_client):
+    """Every test here runs against the module's own in-memory database (the
+    one the app client uses), never against a file left by an earlier run."""
     Base.metadata.create_all(engine())
 
 
@@ -144,9 +132,7 @@ def _clean_test_files(_schema):
     """Each test starts from an empty library - counts are asserted globally."""
     def wipe():
         with session_scope() as s:
-            s.query(MediaFile).filter(MediaFile.path.like("/media/t/%")).delete(
-                synchronize_session=False
-            )
+            s.query(MediaFile).delete(synchronize_session=False)
     wipe()
     yield
     wipe()

@@ -103,7 +103,6 @@ def library_path(row: LibraryPath, stats: dict[str, Any] | None = None) -> dict[
         "path": row.path,
         "name": row.name or Path(row.path).name or row.path,
         "enabled": row.enabled,
-        "profile": row.profile,
         "created_at": iso(row.created_at),
     }
     if stats:
