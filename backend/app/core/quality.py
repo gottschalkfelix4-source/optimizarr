@@ -26,8 +26,12 @@ import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import ffmpeg
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .planner import EncodePlan
 
 log = logging.getLogger(__name__)
 
@@ -103,22 +107,45 @@ async def available_metric() -> str:
     return "none"
 
 
+#: Common pixel format both inputs are brought to before comparing.  libvmaf
+#: and ssim want identical formats on both pads; a 10-bit encode of an 8-bit
+#: source otherwise fails the graph (or, worse, gets auto-converted on one pad
+#: only).  Widening 8-bit to 10-bit is lossless, so nothing is judged unfairly.
+COMPARE_PIX_FMT = "yuv420p10le"
+
+
+def build_compare_graph(metric_filter: str, width: int = 0, height: int = 0) -> str:
+    """Filter graph comparing input 0 (distorted) against input 1 (reference).
+
+    Both pads are named and prepared explicitly.  The old graph scaled the
+    encode with ``scale=rw:rh`` - variables the plain scale filter does not
+    have - so every measurement of a downscaled encode failed and the quality
+    gate quietly let it through.  The encode is instead scaled to the known
+    reference size taken from the probe.
+    """
+    dist = ["setpts=PTS-STARTPTS"]
+    if width > 0 and height > 0:
+        # Judge a downscaled encode on the canvas the viewer actually sees.
+        dist.append(f"scale={int(width)}:{int(height)}:flags=bicubic")
+    dist.append(f"format={COMPARE_PIX_FMT}")
+    ref = ["setpts=PTS-STARTPTS", f"format={COMPARE_PIX_FMT}"]
+    return (
+        f"[0:v:0]{','.join(dist)}[dist];"
+        f"[1:v:0]{','.join(ref)}[ref];"
+        f"[dist][ref]{metric_filter}"
+    )
+
+
 async def _measure_vmaf(
-    reference: str, distorted: str, threads: int, scale_to_reference: bool, timeout: float
+    reference: str, distorted: str, threads: int, width: int, height: int, timeout: float
 ) -> float | None:
     tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
     tmp.close()
     log_path = tmp.name
     # ffmpeg's filtergraph parser treats ':' and '\' as separators.
     escaped = log_path.replace("\\", "/").replace(":", r"\:")
-
-    dist_chain = "[0:v]setpts=PTS-STARTPTS"
-    if scale_to_reference:
-        # Judge a downscaled encode on the canvas the viewer actually sees.
-        dist_chain += ",scale=rw:rh:flags=bicubic"
-    graph = (
-        f"{dist_chain}[dist];[1:v]setpts=PTS-STARTPTS[ref];"
-        f"[dist][ref]libvmaf=log_fmt=json:log_path={escaped}:n_threads={max(1, threads)}"
+    graph = build_compare_graph(
+        f"libvmaf=log_fmt=json:log_path={escaped}:n_threads={max(1, threads)}", width, height
     )
 
     try:
@@ -151,13 +178,9 @@ async def _measure_vmaf(
 
 
 async def _measure_ssim(
-    reference: str, distorted: str, scale_to_reference: bool, timeout: float
+    reference: str, distorted: str, width: int, height: int, timeout: float
 ) -> float | None:
-    dist_chain = "[0:v]setpts=PTS-STARTPTS"
-    if scale_to_reference:
-        dist_chain += ",scale=rw:rh:flags=bicubic"
-    graph = f"{dist_chain}[dist];[1:v]setpts=PTS-STARTPTS[ref];[dist][ref]ssim"
-
+    graph = build_compare_graph("ssim", width, height)
     try:
         code, _, err = await ffmpeg.run_simple(
             ["-i", distorted, "-i", reference, "-lavfi", graph, "-f", "null", "-"], timeout=timeout
@@ -170,6 +193,7 @@ async def _measure_ssim(
         return None
     match = _SSIM_RE.search(err)
     if not match:
+        log.warning("SSIM run printed no score: %s", err.strip()[-300:])
         return None
     try:
         return float(match.group(1))
@@ -183,21 +207,35 @@ async def measure_quality(
     threads: int = 4,
     scale_to_reference: bool = True,
     timeout: float = 1800.0,
+    width: int = 0,
+    height: int = 0,
 ) -> QualityScore | None:
     """Compare ``distorted`` against ``reference``.
 
-    Returns ``None`` only when no comparison filter exists at all, so callers
-    can carry on without a quality gate instead of failing the job.
+    ``width``/``height`` are the reference's picture size; the encode is scaled
+    to it.  Left at 0 with ``scale_to_reference`` the reference is probed for
+    it.  Returns ``None`` when nothing could be measured - callers that gate on
+    quality must treat that as "unknown", not as "fine".
     """
+    if scale_to_reference and not (width > 0 and height > 0):
+        try:
+            ref_info = await ffmpeg.probe(reference)
+            width, height = ref_info.width, ref_info.height
+        except ffmpeg.FFmpegError as exc:
+            log.warning("could not read the reference size of %s: %s", reference, exc)
+            width = height = 0
+    if not scale_to_reference:
+        width = height = 0
+
     metric = await available_metric()
     if metric == "vmaf":
-        score = await _measure_vmaf(reference, distorted, threads, scale_to_reference, timeout)
+        score = await _measure_vmaf(reference, distorted, threads, width, height, timeout)
         if score is not None:
             return QualityScore(value=score, metric="vmaf", vmaf_estimate=score)
         # A failed VMAF run is worth retrying as SSIM rather than giving up.
         metric = "ssim"
     if metric == "ssim":
-        ssim = await _measure_ssim(reference, distorted, scale_to_reference, timeout)
+        ssim = await _measure_ssim(reference, distorted, width, height, timeout)
         if ssim is not None:
             return QualityScore(value=ssim, metric="ssim", vmaf_estimate=ssim_to_vmaf(ssim))
         return None
@@ -264,10 +302,53 @@ def looks_like_animation(path: str) -> bool:
     return any(hint in lowered for hint in ANIMATION_HINTS)
 
 
+def _parse_clock(value: str) -> float:
+    """``"01:23:45.678000000"`` (Matroska's per-stream DURATION tag) -> seconds."""
+    try:
+        parts = [float(p) for p in str(value).strip().split(":")]
+    except ValueError:
+        return 0.0
+    seconds = 0.0
+    for part in parts:
+        seconds = seconds * 60 + part
+    return seconds
+
+
+def video_stream_duration(info: ffmpeg.MediaInfo) -> float:
+    """Length of the main video stream itself, 0 when the file does not say.
+
+    The container duration is the longest stream: an encode whose picture died
+    after ten minutes still reports the full length through its audio.
+    """
+    for stream in (info.raw or {}).get("streams") or []:
+        if stream.get("codec_type") != "video":
+            continue
+        if (stream.get("disposition") or {}).get("attached_pic"):
+            continue
+        try:
+            value = float(stream.get("duration") or 0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0:
+            return value
+        for key, raw in (stream.get("tags") or {}).items():
+            if str(key).upper().startswith("DURATION"):
+                value = _parse_clock(raw)
+                if value > 0:
+                    return value
+        return 0.0
+    return 0.0
+
+
+def _kept(actions: list[dict] | None) -> int:
+    return sum(1 for a in actions or [] if a.get("action") != "drop")
+
+
 async def verify_output(
     source_info: ffmpeg.MediaInfo,
     output_path: str,
     max_duration_drift: float = 2.0,
+    plan: "EncodePlan | None" = None,
 ) -> tuple[bool, str]:
     """Sanity-check a finished encode before it is allowed to replace anything."""
     try:
@@ -285,10 +366,37 @@ async def verify_output(
             f"Laufzeit weicht um {drift:.1f}s ab "
             f"({source_info.duration:.1f}s -> {out.duration:.1f}s)"
         )
+    # The video stream on its own: a picture that stops early hides behind the
+    # audio in the container duration.
+    # Matching either the source's video stream or its container is fine - a
+    # stale per-stream tag on the source must not reject a good encode.
+    out_video = video_stream_duration(out)
+    src_video = video_stream_duration(source_info) or source_info.duration
+    if (
+        out_video > 0 and src_video > 0
+        and abs(out_video - src_video) > max_duration_drift
+        and abs(out_video - source_info.duration) > max_duration_drift
+    ):
+        return False, (
+            f"Videospur ist {out_video:.1f}s lang statt {src_video:.1f}s - "
+            "das Bild bricht vorzeitig ab"
+        )
     if Path(output_path).stat().st_size < 1024:
         return False, "Ergebnisdatei ist leer"
     if source_info.audio_streams and not out.audio_streams:
         # Language and commentary rules can drop every track; a silent file
         # must never replace one with sound.
         return False, "Ergebnis hat keine Tonspur mehr"
+    if plan is not None:
+        want_audio = _kept(plan.audio)
+        if len(out.audio_streams) != want_audio:
+            return False, (
+                f"Ergebnis hat {len(out.audio_streams)} Tonspur(en), geplant waren {want_audio}"
+            )
+        want_subs = _kept(plan.subtitles)
+        if len(out.subtitle_streams) != want_subs:
+            return False, (
+                f"Ergebnis hat {len(out.subtitle_streams)} Untertitelspur(en), "
+                f"geplant waren {want_subs}"
+            )
     return True, ""
