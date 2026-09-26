@@ -87,6 +87,10 @@ class EncodePlan:
     estimated_saving_bytes: int = 0
     estimated_saving_pct: float = 0.0
     predicted_video_bitrate: int = 0
+    #: What the learning model trains on: the *uncorrected* base prediction and
+    #: exactly the features it was made from (filled in by the analyzer).
+    base_video_bitrate: int = 0
+    prediction_features: dict[str, Any] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
