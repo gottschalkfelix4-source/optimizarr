@@ -148,6 +148,13 @@ class Prediction:
     source: str = "heuristic"        # heuristic | sample | sample+model | model
     complexity: float = 1.0
     learned_correction: float = 1.0
+    #: The prediction *before* the learned correction, and the exact features
+    #: the correction was looked up with.  The model is fitted on
+    #: log(actual / base) against these same features, so an encode must be
+    #: recorded with both - recording the corrected bitrate instead made the
+    #: model learn its own output.
+    base_video_bitrate: float = 0.0
+    features: dict[str, float] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -161,6 +168,7 @@ class Prediction:
             "source": self.source,
             "complexity": round(self.complexity, 3),
             "learned_correction": round(self.learned_correction, 4),
+            "base_video_bitrate": round(self.base_video_bitrate),
             "notes": self.notes,
         }
 
@@ -235,6 +243,10 @@ FEATURE_KEYS = [
 ]
 
 
+def is_hw_encoder(encoder: str) -> bool:
+    return encoder in ("av1_qsv", "av1_vaapi")
+
+
 def build_features(inp: PredictionInput, encoder: str, has_sample: bool) -> dict[str, float]:
     return {
         "log_pixels": math.log(max(inp.out_pixels_per_second, 1.0)),
@@ -243,7 +255,7 @@ def build_features(inp: PredictionInput, encoder: str, has_sample: bool) -> dict
         "log_source_bpp": math.log(max(inp.source_bpp, 1e-4)),
         "codec_eff": codec_efficiency(inp.source_codec),
         "is_hdr": 1.0 if inp.is_hdr else 0.0,
-        "is_hw_encoder": 1.0 if encoder in ("av1_qsv", "av1_vaapi") else 0.0,
+        "is_hw_encoder": 1.0 if is_hw_encoder(encoder) else 0.0,
         "grain": float(inp.grain_level),
         "has_sample": 1.0 if has_sample else 0.0,
     }
@@ -364,6 +376,18 @@ class LearnedModel:
         return pairs[:4]
 
 
+def heuristic_training_pair(inp: PredictionInput, encoder: str) -> tuple[float, dict[str, float]]:
+    """(base bitrate, features) exactly as :func:`predict` forms them without a
+    sample measurement.
+
+    For encodes whose plan predates ``base_video_bitrate``: the corrected
+    prediction stored back then cannot be used as a training target, but the
+    heuristic can be recomputed from the same input, and base and features then
+    match the way the model is applied.
+    """
+    return heuristic_bitrate(inp)[0], build_features(inp, encoder, has_sample=False)
+
+
 _model = LearnedModel()
 
 
@@ -423,8 +447,10 @@ def predict(
         out.source = "heuristic"
         out.confidence = 0.45 if inp.source_bitrate > 0 else 0.25
 
+    features = build_features(inp, encoder, has_sample=bool(sample_bitrate and sample_bitrate > 0))
+    out.base_video_bitrate = base_bitrate
+    out.features = features
     if use_model:
-        features = build_features(inp, encoder, has_sample=bool(sample_bitrate))
         correction, conf_bonus = _model.correction(features)
         out.learned_correction = correction
         base_bitrate *= correction

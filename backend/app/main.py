@@ -40,15 +40,34 @@ def _recover_orphans() -> None:
         for job in stuck_jobs:
             job.state = JobState.QUEUED.value
             job.progress = 0.0
+            job.fps = 0.0
+            job.speed = 0.0
+            job.eta_seconds = 0
+            job.current_size = 0
             job.started_at = None
+            job.finished_at = None
             job.log = (job.log or "") + "[neustart] Job wurde nach einem Neustart neu eingereiht.\n"
+        s.flush()
+        # Every file that still has a job waiting belongs in "queued" - not
+        # only those of the jobs reset just now.
+        queued_files = {
+            file_id for (file_id,) in
+            s.query(Job.file_id).filter(Job.state == JobState.QUEUED.value).all()
+        }
         stuck_files = s.query(MediaFile).filter(
             MediaFile.state.in_([FileState.ENCODING.value, FileState.ANALYZING.value])
         ).all()
         for media in stuck_files:
-            media.state = FileState.QUEUED.value if any(
-                j.file_id == media.id for j in stuck_jobs
-            ) else FileState.CANDIDATE.value
+            if media.id in queued_files:
+                media.state = FileState.QUEUED.value
+            elif media.plan:
+                media.state = FileState.CANDIDATE.value
+            else:
+                # Never analysed: "candidate" would put it up for auto-queue
+                # without a plan.
+                media.state = (
+                    FileState.PROBED.value if media.video_codec else FileState.NEW.value
+                )
         # A scan cut off by the restart would otherwise read "running" forever.
         for run in s.query(ScanRun).filter(ScanRun.state == "running").all():
             run.state = "failed"
@@ -57,9 +76,14 @@ def _recover_orphans() -> None:
         if stuck_jobs or stuck_files:
             s.add(HistoryEntry(
                 level="warning", category="system",
-                message=f"Nach Neustart aufgeraeumt: {len(stuck_jobs)} Job(s) neu eingereiht.",
+                message=(
+                    f"Nach Neustart aufgeraeumt: {len(stuck_jobs)} Job(s) neu eingereiht, "
+                    f"{len(stuck_files)} Datei(en) zurueckgesetzt."
+                ),
             ))
-            log.info("recovered %d orphaned jobs", len(stuck_jobs))
+            log.info(
+                "recovered %d orphaned job(s) and %d file(s)", len(stuck_jobs), len(stuck_files)
+            )
 
 
 def _clean_transcode_dir() -> None:
@@ -67,7 +91,34 @@ def _clean_transcode_dir() -> None:
 
     Runs before the worker starts, so nothing in here can still be in use.
     Only our own prefix is touched - the directory may be shared.
+
+    The library side is handled too, without walking it (tens of terabytes,
+    disks spun down): a commit cut off half-way is rolled back from its journal
+    entry, and staging copies from before the journal existed are only looked
+    for next to files that still have a job waiting - the only ones a commit
+    can have been interrupted on.
     """
+    from .core import encoder
+
+    try:
+        rolled_back = encoder.recover_interrupted_commits()
+        if rolled_back:
+            log.warning("rolled back %d interrupted replacement(s)", rolled_back)
+    except Exception:
+        log.exception("could not roll back interrupted replacements")
+    try:
+        with session_scope() as s:
+            folders = {
+                os.path.dirname(path) for (path,) in
+                s.query(MediaFile.path).join(Job, Job.file_id == MediaFile.id)
+                .filter(Job.state.in_([JobState.QUEUED.value, JobState.RUNNING.value])).all()
+            }
+        swept = encoder.sweep_stale_staging(sorted(folders))
+        if swept:
+            log.info("removed %d leftover staging file(s) from the library", swept)
+    except Exception:
+        log.exception("could not sweep leftover staging files")
+
     if not TRANSCODE_DIR.is_dir():
         return
     removed = 0
