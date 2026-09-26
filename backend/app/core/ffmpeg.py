@@ -801,7 +801,10 @@ async def available_filters(refresh: bool = False) -> set[str]:
     names: set[str] = set()
     if code == 0:
         for line in out.splitlines():
-            m = re.match(r"^\s*[TSC.]{3}\s+(\S+)", line)
+            # Three flag columns (timeline, slice threads, commands) up to
+            # ffmpeg 7; newer builds dropped the command column.  Matching
+            # only three found no filter at all there - not even ssim.
+            m = re.match(r"^\s*[TSC.]{2,3}\s+(\S+)", line)
             if m:
                 names.add(m.group(1))
     _filter_cache = names
