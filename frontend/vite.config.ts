@@ -22,6 +22,14 @@ export default defineConfig({
         target: apiTarget,
         changeOrigin: true,
         ws: true,
+        // changeOrigin rewrites Host to the backend, so the backend's WebSocket
+        // origin check would see a foreign origin.  X-Forwarded-Host carries the
+        // browser's host along (http-proxy's xfwd leaves it out for WebSockets).
+        configure: (proxy) => {
+          proxy.on("proxyReqWs", (proxyReq, req) => {
+            if (req.headers.host) proxyReq.setHeader("X-Forwarded-Host", req.headers.host);
+          });
+        },
         bypass: readOnly
           ? (req) => (["GET", "HEAD", "OPTIONS"].includes(req.method ?? "GET") ? undefined : false)
           : undefined,
