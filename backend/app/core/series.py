@@ -36,6 +36,10 @@ BUCKETS = ("converted", "av1", "active", "pending", "excluded", "failed", "other
 # A single one can still be forced from its own row.
 FORCEABLE = ("pending", "excluded", "failed", "other")
 
+#: Season number that addresses the files without one ("Ohne Staffel") in a
+#: request - ``None`` already means "every season" there.
+NO_SEASON = -1
+
 
 @dataclass(frozen=True)
 class Placement:
@@ -223,6 +227,28 @@ class SeriesGroup:
         # too (Film (2020)/Specials/Making of.mkv).  It takes an episode number
         # or a real season to make a series.
         return any(e.episode is not None or e.season not in (None, 0) for e in self.episodes)
+
+
+def is_forceable(episode: Episode) -> bool:
+    """Would a forced bulk run take this file?
+
+    A missing file sits in "other" but cannot be encoded - the frontend leaves
+    it out of the count (``groups.tsx`` ``pick``), so the backend must too.
+    """
+    state = getattr(episode.row, "state", None) if episode.row is not None else None
+    return episode.bucket in FORCEABLE and state != FileState.MISSING.value
+
+
+def pick(episodes: Iterable[Episode], force: bool, season: int | None = None) -> list[int]:
+    """File ids a bulk enqueue takes: candidates, or with ``force`` everything
+    forceable.  ``season`` None means every season, ``NO_SEASON`` the files
+    without one."""
+    wanted = None if season == NO_SEASON else season
+    return [
+        e.file_id for e in episodes
+        if (is_forceable(e) if force else e.bucket == "pending")
+        and (season is None or e.season == wanted)
+    ]
 
 
 def group(rows: Iterable[Any], libraries: dict[int, tuple[str, str]]) -> list[SeriesGroup]:

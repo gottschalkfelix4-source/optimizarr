@@ -26,6 +26,25 @@ from app.core.advisor.provider_openai import (  # noqa: E402
 from app.core.advisor.service import build_provider, provider_catalogue  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def isolated_db(monkeypatch):
+    """Own in-memory database: stored credentials or settings left behind by
+    another test (or a real install in the config dir) must not leak in."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import StaticPool
+
+    from app import config, db
+    from app.models import Base
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(db, "_engine", engine)
+    monkeypatch.setattr(db, "_SessionLocal", None)
+    monkeypatch.setattr(config, "_cache", None)
+    yield
+    engine.dispose()
+
+
 # --------------------------------------------------------------------------- #
 # Response parsing - endpoints without schema enforcement return all sorts
 # --------------------------------------------------------------------------- #
@@ -620,3 +639,204 @@ def test_token_expiry_uses_a_safety_margin():
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+# --------------------------------------------------------------------------- #
+# Stored secrets only go where they were configured for
+# --------------------------------------------------------------------------- #
+
+STORED_URL = "https://api.openai.com/v1"
+HEADERS = {"X-Optimizarr": "1"}
+
+
+def _store_advisor(**fields):
+    from app.config import AppSettings, save_settings
+
+    settings = AppSettings()
+    for key, value in fields.items():
+        setattr(settings.advisor, key, value)
+    save_settings(settings)
+
+
+def _capture_http(monkeypatch):
+    """Route every httpx.AsyncClient through a recorder."""
+    seen: list[httpx.Request] = []
+    real = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"data": [{"id": "m1"}]})
+
+    def factory(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+    return seen
+
+
+@pytest.fixture()
+def api():
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    return TestClient(app)   # no lifespan: no worker, no scan
+
+
+def test_openai_key_rules():
+    from app.api.routes_advisor import openai_key_for
+
+    stored = AdvisorSettings(openai_base_url=STORED_URL, openai_api_key="sk-stored")
+    assert openai_key_for(STORED_URL + "/", None, stored) == "sk-stored"
+    assert openai_key_for(STORED_URL, "********", stored) == "sk-stored"
+    assert openai_key_for("http://evil.example/v1", "", stored) == ""
+    assert openai_key_for("http://evil.example/v1", "********", stored) == ""
+    assert openai_key_for("http://evil.example/v1", "sk-own", stored) == "sk-own"
+    assert openai_key_for(STORED_URL, None, AdvisorSettings(openai_api_key="sk")) == ""
+
+
+def test_model_list_is_a_post_and_keeps_the_stored_key_home(api, monkeypatch):
+    _store_advisor(openai_base_url=STORED_URL, openai_api_key="sk-stored")
+    seen = _capture_http(monkeypatch)
+
+    assert api.get("/api/advisor/openai/models", params={"base_url": "http://evil.example"}).status_code == 405
+
+    r = api.post("/api/advisor/openai/models", headers=HEADERS,
+                 json={"base_url": "http://evil.example/v1", "api_key": "********"})
+    assert r.status_code == 200 and r.json()["models"] == ["m1"]
+    assert str(seen[-1].url) == "http://evil.example/v1/models"
+    assert "authorization" not in seen[-1].headers
+
+    api.post("/api/advisor/openai/models", headers=HEADERS,
+             json={"base_url": STORED_URL + "/", "api_key": None})
+    assert seen[-1].headers["authorization"] == "Bearer sk-stored"
+
+
+def test_connection_test_does_not_ship_the_stored_key_elsewhere(api, monkeypatch):
+    from app.core.advisor import service
+
+    _store_advisor(openai_base_url=STORED_URL, openai_api_key="sk-stored", api_key="sk-ant")
+    used: list[AdvisorSettings] = []
+
+    async def fake_test(self):
+        used.append(self.settings)
+        return True, "ok"
+
+    monkeypatch.setattr(service.Advisor, "test_connection", fake_test)
+    api.post("/api/advisor/test", headers=HEADERS, json={
+        "provider": "openai_compatible", "openai_base_url": "http://evil.example/v1",
+        "openai_model": "m", "openai_api_key": "********",
+    })
+    api.post("/api/advisor/test", headers=HEADERS, json={
+        "provider": "openai_compatible", "openai_model": "m", "openai_api_key": "********",
+    })
+    api.post("/api/advisor/test", headers=HEADERS, json={"provider": "anthropic", "api_key": "********"})
+    evil, home, anthropic = used
+    assert evil.openai_base_url == "http://evil.example/v1" and evil.openai_api_key == ""
+    assert home.openai_api_key == "sk-stored"
+    # The mask means "not given", never the key itself.
+    assert anthropic.api_key == "sk-ant"
+
+
+# --------------------------------------------------------------------------- #
+# Claude: per-model request shape
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("model,effort,adaptive", [
+    ("claude-opus-5-5", True, True),
+    ("claude-opus-5", True, True),
+    ("claude-sonnet-5", True, True),
+    ("claude-fable-5-1", True, True),
+    ("claude-haiku-4-5", False, False),
+    ("claude-opus-4-5", True, False),
+    ("claude-sonnet-4-5", False, False),
+])
+def test_model_features(model, effort, adaptive):
+    from app.core.advisor.provider_anthropic import model_features
+
+    assert model_features(model) == (effort, adaptive)
+
+
+class _FakeMessages:
+    def __init__(self):
+        self.calls = []
+
+    async def create(self, **kwargs):
+        from types import SimpleNamespace
+
+        self.calls.append(kwargs)
+        return SimpleNamespace(
+            model=kwargs["model"], stop_reason="end_turn",
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+            content=[SimpleNamespace(type="text", text=json.dumps(GOOD))],
+        )
+
+
+def _anthropic(model):
+    from types import SimpleNamespace
+
+    from app.core.advisor.provider_anthropic import SDK_AVAILABLE, AnthropicProvider
+
+    if not SDK_AVAILABLE:
+        pytest.skip("anthropic SDK not installed")
+    provider = AnthropicProvider(AdvisorSettings(api_key="sk", model=model))
+    messages = _FakeMessages()
+    provider._client = SimpleNamespace(messages=messages)
+    return provider, messages
+
+
+@pytest.mark.anyio
+async def test_haiku_gets_neither_effort_nor_adaptive_thinking():
+    provider, messages = _anthropic("claude-haiku-4-5")
+    await provider.complete("sys", "user", 30)
+    ok, _ = await provider.check()
+    request, check = messages.calls
+    assert "thinking" not in request
+    assert "effort" not in request["output_config"]
+    assert request["output_config"]["format"]["type"] == "json_schema"
+    assert "output_config" not in check
+    assert ok
+
+
+@pytest.mark.anyio
+async def test_current_models_keep_low_effort_and_adaptive_thinking():
+    provider, messages = _anthropic("claude-opus-5-5")
+    await provider.complete("sys", "user", 30)
+    await provider.check()
+    request, check = messages.calls
+    assert request["thinking"] == {"type": "adaptive"}
+    assert request["output_config"]["effort"] == "low"
+    assert check["output_config"] == {"effort": "low"}
+    # The prompt is below every model's cache minimum - no marker pretending otherwise.
+    assert "cache_control" not in json.dumps(request["system"])
+
+
+# --------------------------------------------------------------------------- #
+# OpenAI-compatible connection test wording
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.anyio
+async def test_check_names_the_strict_schema_mode():
+    def handler(request):
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "test-model"}]})
+        return _ok_response('{"ok": true}')
+
+    ok, message = await _provider_with(handler).check()
+    assert ok and "mit erzwungenem JSON-Schema" in message
+    assert "json_schema_strict" not in message
+
+
+@pytest.mark.anyio
+async def test_check_reports_a_dropped_system_role_on_its_own():
+    def handler(request):
+        if request.url.path.endswith("/models"):
+            return httpx.Response(404)
+        body = json.loads(request.content)
+        if any(m["role"] == "system" for m in body["messages"]):
+            return httpx.Response(400, json={"error": {"message": "system role not supported"}})
+        return _ok_response('{"ok": true}')
+
+    ok, message = await _provider_with(handler).check()
+    assert ok and "[angepasst: ohne system-Rolle]" in message
