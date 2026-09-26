@@ -38,6 +38,8 @@ def isolated(monkeypatch, tmp_path):
     # The DV re-probe marker lives in the config dir - never the shared one.
     marker = tmp_path / "config" / "dolby-vision-reprobe.done"
     monkeypatch.setattr(scanner, "_dv_marker", lambda: marker, raising=False)
+    converted = tmp_path / "config" / "converted-metadata-refresh.done"
+    monkeypatch.setattr(scanner, "_converted_marker", lambda: converted, raising=False)
     monkeypatch.setattr(scanner, "_pending_analysis", set(), raising=False)
     monkeypatch.setattr(scanner.state, "running", False)
     yield
@@ -49,6 +51,7 @@ def marker_done(tmp_path):
     path = tmp_path / "config" / "dolby-vision-reprobe.done"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("done")
+    (tmp_path / "config" / "converted-metadata-refresh.done").write_text("done")
     return path
 
 
@@ -551,3 +554,39 @@ def test_without_an_event_loop_the_next_scan_picks_it_up(monkeypatch):
     monkeypatch.setattr(bus, "_loop", None)
     result = scanner.apply_codec_exclusions(["av1", "hevc"], ["av1"])
     assert result["restored"] == 1 and result["analysis_started"] is False
+
+
+def test_converted_files_get_their_own_metadata_once(tmp_path, monkeypatch, marker_done):
+    """Encodes before the fix left the source's bit depth and bitrate on the row."""
+    marker_done.parent.joinpath("converted-metadata-refresh.done").unlink()
+    fake_hw(monkeypatch)
+    root = tmp_path / "lib"
+    lib_id = add_library(root)
+    done = add_row(video(root, "Done.mkv"), lib_id, state=FileState.DONE.value,
+                   video_codec="av1", bit_depth=8, pix_fmt="yuv420p", video_bitrate=12_000_000,
+                   converted_at=dt.datetime(2026, 9, 1), original_size=5 * 1024**3,
+                   estimated_saving_bytes=3 * 1024**3, decision_reason="Fertig")
+    probes = []
+
+    async def probe(path, timeout=120.0):
+        probes.append(Path(path).name)
+        return MediaInfo(path=path, size=2048, duration=2600, video_codec="av1",
+                         width=1920, height=1080, fps=24, video_bitrate=2_500_000,
+                         bit_depth=10, pix_fmt="yuv420p10le",
+                         audio_streams=[{"index": 1, "codec": "eac3"}])
+
+    monkeypatch.setattr(ffmpeg, "probe", probe)
+    config.update_settings({"library": {"min_file_size_mb": 0}})
+    assert asyncio.run(scanner.run_scan(trigger="test"))["ok"]
+
+    stored = row(done)
+    assert (stored.bit_depth, stored.pix_fmt, stored.video_bitrate) == (10, "yuv420p10le", 2_500_000)
+    assert stored.state == FileState.DONE.value
+    assert stored.estimated_saving_bytes == 3 * 1024**3
+    assert stored.original_size == 5 * 1024**3
+    assert probes == ["Done.mkv"]
+    assert scanner._converted_marker().exists()
+
+    probes.clear()
+    assert asyncio.run(scanner.run_scan(trigger="test"))["ok"]
+    assert probes == []

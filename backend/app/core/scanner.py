@@ -260,6 +260,53 @@ def _dv_reprobe_ids() -> list[int]:
     ]
 
 
+#: Written after the first full scan that re-read the metadata of files already
+#: converted.  Encodes before that left the source's codec profile, bit depth,
+#: bitrate and streams on the row (the AV1 file is 10-bit, the row said 8).
+CONVERTED_REFRESH_MARKER = "converted-metadata-refresh.done"
+
+
+def _converted_marker() -> Path:
+    from .. import db
+
+    return db.CONFIG_DIR / CONVERTED_REFRESH_MARKER
+
+
+def _converted_refresh_pending() -> bool:
+    try:
+        return not _converted_marker().exists()
+    except OSError:
+        return False
+
+
+def _mark_converted_refresh_done() -> None:
+    try:
+        path = _converted_marker()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(utcnow().isoformat() + "\n")
+    except OSError as exc:
+        log.warning("could not write %s: %s", CONVERTED_REFRESH_MARKER, exc)
+
+
+def _converted_refresh_ids() -> list[int]:
+    with session_scope() as s:
+        return list(s.execute(
+            select(MediaFile.id).where(
+                MediaFile.state == FileState.DONE.value,
+                MediaFile.converted_at.is_not(None),
+            )
+        ).scalars().all())
+
+
+def _refresh_converted(file_id: int, info: ffmpeg.MediaInfo) -> None:
+    """Metadata only: a converted file stays "done" with its recorded saving."""
+    with session_scope() as s:
+        row = s.get(MediaFile, file_id)
+        if row is None or row.state != FileState.DONE.value:
+            return
+        _copy_probe(row, info)
+
+
 def _restored_state(row: MediaFile) -> str:
     """Where a file that went missing and came back unchanged belongs.
 
@@ -552,29 +599,33 @@ def _analysis_is_stale(row: MediaFile, settings: AppSettings) -> bool:
     return (utcnow() - analyzed).days >= days
 
 
+def _copy_probe(row: MediaFile, info: ffmpeg.MediaInfo) -> None:
+    row.container = info.container or row.container
+    row.video_codec = info.video_codec
+    row.profile = info.profile
+    row.width = info.width
+    row.height = info.height
+    row.fps = info.fps
+    row.duration = info.duration
+    row.video_bitrate = info.video_bitrate
+    row.bit_depth = info.bit_depth
+    row.pix_fmt = info.pix_fmt
+    row.is_hdr = info.is_hdr
+    row.hdr_format = info.hdr_format
+    row.color_primaries = info.color_primaries
+    row.color_transfer = info.color_transfer
+    row.color_space = info.color_space
+    row.interlaced = info.interlaced
+    row.audio_streams = info.audio_streams
+    row.subtitle_streams = info.subtitle_streams
+
+
 def _store_probe(file_id: int, info: ffmpeg.MediaInfo) -> None:
     with session_scope() as s:
         row = s.get(MediaFile, file_id)
         if row is None:
             return
-        row.container = info.container or row.container
-        row.video_codec = info.video_codec
-        row.profile = info.profile
-        row.width = info.width
-        row.height = info.height
-        row.fps = info.fps
-        row.duration = info.duration
-        row.video_bitrate = info.video_bitrate
-        row.bit_depth = info.bit_depth
-        row.pix_fmt = info.pix_fmt
-        row.is_hdr = info.is_hdr
-        row.hdr_format = info.hdr_format
-        row.color_primaries = info.color_primaries
-        row.color_transfer = info.color_transfer
-        row.color_space = info.color_space
-        row.interlaced = info.interlaced
-        row.audio_streams = info.audio_streams
-        row.subtitle_streams = info.subtitle_streams
+        _copy_probe(row, info)
         # A queued or running job owns the state; a manual re-analysis turned
         # an encoding file into a candidate and _store_analysis then no longer
         # recognised it as busy.
@@ -671,6 +722,7 @@ async def run_scan(trigger: str = "manual", analyze_only_ids: list[int] | None =
 
         # ---------------- phase 1: walk ----------------
         dv_reprobe = analyze_only_ids is None and _dv_reprobe_pending()
+        converted_refresh = analyze_only_ids is None and _converted_refresh_pending()
         if analyze_only_ids is None:
             seen, new_count, todo = await asyncio.to_thread(_sync_disk_to_db, settings, run_id)
             _log_history("info", "scan",
@@ -737,6 +789,33 @@ async def run_scan(trigger: str = "manual", analyze_only_ids: list[int] | None =
             run = s.get(ScanRun, run_id)
             if run:
                 run.files_probed = probed
+
+        # Once: re-read converted files whose rows still describe the source.
+        if converted_refresh:
+            refresh_ids = await asyncio.to_thread(_converted_refresh_ids)
+
+            async def refresh_one(file_id: int) -> None:
+                if cancel.is_set():
+                    return
+                async with probe_sem:
+                    if cancel.is_set():
+                        return
+                    with session_scope() as s:
+                        row = s.get(MediaFile, file_id)
+                        path = row.path if row else None
+                    if not path:
+                        return
+                    try:
+                        info = await ffmpeg.probe(path)
+                    except ffmpeg.FFmpegError as exc:
+                        log.warning("metadata refresh failed for %s: %s", path, exc)
+                        return
+                    await asyncio.to_thread(_refresh_converted, file_id, info)
+
+            await _gather_limited([refresh_one(i) for i in refresh_ids], cancel)
+            if cancel.is_set():
+                raise asyncio.CancelledError
+            await asyncio.to_thread(_mark_converted_refresh_done)
 
         # ---------------- phase 3: analyse ----------------
         state.phase = "analyze"
