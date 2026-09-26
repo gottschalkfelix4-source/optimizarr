@@ -4,13 +4,14 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+from pathlib import Path
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from ..config import AppSettings, load_settings
 from ..db import session_scope
-from ..models import Job, JobState, LearningSample, MediaFile, FileState
+from ..models import HistoryEntry, Job, JobState, LearningSample, MediaFile, FileState
 from . import encoder, hwaccel, planner, predictor, scanner
 from .events import bus
 
@@ -337,6 +338,53 @@ def refit_predictor() -> dict[str, Any]:
     stats = model.stats()
     bus.publish("model.updated", stats)
     return stats
+
+
+#: Written once the learning samples of the old GPU quality handling are gone.
+HW_SAMPLES_RESET_MARKER = "hw-learning-samples-reset.done"
+#: Encoders whose quality value used to be wrong: ``av1_vaapi`` ignored the
+#: CRF entirely (every encode ran at the driver default, q_idx 25) and
+#: ``av1_qsv`` read the CRF unchanged as ICQ.  Samples from those encodes
+#: describe a CRF that was never applied and would pull the model away from
+#: what ``planner.hw_quality`` does now.
+LEGACY_HW_SAMPLE_ENCODERS = ("av1_vaapi", "av1_qsv")
+
+
+def reset_legacy_hw_samples(config_dir: Path) -> int:
+    """Once: drop the learning samples recorded with the old GPU quality values.
+
+    Returns how many were deleted.  The caller refits the predictor afterwards.
+    Nothing happens (and no marker is written) when the database cannot be
+    read, so the next start tries again.
+    """
+    marker = config_dir / HW_SAMPLES_RESET_MARKER
+    try:
+        if marker.exists():
+            return 0
+    except OSError:
+        return 0
+    with session_scope() as s:
+        removed = s.execute(
+            delete(LearningSample).where(LearningSample.encoder.in_(LEGACY_HW_SAMPLE_ENCODERS))
+        ).rowcount or 0
+        if removed:
+            s.add(HistoryEntry(
+                level="info", category="system",
+                message=(
+                    f"Lernmodell bereinigt: {removed} Messwert(e) aus GPU-Encodes "
+                    "(av1_vaapi/av1_qsv) mit der alten Qualitaetseinstellung entfernt - "
+                    "sie passen nicht zur neuen CRF-Umrechnung."
+                ),
+                detail={"removed": removed, "encoders": list(LEGACY_HW_SAMPLE_ENCODERS)},
+            ))
+    if removed:
+        log.info("removed %d learning sample(s) of the old GPU quality handling", removed)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(dt.datetime.now(dt.timezone.utc).isoformat() + "\n")
+    except OSError as exc:
+        log.warning("could not write %s: %s", marker, exc)
+    return removed
 
 
 def _aware(value: dt.datetime | None) -> dt.datetime | None:

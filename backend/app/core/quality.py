@@ -19,6 +19,7 @@ familiar "94 is visually transparent" rule of thumb still works.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -113,6 +114,18 @@ async def available_metric() -> str:
 #: only).  Widening 8-bit to 10-bit is lossless, so nothing is judged unfairly.
 COMPARE_PIX_FMT = "yuv420p10le"
 
+#: Pairs frames by their index instead of their timestamp.  Both slices hold
+#: the same pictures in the same order, but their timestamps need not agree:
+#: Matroska stores milliseconds, and at 24000/1001 fps a source muxed from a
+#: 90 kHz clock rounds some frames one millisecond the other way than its
+#: encode does.  ``PTS-STARTPTS`` kept that jitter, and the metric then
+#: compared a frame against its predecessor about once a second - a clean HDR
+#: encode measured VMAF 78 instead of 92.5.  ``N/FRAME_RATE/TB`` is not enough
+#: either: it still rounds into each input's own timebase (ms against 90 kHz
+#: for an MP4 trial encode) and breaks when the frame rate is unknown.  A
+#: shared timebase and the bare frame number are exact on both pads.
+FRAME_INDEX_PTS = "settb=AVTB,setpts=N"
+
 
 def build_compare_graph(metric_filter: str, width: int = 0, height: int = 0) -> str:
     """Filter graph comparing input 0 (distorted) against input 1 (reference).
@@ -121,14 +134,15 @@ def build_compare_graph(metric_filter: str, width: int = 0, height: int = 0) -> 
     encode with ``scale=rw:rh`` - variables the plain scale filter does not
     have - so every measurement of a downscaled encode failed and the quality
     gate quietly let it through.  The encode is instead scaled to the known
-    reference size taken from the probe.
+    reference size taken from the probe.  Frames are paired by index, see
+    :data:`FRAME_INDEX_PTS`.
     """
-    dist = ["setpts=PTS-STARTPTS"]
+    dist = [FRAME_INDEX_PTS]
     if width > 0 and height > 0:
         # Judge a downscaled encode on the canvas the viewer actually sees.
         dist.append(f"scale={int(width)}:{int(height)}:flags=bicubic")
     dist.append(f"format={COMPARE_PIX_FMT}")
-    ref = ["setpts=PTS-STARTPTS", f"format={COMPARE_PIX_FMT}"]
+    ref = [FRAME_INDEX_PTS, f"format={COMPARE_PIX_FMT}"]
     return (
         f"[0:v:0]{','.join(dist)}[dist];"
         f"[1:v:0]{','.join(ref)}[ref];"
@@ -137,7 +151,8 @@ def build_compare_graph(metric_filter: str, width: int = 0, height: int = 0) -> 
 
 
 async def _measure_vmaf(
-    reference: str, distorted: str, threads: int, width: int, height: int, timeout: float
+    reference: str, distorted: str, threads: int, width: int, height: int, timeout: float,
+    cancel_event: asyncio.Event | None = None,
 ) -> float | None:
     tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
     tmp.close()
@@ -150,7 +165,8 @@ async def _measure_vmaf(
 
     try:
         code, _, err = await ffmpeg.run_simple(
-            ["-i", distorted, "-i", reference, "-lavfi", graph, "-f", "null", "-"], timeout=timeout
+            ["-i", distorted, "-i", reference, "-lavfi", graph, "-f", "null", "-"],
+            timeout=timeout, cancel_event=cancel_event,
         )
         if code != 0:
             log.warning("VMAF run failed: %s", err.strip()[-300:])
@@ -167,6 +183,9 @@ async def _measure_vmaf(
             scores = [s for s in scores if isinstance(s, (int, float))]
             mean = sum(scores) / len(scores) if scores else None
         return float(mean) if mean is not None else None
+    except ffmpeg.FFmpegCancelled:
+        # Stopped on purpose - not a failed measurement worth an SSIM retry.
+        raise
     except (OSError, json.JSONDecodeError, ffmpeg.FFmpegError) as exc:
         log.warning("VMAF measurement failed: %s", exc)
         return None
@@ -178,13 +197,17 @@ async def _measure_vmaf(
 
 
 async def _measure_ssim(
-    reference: str, distorted: str, width: int, height: int, timeout: float
+    reference: str, distorted: str, width: int, height: int, timeout: float,
+    cancel_event: asyncio.Event | None = None,
 ) -> float | None:
     graph = build_compare_graph("ssim", width, height)
     try:
         code, _, err = await ffmpeg.run_simple(
-            ["-i", distorted, "-i", reference, "-lavfi", graph, "-f", "null", "-"], timeout=timeout
+            ["-i", distorted, "-i", reference, "-lavfi", graph, "-f", "null", "-"],
+            timeout=timeout, cancel_event=cancel_event,
         )
+    except ffmpeg.FFmpegCancelled:
+        raise
     except ffmpeg.FFmpegError as exc:
         log.warning("SSIM measurement failed: %s", exc)
         return None
@@ -209,6 +232,7 @@ async def measure_quality(
     timeout: float = 1800.0,
     width: int = 0,
     height: int = 0,
+    cancel_event: asyncio.Event | None = None,
 ) -> QualityScore | None:
     """Compare ``distorted`` against ``reference``.
 
@@ -216,6 +240,9 @@ async def measure_quality(
     to it.  Left at 0 with ``scale_to_reference`` the reference is probed for
     it.  Returns ``None`` when nothing could be measured - callers that gate on
     quality must treat that as "unknown", not as "fine".
+
+    ``cancel_event`` stops the running comparison; that raises
+    :class:`ffmpeg.FFmpegCancelled` instead of returning ``None``.
     """
     if scale_to_reference and not (width > 0 and height > 0):
         try:
@@ -229,13 +256,15 @@ async def measure_quality(
 
     metric = await available_metric()
     if metric == "vmaf":
-        score = await _measure_vmaf(reference, distorted, threads, width, height, timeout)
+        score = await _measure_vmaf(
+            reference, distorted, threads, width, height, timeout, cancel_event
+        )
         if score is not None:
             return QualityScore(value=score, metric="vmaf", vmaf_estimate=score)
         # A failed VMAF run is worth retrying as SSIM rather than giving up.
         metric = "ssim"
     if metric == "ssim":
-        ssim = await _measure_ssim(reference, distorted, width, height, timeout)
+        ssim = await _measure_ssim(reference, distorted, width, height, timeout, cancel_event)
         if ssim is not None:
             return QualityScore(value=ssim, metric="ssim", vmaf_estimate=ssim_to_vmaf(ssim))
         return None
@@ -243,7 +272,9 @@ async def measure_quality(
     return None
 
 
-async def measure_grain(sample_path: str, timeout: float = 300.0) -> float:
+async def measure_grain(
+    sample_path: str, timeout: float = 300.0, cancel_event: asyncio.Event | None = None,
+) -> float:
     """Estimate how much film grain / sensor noise a clip carries (0..1).
 
     Denoise the clip and compare it against itself: the more the denoiser
@@ -251,12 +282,17 @@ async def measure_grain(sample_path: str, timeout: float = 300.0) -> float:
     classic case where naive AV1 settings *grow* a file, and the classic case
     where grain synthesis wins big - so it is worth measuring rather than
     guessing.
+
+    ``cancel_event`` stops the probe (raises :class:`ffmpeg.FFmpegCancelled`).
     """
     graph = "split[a][b];[a]hqdn3d=4:4:9:9[den];[b][den]psnr"
     try:
         code, _, err = await ffmpeg.run_simple(
-            ["-i", sample_path, "-lavfi", graph, "-f", "null", "-"], timeout=timeout
+            ["-i", sample_path, "-lavfi", graph, "-f", "null", "-"],
+            timeout=timeout, cancel_event=cancel_event,
         )
+    except ffmpeg.FFmpegCancelled:
+        raise
     except ffmpeg.FFmpegError as exc:
         log.debug("grain probe failed: %s", exc)
         return 0.0

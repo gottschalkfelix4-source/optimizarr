@@ -204,10 +204,13 @@ async def _encode_segment(
     """Encode one extracted segment, return (bytes, duration).
 
     ``cancel_event`` terminates the ffmpeg process when a scan is cancelled -
-    cancelling the task alone would leave it running.
+    cancelling the task alone would leave it running.  That raises
+    :class:`ffmpeg.FFmpegCancelled`, not a failed trial encode.
     """
     args = planner.build_ffmpeg_args(plan, info, segment, dest, quiet_streams=True)
     code, err = await ffmpeg.run_with_progress(args, timeout=timeout, cancel_event=cancel_event)
+    if code != 0 and cancel_event is not None and cancel_event.is_set():
+        raise ffmpeg.FFmpegCancelled("Testencode abgebrochen", code)
     if code != 0:
         raise ffmpeg.FFmpegError(f"Testencode fehlgeschlagen: {err.strip()[-300:]}", code, err)
     size = os.path.getsize(dest) if os.path.exists(dest) else 0
@@ -246,14 +249,24 @@ async def run_samples(
         raw = workdir / f"seg{i}.mkv"
         enc = workdir / f"seg{i}.av1.mkv"
         try:
-            await ffmpeg.extract_segment(info.path, start, duration, str(raw), timeout=300)
+            await ffmpeg.extract_segment(
+                info.path, start, duration, str(raw), timeout=300, cancel_event=cancel_event,
+            )
+        except ffmpeg.FFmpegCancelled:
+            result.error = "abgebrochen"
+            return result
         except ffmpeg.FFmpegError as exc:
             log.debug("segment %d extraction failed: %s", i, exc)
             continue
 
         if measure_grain and i == 0:
             try:
-                result.grain_level = await quality.measure_grain(str(raw))
+                result.grain_level = await quality.measure_grain(
+                    str(raw), cancel_event=cancel_event
+                )
+            except ffmpeg.FFmpegCancelled:
+                result.error = "abgebrochen"
+                return result
             except Exception as exc:  # never let the probe kill the analysis
                 log.debug("grain probe failed: %s", exc)
 
@@ -261,6 +274,9 @@ async def run_samples(
             size, seg_duration = await _encode_segment(
                 plan, info, str(raw), str(enc), timeout=900, cancel_event=cancel_event,
             )
+        except ffmpeg.FFmpegCancelled:
+            result.error = "abgebrochen"
+            return result
         except ffmpeg.FFmpegError as exc:
             result.error = str(exc)
             log.warning("trial encode failed for %s: %s", info.path, exc)
@@ -295,6 +311,37 @@ async def run_samples(
     return result
 
 
+def _next_search_crf(
+    crf: float, move: float, settings: AppSettings, encoder: str,
+    history: list[tuple[float, float]],
+) -> float:
+    """The CRF the quality search tries next; ``crf`` itself means "stop".
+
+    QSV's ICQ moves only 0.43 per CRF step (``planner.hw_quality``), so a
+    neighbouring CRF often lands on the same ICQ - an identical encode that
+    costs a full trial and teaches nothing, and whose flat slope then sends
+    the secant off course.  For QSV the step is therefore extended until the
+    ICQ actually changes; a candidate whose ICQ was measured before (the other
+    end of the bracket) ends the search instead.
+    """
+    nxt = planner.clamp_crf(round(crf + move), settings)
+    if encoder != "av1_qsv" or nxt == crf:
+        return nxt
+    current = planner.hw_quality(crf, encoder)
+    measured = {planner.hw_quality(c, encoder) for c, _ in history}
+    direction = 1.0 if nxt > crf else -1.0
+    while True:
+        value = planner.hw_quality(nxt, encoder)
+        if value not in measured:
+            return nxt
+        if value != current:
+            return crf
+        further = planner.clamp_crf(nxt + direction, settings)
+        if further == nxt:
+            return crf
+        nxt = further
+
+
 async def search_crf_for_quality(
     info: ffmpeg.MediaInfo,
     plan: EncodePlan,
@@ -326,7 +373,12 @@ async def search_crf_for_quality(
     position = planner.sample_positions(info.duration, 1, 0.15)[0]
     seg_len = min(float(settings.analysis.sample_duration), 15.0)
     try:
-        await ffmpeg.extract_segment(info.path, position, seg_len, str(seg), timeout=300)
+        await ffmpeg.extract_segment(
+            info.path, position, seg_len, str(seg), timeout=300, cancel_event=cancel_event,
+        )
+    except ffmpeg.FFmpegCancelled:
+        notes.append("Qualitaetssuche abgebrochen.")
+        return plan.crf, None, notes
     except ffmpeg.FFmpegError as exc:
         notes.append(f"Qualitaetssuche uebersprungen: Referenzsegment nicht lesbar ({exc})")
         return plan.crf, None, notes
@@ -345,15 +397,20 @@ async def search_crf_for_quality(
             await _encode_segment(
                 trial_plan, info, str(seg), str(out), timeout=900, cancel_event=cancel_event,
             )
+            score = await quality.measure_quality(
+                str(seg), str(out), threads=4, cancel_event=cancel_event,
+            )
+        except ffmpeg.FFmpegCancelled:
+            notes.append("Qualitaetssuche abgebrochen.")
+            break
         except ffmpeg.FFmpegError as exc:
             notes.append(f"Qualitaetssuche abgebrochen: {exc}")
             break
-
-        score = await quality.measure_quality(str(seg), str(out), threads=4)
-        try:
-            out.unlink(missing_ok=True)
-        except OSError:
-            pass
+        finally:
+            try:
+                out.unlink(missing_ok=True)
+            except OSError:
+                pass
         if score is None:
             notes.append("Qualitaet konnte nicht gemessen werden - Standard-CRF wird verwendet.")
             break
@@ -383,7 +440,7 @@ async def search_crf_for_quality(
                 if 0.15 < measured < 4.0:
                     slope = measured
         move = max(-6.0, min(6.0, gap / slope))
-        next_crf = planner.clamp_crf(round(crf + move), settings)
+        next_crf = _next_search_crf(crf, move, settings, plan.encoder, history)
         if abs(next_crf - crf) < 1:
             break
         crf = next_crf

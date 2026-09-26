@@ -29,7 +29,7 @@ def test_compare_graph_scales_to_the_known_size_with_named_pads():
 def test_measure_quality_hands_the_reference_size_to_the_graph(monkeypatch):
     seen = []
 
-    async def fake_run(args, timeout=None):
+    async def fake_run(args, timeout=None, cancel_event=None):
         seen.append(args[args.index("-lavfi") + 1])
         return 0, "", "[Parsed_ssim_4 @ 0x1] SSIM Y:0.99 All:0.985 (18.2)"
 

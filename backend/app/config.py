@@ -245,7 +245,10 @@ class QueueSettings(BaseModel):
     schedule_start: str = Field("22:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
     schedule_end: str = Field("07:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
     schedule_days: list[int] = Field(default_factory=lambda: [0, 1, 2, 3, 4, 5, 6])
-    cpu_threads: int = Field(0, ge=0, description="0 = all cores (SVT-AV1 lp parameter)")
+    cpu_threads: int = Field(
+        0, ge=0,
+        description="0 = all cores; limits SVT-AV1 (pin) and the decoder threads per job",
+    )
     nice_level: int = Field(10, ge=-20, le=19)
     min_free_disk_gb: int = Field(20, ge=0, description="Refuse to start a job below this")
 

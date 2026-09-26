@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from .api import (
     routes_advisor, routes_jobs, routes_library, routes_movies, routes_series, routes_system,
 )
-from .config import CONFIG_DIR, TRANSCODE_DIR, load_settings, save_settings
+from .config import AppSettings, CONFIG_DIR, TRANSCODE_DIR, load_settings, save_settings
 from .core import hwaccel, notify, scanner, worker
 from .core.events import bus
 from .db import engine, session_scope
@@ -137,6 +137,52 @@ def _clean_transcode_dir() -> None:
         log.info("removed %d leftover temporary file(s) from %s", removed, TRANSCODE_DIR)
 
 
+#: The recycle folder every installation got before the per-library default.
+LEGACY_TRASH_DIR = "/config/trash"
+TRASH_MIGRATION_MARKER = "trash-dir-migration.done"
+
+
+def _migrate_trash_dir(settings: AppSettings) -> bool:
+    """Once: move a stored ``/config/trash`` over to the per-library default.
+
+    ``/config/trash`` was the default, and the first start writes every default
+    into the database - so it is stored on every older installation, chosen
+    or not.  It lies on the appdata share: every recycled original was copied
+    across filesystems instead of renamed.  Empty means
+    ``<library>/.optimizarr-trash`` on the same filesystem.  What is already in
+    ``/config/trash`` stays there; ``purge_trash`` keeps cleaning that folder.
+
+    Returns whether the setting changed (the caller saves it).  Runs once, so
+    a later deliberate choice of ``/config/trash`` is left alone.
+    """
+    marker = CONFIG_DIR / TRASH_MIGRATION_MARKER
+    try:
+        if marker.exists():
+            return False
+    except OSError:
+        return False
+    changed = settings.output.trash_dir.rstrip("/") == LEGACY_TRASH_DIR
+    if changed:
+        settings.output.trash_dir = ""
+        with session_scope() as s:
+            s.add(HistoryEntry(
+                level="info", category="system",
+                message=(
+                    "Papierkorb umgestellt: statt /config/trash liegt er jetzt als "
+                    ".optimizarr-trash im jeweiligen Bibliotheksordner (gleiches Dateisystem, "
+                    "kein Kopieren mehr). Bereits vorhandene Dateien in /config/trash bleiben "
+                    "dort und werden nach Ablauf der Aufbewahrungszeit geloescht."
+                ),
+            ))
+        log.info("trash folder moved from %s to the per-library default", LEGACY_TRASH_DIR)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(utcnow().isoformat() + "\n")
+    except OSError as exc:
+        log.warning("could not write %s: %s", marker, exc)
+    return changed
+
+
 # Background tasks started by the lifespan.  asyncio only keeps weak
 # references to tasks, so an unreferenced one can vanish mid-run.
 _background: set[asyncio.Task] = set()
@@ -161,11 +207,18 @@ async def lifespan(app: FastAPI):
         settings.security.auth_enabled = False
         log.warning("OPTIMIZARR_RESET_AUTH is set: login switched off. "
                     "Set a new password in the settings and remove the variable.")
+    _migrate_trash_dir(settings)
     save_settings(settings)  # materialise defaults on first run
 
     bus.bind_loop(asyncio.get_running_loop())
     _recover_orphans()
     _clean_transcode_dir()
+
+    # Samples from the old GPU quality handling go before the first fit.
+    try:
+        await asyncio.to_thread(worker.reset_legacy_hw_samples, CONFIG_DIR)
+    except Exception:
+        log.warning("could not clean up the old GPU learning samples", exc_info=True)
 
     # Fit the predictor on whatever history already exists.
     try:

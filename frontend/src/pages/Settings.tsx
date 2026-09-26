@@ -1694,7 +1694,7 @@ function QueueTab({ draft, update }: { draft: Settings; update: UpdateFn }) {
           </Field>
           <Field
             label="CPU-Threads"
-            hint="0 nutzt alle Kerne. Niedriger setzen, wenn parallel noch andere Dienste laufen."
+            hint="0 nutzt alle Kerne. Begrenzt pro Job den SVT-AV1-Encoder und die Decoder-Threads – niedriger setzen, wenn parallel noch andere Dienste laufen."
           >
             <NumberField
               value={draft.queue.cpu_threads}
