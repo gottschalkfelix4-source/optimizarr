@@ -15,9 +15,10 @@ RUN npm run build
 # Stage 2 - runtime
 #
 # jellyfin-ffmpeg is used rather than Debian's ffmpeg: it ships the Intel
-# QSV/VAAPI stack pre-wired (oneVPL, iHD driver, SVT-AV1, libvmaf), which is
-# exactly the combination this application needs and the hardest part to get
-# right by hand.
+# QSV/VAAPI stack pre-wired (oneVPL, iHD driver, SVT-AV1), which is exactly
+# the combination this application needs and the hardest part to get right by
+# hand.  It has no libvmaf (checked with jellyfin-ffmpeg 7.1): quality is
+# measured with SSIM and mapped onto the VMAF scale, see core/quality.py.
 # ---------------------------------------------------------------------------
 FROM debian:trixie-slim
 
@@ -45,13 +46,13 @@ RUN set -eux; \
         /etc/apt/sources.list.d/debian.sources; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        ca-certificates curl gnupg tzdata gosu procps tini \
+        ca-certificates curl gnupg tzdata procps tini util-linux \
         python3 python3-pip \
         libva2 libva-drm2 vainfo \
         intel-media-va-driver-non-free \
         mesa-va-drivers; \
     \
-    # --- jellyfin-ffmpeg (Intel QSV/VAAPI + SVT-AV1 + libvmaf) ---
+    # --- jellyfin-ffmpeg (Intel QSV/VAAPI + SVT-AV1) ---
     install -d -m 0755 /etc/apt/keyrings; \
     curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key \
         | gpg --dearmor -o /etc/apt/keyrings/jellyfin.gpg; \

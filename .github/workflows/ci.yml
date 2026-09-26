@@ -52,6 +52,10 @@ jobs:
       - run: npm ci
         working-directory: frontend
 
+      - name: Tests
+        run: npm test
+        working-directory: frontend
+
       - name: Typen pruefen
         run: npx tsc --noEmit
         working-directory: frontend
@@ -107,12 +111,22 @@ jobs:
           docker run -d --name smoke -p 8080:8080 \
             -e PUID=0 -e PGID=0 \
             ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}
+          trap 'docker rm -f smoke > /dev/null 2>&1 || true' EXIT
           for i in $(seq 1 30); do
             if curl -sf http://127.0.0.1:8080/api/health > /dev/null; then
               echo "Container antwortet."
-              docker exec smoke ffmpeg -hide_banner -encoders 2>/dev/null \
-                | grep -q libsvtav1 && echo "SVT-AV1 vorhanden."
-              docker rm -f smoke
+              # Captured first: `| grep -q` would end the pipe early, and with
+              # pipefail the SIGPIPE on ffmpeg fails the step even on success.
+              encoders="$(docker exec smoke ffmpeg -hide_banner -encoders 2>/dev/null || true)"
+              missing=""
+              for enc in libsvtav1 av1_qsv av1_vaapi libopus; do
+                grep -qw "${enc}" <<< "${encoders}" || missing="${missing} ${enc}"
+              done
+              if [ -n "${missing}" ]; then
+                echo "Im Image fehlen Encoder:${missing}"
+                exit 1
+              fi
+              echo "Encoder vorhanden: libsvtav1 av1_qsv av1_vaapi libopus."
               exit 0
             fi
             sleep 3
