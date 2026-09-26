@@ -288,3 +288,19 @@ def test_dolby_vision_switch_only_where_needed():
     _, args = build("av1_vaapi", info=dv8_info())
     assert "-dolbyvision:v" not in args
     assert value_of(args, "-color_trc:v") == "smpte2084"
+
+
+def test_a_lock_left_held_by_a_dead_loop_does_not_block_detection(monkeypatch):
+    """A detection cut off with its event loop must not wedge every later one."""
+    async def hold_forever():
+        await hwaccel._detect_lock().acquire()
+
+    loop = asyncio.new_event_loop()
+    loop.run_until_complete(hold_forever())
+    loop.close()
+
+    async def cached():
+        return await asyncio.wait_for(hwaccel.detect("/dev/dri/renderD128"), timeout=2)
+
+    monkeypatch.setattr(hwaccel, "_report", hwaccel.HardwareReport(device="/dev/dri/renderD128"))
+    assert asyncio.run(cached()).device == "/dev/dri/renderD128"

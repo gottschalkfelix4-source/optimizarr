@@ -101,7 +101,22 @@ class HardwareReport:
 
 
 _report: HardwareReport | None = None
-_lock = asyncio.Lock()
+_lock: asyncio.Lock | None = None
+_lock_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _detect_lock() -> asyncio.Lock:
+    """One lock per event loop.
+
+    A module-level lock taken by a detection that dies with its loop (a task
+    cut off at shutdown, a TestClient closing) stays locked forever, and every
+    later ``detect()`` - on a new loop - would wait on it for good.
+    """
+    global _lock, _lock_loop
+    loop = asyncio.get_running_loop()
+    if _lock is None or _lock_loop is not loop:
+        _lock, _lock_loop = asyncio.Lock(), loop
+    return _lock
 
 
 def _find_vainfo() -> str | None:
@@ -283,7 +298,7 @@ async def detect(device: str = "/dev/dri/renderD128", low_power: bool = True,
                  force: bool = False) -> HardwareReport:
     """Probe the host GPU.  Result is cached until ``force=True``."""
     global _report
-    async with _lock:
+    async with _detect_lock():
         if _report is not None and not force and _report.device == device:
             return _report
 
