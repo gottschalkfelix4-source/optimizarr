@@ -5,7 +5,7 @@
   <Registry>https://github.com/gottschalkfelix4-source/optimizarr/pkgs/container/optimizarr</Registry>
   <Branch>
     <Tag>latest</Tag>
-    <TagDescription>Aktuelle stabile Version</TagDescription>
+    <TagDescription>Neuester Stand des main-Branches - wird bei jedem Commit neu gebaut, keine gesonderte Release-Version</TagDescription>
   </Branch>
   <Network>bridge</Network>
   <MyIP/>
@@ -31,22 +31,36 @@
 
     Eine Datei wird nur dann ersetzt, wenn das Ergebnis kleiner UND technisch einwandfrei
     ist. Faellt eine der Pruefungen durch, wird das Ergebnis verworfen und das Original
-    bleibt unangetastet. Originale wandern standardmaessig in einen Papierkorb-Ordner.
+    bleibt unangetastet. Ersetzte Originale wandern standardmaessig in einen Papierkorb im
+    jeweiligen Bibliotheksordner (.optimizarr-trash) - auf demselben Dateisystem, also ohne
+    Kopieren. Ein anderer Ort laesst sich in den Einstellungen festlegen.
+
+    HDR10 und HLG bleiben erhalten (bei HDR10+ die HDR10-Basis, die dynamischen
+    Metadaten entfallen). Dolby Vision Profil 5 wird nie umgewandelt (es hat keine
+    HDR10-Basis, das Ergebnis haette falsche Farben). Profil 7 und 8 werden
+    standardmaessig uebersprungen; in den Einstellungen (Analyse) laesst sich eine Umwandlung
+    mit HDR10-Fallback einschalten - die Dolby-Vision-Ebene entfaellt dann, HDR10 bleibt.
 
     Intel-Grafik wird automatisch erkannt: Arc- und Core-Ultra-GPUs kodieren AV1 in
     Hardware, aeltere iGPUs uebernehmen zumindest das Dekodieren, und ohne GPU laeuft
     alles auf der CPU mit SVT-AV1. Alle Einstellungen werden in der Weboberflaeche
     vorgenommen - es gibt keine Konfigurationsdateien und keine Umgebungsvariablen fuer
-    das Verhalten.
+    das Verhalten (einzige Ausnahme: der Notausgang OPTIMIZARR_RESET_AUTH, falls das
+    Passwort vergessen wurde).
 
     Wichtig: /dev/dri muss durchgereicht werden, damit die GPU genutzt werden kann
     (unten unter "Intel GPU" bereits vorbereitet).
+
+    Zugangsschutz: Ab Werk ist die Weboberflaeche ohne Anmeldung erreichbar - jeder im
+    Netzwerk kann Einstellungen aendern und Konvertierungen starten. Unter Einstellungen >
+    Sicherheit laesst sich eine Anmeldung mit Benutzername und Passwort (HTTP Basic Auth)
+    einschalten.
   </Overview>
   <Category>MediaApp:Video Tools: Status:Stable</Category>
   <WebUI>http://[IP]:[PORT:8080]/</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/gottschalkfelix4-source/optimizarr/main/unraid/optimizarr.xml</TemplateURL>
   <Icon>https://raw.githubusercontent.com/gottschalkfelix4-source/optimizarr/main/unraid/icon.png</Icon>
-  <ExtraParams>--device=/dev/dri:/dev/dri</ExtraParams>
+  <ExtraParams/>
   <PostArgs/>
   <CPUset/>
   <DateInstalled/>
@@ -68,7 +82,7 @@
           Target="/config"
           Default="/mnt/user/appdata/optimizarr"
           Mode="rw"
-          Description="Datenbank, Einstellungen und Papierkorb fuer ersetzte Originale. Sollte auf dem Cache liegen."
+          Description="Datenbank und Einstellungen. Sollte auf dem Cache liegen."
           Type="Path"
           Display="always"
           Required="true"
@@ -143,4 +157,14 @@
           Display="advanced"
           Required="false"
           Mask="false">Europe/Berlin</Config>
+
+  <Config Name="OPTIMIZARR_RESET_AUTH"
+          Target="OPTIMIZARR_RESET_AUTH"
+          Default=""
+          Mode=""
+          Description="Notausgang fuer die Anmeldung: 1 schaltet den Zugangsschutz beim naechsten Start ab (z. B. bei vergessenem Passwort). Danach wieder leeren und in der Weboberflaeche ein neues Passwort setzen."
+          Type="Variable"
+          Display="advanced"
+          Required="false"
+          Mask="false"></Config>
 </Container>

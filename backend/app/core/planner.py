@@ -5,13 +5,13 @@ happen, and so a queued job survives a container restart.
 """
 from __future__ import annotations
 
-import math
+import os
 import shlex
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from ..config import AppSettings
-from .ffmpeg import MediaInfo
+from .ffmpeg import MediaInfo, is_dolby_vision
 from .hwaccel import HardwareReport
 
 # SVT-AV1 preset (0 slow .. 13 fast) mapped onto the 1..7 scale QSV uses.
@@ -113,6 +113,10 @@ class EncodePlan:
     def describe(self) -> str:
         """One-line human summary for the UI."""
         bits = [f"{self.encoder}", f"CRF {self.crf:g}"]
+        if self.encoder == "av1_vaapi":
+            bits[-1] += f" (q_idx {hw_quality(self.crf, self.encoder)})"
+        elif self.encoder == "av1_qsv":
+            bits[-1] += f" (ICQ {hw_quality(self.crf, self.encoder)})"
         if self.encoder == "libsvtav1":
             bits.append(f"Preset {self.preset}")
         if self.pix_fmt.endswith("10le"):
@@ -339,6 +343,11 @@ def build_plan(
         plan.pix_fmt = "yuv420p10le" if wants_10bit else "yuv420p"
     if wants_10bit and info.bit_depth < 10:
         plan.notes.append("Encoding in 10 Bit - komprimiert auch 8-Bit-Quellen effizienter")
+    if is_dolby_vision(info.hdr_format):
+        plan.notes.append(
+            "Dolby Vision: uebernommen wird nur die HDR10-Basis (Farbraum, Mastering-Display, "
+            "Helligkeitswerte) - die Dolby-Vision-Ebene entfaellt."
+        )
 
     # --- resolution cap ---
     if cfg.max_width and info.width > cfg.max_width and info.height:
@@ -462,12 +471,67 @@ def _vaapi_format(pix_fmt: str) -> str:
     return "p010" if pix_fmt in ("p010le", "p010") else pix_fmt
 
 
+#: The app thinks in SVT-AV1 CRF (0-63): settings, the analyzer's quality
+#: search and the advisor all move that one number.  The GPU encoders have
+#: their own scales, and passing CRF through unchanged was badly wrong for both
+#: - VAAPI ignored it entirely (see ``vaapi_encoder_args``), QSV read it on a
+#: much steeper scale (ICQ 20 came out as large as the H.264 source, ICQ 30 at
+#: half the size of SVT-AV1 CRF 30 and 4.6 VMAF points below it).
+#:
+#: Both mappings are measured, not guessed: SVT-AV1 (preset 6, 10 bit) at CRF
+#: 22/26/30/34/38 against sweeps of each GPU encoder on an Arc A380, on two
+#: 1080p H.264 web sources and a 4K HDR10 HEVC source, matched on VMAF against
+#: the source.  Equal-VMAF points per CRF:
+#:
+#:     CRF            22     26     30     34     38
+#:     VAAPI q_idx    57-74  68-73  81-99  92-103 103-122   -> 3 x CRF
+#:     QSV ICQ        22-24  24     25-27  26-28  28-30     -> 13 + 0.43 x CRF
+#:
+#: The spread between sources is what a fixed-QP hardware encoder does
+#: compared with SVT-AV1's adaptive quantisation; the per-file quality search
+#: moves CRF (and with it these values) to where the VMAF target is met.
+VAAPI_QIDX_PER_CRF = 3.0
+QSV_ICQ_BASE = 13.0
+QSV_ICQ_PER_CRF = 0.43
+
+
+def hw_quality(crf: float, encoder: str) -> int | float:
+    """The value the given encoder needs for quality comparable to ``crf``.
+
+    * ``av1_vaapi``: AV1 ``q_idx`` (0-255) for constant-QP rate control.
+    * ``av1_qsv``: ICQ quality (1-51); larger values are clamped by the driver.
+    * anything else: the CRF itself.
+    """
+    if encoder == "av1_vaapi":
+        return int(min(255, max(1, round(crf * VAAPI_QIDX_PER_CRF))))
+    if encoder == "av1_qsv":
+        return int(min(51, max(1, round(QSV_ICQ_BASE + crf * QSV_ICQ_PER_CRF))))
+    return crf
+
+
+def hw_device_args(encoder: str, device: str) -> list[str]:
+    """Device setup for a GPU encoder - shared with the hardware probe.
+
+    One named device for decoder, filters and encoder.  For VAAPI,
+    ``-vaapi_device`` plus ``-hwaccel_device <path>`` opened the render node
+    twice, and ffmpeg then handed the filters "vaapi1" while the frames lived
+    on the other one.
+    """
+    if encoder == "av1_qsv":
+        return ["-init_hw_device", f"qsv=hw,child_device={device}", "-filter_hw_device", "hw"]
+    if encoder == "av1_vaapi":
+        return ["-init_hw_device", f"vaapi=va:{device}", "-filter_hw_device", "va"]
+    return []
+
+
 def qsv_encoder_args(crf: float, preset: int, keyint: int, low_power: bool) -> list[str]:
     """The av1_qsv encoder arguments - one source of truth.
 
     Kept here rather than inline so the hardware probe in ``hwaccel.py`` tests
     exactly what the real encode runs.  A probe that verifies a different
     configuration is how a broken encode gets declared working.
+
+    ``crf`` is on the app's SVT-AV1 scale and translated by :func:`hw_quality`.
 
     Two options are deliberately absent:
 
@@ -489,7 +553,7 @@ def qsv_encoder_args(crf: float, preset: int, keyint: int, low_power: bool) -> l
     # reads as if the audio were at fault.
     args = [
         "-c:v", "av1_qsv",
-        "-global_quality:v", f"{crf:g}",
+        "-global_quality:v", str(hw_quality(crf, "av1_qsv")),
         "-preset:v", str(_QSV_PRESET_MAP.get(preset, 4)),
         "-g:v", str(keyint),
     ]
@@ -500,14 +564,47 @@ def qsv_encoder_args(crf: float, preset: int, keyint: int, low_power: bool) -> l
     return args
 
 
+def vaapi_encoder_args(crf: float, keyint: int) -> list[str]:
+    """The av1_vaapi encoder arguments - shared with the hardware probe.
+
+    ``av1_vaapi`` has no ``-qp`` option: ffmpeg only warns that "qp:v has not
+    been used", then encodes at its built-in default (q_idx 25, near
+    lossless) whatever the plan says - every setting from 10 to 40 produced
+    byte-identical files.  Constant QP takes its value from
+    ``-global_quality``, as an AV1 ``q_idx`` (0-255).
+    """
+    return [
+        "-c:v", "av1_vaapi",
+        "-rc_mode:v", "CQP",
+        "-global_quality:v", str(hw_quality(crf, "av1_vaapi")),
+        "-g:v", str(keyint),
+    ]
+
+
 def _svtav1_params(plan: EncodePlan) -> str:
     params = [f"tune={plan.tune}"]
     if plan.film_grain:
         params.append(f"film-grain={plan.film_grain}")
         params.append(f"film-grain-denoise={plan.film_grain_denoise}")
     if plan.threads:
-        params.append(f"lp={plan.threads}")
+        # Since SVT-AV1 2.0 `lp` is a *level of parallelism* (1-6, anything
+        # higher silently means 6), not a thread count: lp=8 on a 40-core box
+        # limited nothing.  `pin=N` confines the encoder to N cores and picks
+        # a matching level itself - measured on SVT-AV1 3.1: pin=1 ~1 core,
+        # pin=4 ~4 cores, also inside a container cpuset.
+        params.append(f"pin={cpu_limit(plan.threads)}")
     return ":".join(params)
+
+
+def cpu_limit(threads: int) -> int:
+    """``queue.cpu_threads`` as a core count this machine can honour (0 = no limit)."""
+    if threads <= 0:
+        return 0
+    try:
+        available = len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        available = os.cpu_count() or threads
+    return max(1, min(int(threads), available))
 
 
 def build_ffmpeg_args(
@@ -526,8 +623,8 @@ def build_ffmpeg_args(
     args: list[str] = ["-y"]
 
     hw_frames_in = False
+    args += hw_device_args(plan.encoder, plan.hw_device)
     if plan.encoder == "av1_qsv":
-        args += ["-init_hw_device", f"qsv=hw,child_device={plan.hw_device}", "-filter_hw_device", "hw"]
         if plan.hw_decode:
             args += ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv", "-hwaccel_device", "hw"]
             # Frame pools cannot grow at runtime, so the decoder's has to be
@@ -536,17 +633,16 @@ def build_ffmpeg_args(
             args += ["-extra_hw_frames", str(max(0, plan.extra_hw_frames))]
             hw_frames_in = True
     elif plan.encoder == "av1_vaapi":
-        # One named device for decoder, filters and encoder.  `-vaapi_device`
-        # plus `-hwaccel_device <path>` opened the render node twice, and ffmpeg
-        # then hands the filters "vaapi1" while the frames live on the other one.
-        args += ["-init_hw_device", f"vaapi=va:{plan.hw_device}", "-filter_hw_device", "va"]
         if plan.hw_decode:
             args += ["-hwaccel", "vaapi", "-hwaccel_device", "va",
                      "-hwaccel_output_format", "vaapi"]
             hw_frames_in = True
     elif plan.hw_decode:
-        args += ["-hwaccel", "vaapi", "-hwaccel_device", plan.hw_device,
-                 "-hwaccel_output_format", "nv12"]
+        # Decode on the GPU for a CPU encoder.  No -hwaccel_output_format: ffmpeg
+        # then downloads every frame in the decoder's own format - p010 for a
+        # 10-bit source, nv12 for 8-bit.  Forcing nv12 here truncated HDR and
+        # every other 10-bit source to 8 bit before the 10-bit encode.
+        args += ["-hwaccel", "vaapi", "-hwaccel_device", plan.hw_device]
 
     if plan.is_hardware:
         # Many MKVs only tag their colour space a few frames in ("video
@@ -559,6 +655,11 @@ def build_ffmpeg_args(
         # with CPU decoding.
         # Input option: must precede -i.
         args += ["-reinit_filter", "0"]
+
+    if plan.threads and cpu_limit(plan.threads):
+        # Input option: caps the decoder's threads.  The SVT-AV1 encoder is
+        # capped separately (pin=, see _svtav1_params).
+        args += ["-threads", str(cpu_limit(plan.threads))]
 
     if start_offset:
         args += ["-ss", f"{start_offset:.3f}"]
@@ -601,11 +702,16 @@ def build_ffmpeg_args(
         if params:
             args += ["-svtav1-params:v", params]
         args += ["-g:v", str(plan.keyint_frames)]
+        if is_dolby_vision(info.hdr_format):
+            # Only the HDR10 base layer is carried over.  Stated explicitly so
+            # no build ever starts writing RPUs next to a re-encoded picture
+            # they no longer describe (live check with jellyfin-ffmpeg 7.1:
+            # no DOVI record, mastering display and CLL preserved).
+            args += ["-dolbyvision:v", "0"]
     elif plan.encoder == "av1_qsv":
         args += qsv_encoder_args(plan.crf, plan.preset, plan.keyint_frames, plan.low_power)
     elif plan.encoder == "av1_vaapi":
-        args += ["-c:v", "av1_vaapi", "-qp:v", f"{plan.crf:g}",
-                 "-g:v", str(plan.keyint_frames)]
+        args += vaapi_encoder_args(plan.crf, plan.keyint_frames)
     else:
         raise ValueError(f"unsupported encoder {plan.encoder}")
 
@@ -703,14 +809,3 @@ def clamp_crf(value: float, settings: AppSettings) -> float:
     lo = float(min(settings.encoding.crf_min, settings.encoding.crf_max))
     hi = float(max(settings.encoding.crf_min, settings.encoding.crf_max))
     return max(lo, min(hi, value))
-
-
-def qp_for_encoder(crf: float, encoder: str) -> float:
-    """QSV/VAAPI quality scales are close enough to CRF to reuse it directly.
-
-    VAAPI QP tends to run a touch hotter than SVT-AV1 CRF, so shave a little to
-    land on comparable quality.
-    """
-    if encoder == "av1_vaapi":
-        return max(1.0, math.floor(crf * 0.95))
-    return crf

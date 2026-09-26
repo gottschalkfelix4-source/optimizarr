@@ -3,9 +3,10 @@
 #
 # Unraid expects containers to write files as 99:100 (nobody:users), so the app
 # drops from root to PUID:PGID.  The one thing that must happen before dropping
-# is joining whatever group owns /dev/dri - otherwise the render node is
-# invisible to the unprivileged user and every hardware encode fails with a
-# confusing permission error.
+# is joining whatever group owns /dev/dri - and dropping in a way that keeps
+# those supplementary groups - otherwise the render node is invisible to the
+# unprivileged user and every hardware encode fails with a confusing
+# permission error.
 set -euo pipefail
 
 PUID="${PUID:-99}"
@@ -67,5 +68,12 @@ fi
 chown -R "${PUID}:${PGID}" "${OPTIMIZARR_CONFIG_DIR:-/config}" 2>/dev/null || true
 chown "${PUID}:${PGID}" "${OPTIMIZARR_TRANSCODE_DIR:-/transcode}" 2>/dev/null || true
 
-log "starting as ${USER_NAME}:${GROUP_NAME} (${PUID}:${PGID}), umask ${UMASK}"
-exec gosu "${PUID}:${PGID}" "$@"
+# --- drop privileges ----------------------------------------------------------
+# The supplementary groups granted above only take effect if the switch
+# initialises them from /etc/group.  `gosu uid:gid` does not: the process ran
+# with an empty group list and could open the render node only because Unraid
+# happens to make /dev/dri world-writable.  setpriv --init-groups calls
+# initgroups() for the user behind PUID, with PGID as the primary group.
+export HOME="$(getent passwd "${PUID}" | cut -d: -f6)"
+log "starting as ${USER_NAME}:${GROUP_NAME} (${PUID}:${PGID}), groups: $(id -Gn "${USER_NAME}" | tr ' ' ','), umask ${UMASK}"
+exec setpriv --reuid="${PUID}" --regid="${PGID}" --init-groups "$@"

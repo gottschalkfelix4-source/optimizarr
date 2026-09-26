@@ -179,10 +179,12 @@ async def _smoke_test(
     from . import planner  # local import: planner imports this module
 
     src = ["-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=24", "-frames:v", "120"]
+    # Device setup and encoder arguments come from the planner, so the probe
+    # runs what production runs (an earlier copy here opened VAAPI through
+    # -vaapi_device and passed a -qp that av1_vaapi does not even have).
     if encoder == "av1_qsv":
         args = [
-            "-init_hw_device", f"qsv=hw,child_device={device}",
-            "-filter_hw_device", "hw",
+            *planner.hw_device_args("av1_qsv", device),
             *src,
             "-vf", f"format={pix_fmt},hwupload=extra_hw_frames=64",
             *planner.qsv_encoder_args(30, 6, 120, low_power),
@@ -190,16 +192,15 @@ async def _smoke_test(
         ]
     elif encoder == "av1_vaapi":
         args = [
-            "-vaapi_device", device,
+            *planner.hw_device_args("av1_vaapi", device),
             *src,
             "-vf", f"format={pix_fmt},hwupload",
-            "-c:v", "av1_vaapi", "-qp", "30",
+            *planner.vaapi_encoder_args(30, 120),
             "-f", "null", "-",
         ]
     elif encoder == "hevc_qsv":
         args = [
-            "-init_hw_device", f"qsv=hw,child_device={device}",
-            "-filter_hw_device", "hw",
+            *planner.hw_device_args("av1_qsv", device),
             *src,
             "-vf", f"format={pix_fmt},hwupload=extra_hw_frames=64",
             "-c:v", "hevc_qsv", "-global_quality", "28",
@@ -221,15 +222,18 @@ async def _smoke_test(
     return False, first_error_line(err)
 
 
-async def _decode_path_test(device: str, low_power: bool, pix_fmt: str) -> tuple[bool, str]:
+async def _decode_path_test(
+    encoder: str, device: str, low_power: bool, pix_fmt: str
+) -> tuple[bool, str]:
     """Does the whole decode -> convert -> encode chain hold up?
 
     Encoding from a generated pattern proves the encoder works; it says nothing
     about decoding on the GPU and handing surfaces straight to the encoder,
     which is where a full-hardware transcode actually tends to break.  So this
-    builds a throwaway 8-bit H.264 file and runs the exact command shape the
-    planner produces - including the 8-to-10-bit conversion the encoder cannot
-    do by itself.
+    builds a throwaway 8-bit H.264 file and runs it through
+    ``planner.build_ffmpeg_args`` - the exact command a real job gets, for the
+    encoder that will actually be used, including the 8-to-10-bit conversion
+    the encoder cannot do by itself.
 
     A failure here disables GPU *decoding* only.  The encoder stays in use, and
     decoding falls back to the CPU, which costs some throughput but keeps the
@@ -241,6 +245,7 @@ async def _decode_path_test(device: str, low_power: bool, pix_fmt: str) -> tuple
     from . import planner
 
     tmp = _Path(tempfile.gettempdir()) / "optimizarr-hwprobe.mp4"
+    out = _Path(tempfile.gettempdir()) / "optimizarr-hwprobe-out.mkv"
     try:
         code, _, err = await ffmpeg.run_simple([
             "-y", "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=24",
@@ -250,24 +255,24 @@ async def _decode_path_test(device: str, low_power: bool, pix_fmt: str) -> tuple
         if code != 0:
             return False, "Testdatei konnte nicht erzeugt werden"
 
-        code, _, err = await ffmpeg.run_simple([
-            "-y",
-            "-init_hw_device", f"qsv=hw,child_device={device}",
-            "-filter_hw_device", "hw",
-            "-hwaccel", "qsv", "-hwaccel_output_format", "qsv",
-            "-hwaccel_device", "hw", "-extra_hw_frames", "16",
-            "-i", str(tmp), "-map", "0:v:0", "-an", "-sn", "-dn",
-            "-vf", f"vpp_qsv=format={pix_fmt}",
-            *planner.qsv_encoder_args(30, 6, 120, low_power),
-            "-f", "null", "-",
-        ], timeout=180)
+        info = ffmpeg.MediaInfo(
+            path=str(tmp), container="mp4", duration=5.0, video_codec="h264",
+            width=1920, height=1080, fps=24.0, bit_depth=8, pix_fmt="yuv420p",
+        )
+        plan = planner.EncodePlan(
+            encoder=encoder, crf=30, preset=6, pix_fmt=pix_fmt, hw_decode=True,
+            hw_device=device, low_power=low_power, keyint_frames=120,
+        )
+        args = planner.build_ffmpeg_args(plan, info, str(tmp), str(out), quiet_streams=True)
+        code, _, err = await ffmpeg.run_simple(args, timeout=180)
     except ffmpeg.FFmpegError as exc:
         return False, str(exc)
     finally:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
+        for path in (tmp, out):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     if code == 0:
         return True, ""
@@ -360,8 +365,10 @@ async def detect(device: str = "/dev/dri/renderD128", low_power: bool = True,
         # its own often enough to be worth a separate verdict: if it does, only
         # GPU decoding is switched off, and the encoder - the expensive half -
         # keeps running.
-        if rep.encoders["av1_qsv"].verified:
-            ok_decode, decode_reason = await _decode_path_test(device, low_power, "p010le")
+        if rep.recommended_encoder in ("av1_qsv", "av1_vaapi"):
+            ok_decode, decode_reason = await _decode_path_test(
+                rep.recommended_encoder, device, low_power, "p010le"
+            )
             rep.hw_decode_usable = ok_decode
             rep.hw_decode_reason = decode_reason
             if not ok_decode:
@@ -403,30 +410,3 @@ async def detect(device: str = "/dev/dri/renderD128", low_power: bool = True,
 
 def cached() -> HardwareReport | None:
     return _report
-
-
-def build_decode_args(rep: HardwareReport | None, codec: str, enabled: bool,
-                      device: str, for_hw_encoder: bool) -> list[str]:
-    """Input-side hwaccel flags, chosen conservatively.
-
-    Hardware decoding is only worth it when the GPU actually supports the source
-    codec.  Getting this wrong is the #1 cause of green frames, so anything
-    unusual falls back to software decoding.
-    """
-    if not enabled or rep is None or not rep.readable:
-        return []
-    codec = (codec or "").lower()
-    supported = {
-        "h264": rep.decode_h264,
-        "hevc": rep.decode_hevc,
-        "h265": rep.decode_hevc,
-        "vp9": rep.decode_vp9,
-        "av1": rep.decode_av1,
-    }
-    if not supported.get(codec):
-        return []
-    if for_hw_encoder:
-        # Keep frames on the GPU - decode and encode share the same context.
-        return ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
-    # Decode on the GPU, hand plain frames back for the CPU encoder.
-    return ["-hwaccel", "vaapi", "-hwaccel_device", device, "-hwaccel_output_format", "nv12"]

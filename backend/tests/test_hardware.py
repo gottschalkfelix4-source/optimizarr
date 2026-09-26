@@ -362,7 +362,8 @@ def test_consequences_alone_leave_the_verdict_open():
 
 #: Options that configure the video encoder and must never reach audio.
 _VIDEO_ONLY = (
-    "-global_quality", "-preset", "-g", "-qp", "-crf", "-low_power",
+    "-global_quality", "-preset", "-g", "-qp", "-crf", "-low_power", "-rc_mode",
+    "-dolbyvision",
     "-svtav1-params", "-color_primaries", "-color_trc", "-colorspace",
 )
 
@@ -410,7 +411,11 @@ def test_vaapi_options_never_leak_onto_audio():
     plan = planner.build_plan(info, settings, hw=arc_report())
     args = planner.build_ffmpeg_args(plan, info, info.path, "/tmp/out.mkv")
     _assert_all_qualified(args, "av1_vaapi")
-    assert "-qp:v" in args
+    # av1_vaapi has no -qp option (ffmpeg ignores it and encodes at its default
+    # q_idx 25); constant QP reads -global_quality.
+    assert "-qp:v" not in args
+    assert args[args.index("-rc_mode:v") + 1] == "CQP"
+    assert "-global_quality:v" in args
 
 
 def test_colour_metadata_is_qualified_too():

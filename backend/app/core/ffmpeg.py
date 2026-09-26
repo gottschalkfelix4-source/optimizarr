@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -150,6 +151,38 @@ def classify_error_line(line: str) -> str:
     return "other"
 
 
+_DUMP_HEADER = re.compile(r"^(Input|Output) #\d+[,:]")
+
+
+def _diagnostic_lines(log_tail: str) -> list[str]:
+    """The lines of an ffmpeg log that can explain a failure.
+
+    Before it does any work ffmpeg describes its inputs and outputs: file
+    paths, container tags, every stream with its title.  None of that is a
+    diagnosis, but it reads like one to a keyword search - an episode called
+    "Trial and Error", a folder named "Invalid", a track titled "Audio failed
+    take" all used to be reported as the cause and decided whether the GPU got
+    blamed.  So:
+
+    * everything up to ``Stream mapping:`` is setup and dropped - an error that
+      stops ffmpeg earlier ends the log before that line is ever printed;
+    * the ``Input #``/``Output #`` headers are dropped, and with them every
+      indented line, which is how ffmpeg prints the body of those dumps (and
+      of the stream mapping).  Its diagnostics are never indented.
+    """
+    raw = (log_tail or "").splitlines()
+    for i, line in enumerate(raw):
+        if line.strip() == "Stream mapping:":
+            raw = raw[i + 1:]
+            break
+    lines: list[str] = []
+    for line in raw:
+        if not line.strip() or line[:1].isspace() or _DUMP_HEADER.match(line):
+            continue
+        lines.append(line.strip())
+    return lines
+
+
 def first_error_line(log_tail: str) -> str:
     """The most explanatory line from an ffmpeg failure.
 
@@ -162,7 +195,7 @@ def first_error_line(log_tail: str) -> str:
       every audio encoder in the file reports its own error a moment later; the
       loudest line is usually not the one that started it.
     """
-    lines = [ln.strip() for ln in (log_tail or "").splitlines() if ln.strip()]
+    lines = _diagnostic_lines(log_tail)
     candidates: list[tuple[str, str]] = []
     for line in lines:
         lowered = line.lower()
@@ -187,8 +220,7 @@ def failure_is_video(log_tail: str) -> bool:
     audio or the muxer failed, the retry burns hours to fail exactly the same
     way, so it is worth being sure before falling back.
     """
-    lines = [ln.strip() for ln in (log_tail or "").splitlines() if ln.strip()]
-    for line in lines:
+    for line in _diagnostic_lines(log_tail):
         lowered = line.lower()
         if any(noise in lowered for noise in _ERROR_NOISE):
             continue
@@ -204,17 +236,84 @@ def failure_is_video(log_tail: str) -> bool:
     return True
 
 
-async def _run(cmd: list[str], timeout: float | None = None) -> tuple[int, str, str]:
+class FFmpegCancelled(FFmpegError):
+    """The caller's cancel event fired and the process was stopped."""
+
+
+async def _kill(proc: asyncio.subprocess.Process) -> None:
+    """SIGKILL and reap.  Safe to call on a process that already exited.
+
+    Used on every way out that is not a normal exit - a timeout, a cancelled
+    task, an exception in the caller.  An encode that outlives the task that
+    started it keeps a GPU session and several CPU cores busy for hours, and
+    nothing is left that would ever stop it.
+    """
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+    try:
+        await proc.wait()
+    except Exception:  # pragma: no cover - reaping must never mask the real error
+        log.debug("could not reap ffmpeg process %s", proc.pid, exc_info=True)
+
+
+async def _terminate(proc: asyncio.subprocess.Process, grace: float = 10.0) -> None:
+    """SIGTERM, give ffmpeg ``grace`` seconds to finish up, then SIGKILL."""
+    if proc.returncode is not None:
+        return
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=grace)
+    except asyncio.TimeoutError:
+        await _kill(proc)
+
+
+async def _run(
+    cmd: list[str], timeout: float | None = None, cancel_event: asyncio.Event | None = None
+) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        *cmd, stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    communicate = asyncio.ensure_future(proc.communicate())
+    cancelled = (
+        asyncio.ensure_future(cancel_event.wait()) if cancel_event is not None else None
     )
     try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+        waiting = {communicate} if cancelled is None else {communicate, cancelled}
+        done, _ = await asyncio.wait(
+            waiting, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+        )
+        if communicate in done:
+            out, err = communicate.result()
+            return (proc.returncode or 0, out.decode("utf-8", "replace"),
+                    err.decode("utf-8", "replace"))
+        await _kill(proc)
+        if cancelled is not None and cancelled in done:
+            raise FFmpegCancelled(f"abgebrochen: {' '.join(cmd[:4])}", -9)
         raise FFmpegError(f"timeout after {timeout}s: {' '.join(cmd[:4])}")
-    return proc.returncode or 0, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+    except BaseException:
+        # CancelledError included: the task that owns this process is gone, so
+        # the process has to go too.
+        await _kill(proc)
+        raise
+    finally:
+        if cancelled is not None:
+            cancelled.cancel()
+        if not communicate.done():
+            # The pipes close once the process is dead; let communicate() see
+            # EOF rather than leaving a pending task behind.
+            try:
+                await asyncio.wait({communicate}, timeout=5)
+            except BaseException:  # pragma: no cover
+                pass
+            if not communicate.done():
+                communicate.cancel()
 
 
 def _parse_fps(value: str | None) -> float:
@@ -228,6 +327,63 @@ def _parse_fps(value: str | None) -> float:
         return float(value)
     except (ValueError, ZeroDivisionError):
         return 0.0
+
+
+def _to_float(value: Any) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return result if math.isfinite(result) and result > 0 else 0.0
+
+
+def _to_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def parse_duration_tag(value: Any) -> float:
+    """Seconds from a Matroska ``DURATION`` tag, 0.0 if it cannot be read.
+
+    mkvmerge writes ``01:23:45.000000000`` - hours, minutes, and seconds with
+    nanosecond precision - which ``float()`` rejects.  Plain seconds are
+    accepted too.  A broken tag must never make a file unreadable: the
+    duration is a convenience, and the probe falls back to 0.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    if ":" not in text:
+        return _to_float(text)
+    parts = text.split(":")
+    if len(parts) > 3:
+        return 0.0
+    total = 0.0
+    try:
+        for position, part in enumerate(parts[:-1]):
+            if not part.strip().isdigit():
+                return 0.0
+            if position > 0 and int(part) >= 60:  # minutes after hours
+                return 0.0
+            total = total * 60 + int(part)
+        seconds = float(parts[-1])
+    except ValueError:
+        return 0.0
+    if not math.isfinite(seconds) or seconds < 0 or seconds >= 60:
+        return 0.0
+    return total * 60 + seconds
+
+
+def _duration_from_tags(tags: dict[str, Any] | None) -> float:
+    """``DURATION`` or a language-suffixed ``DURATION-eng``, whichever parses."""
+    for key, value in (tags or {}).items():
+        if str(key).upper().split("-", 1)[0] == "DURATION":
+            seconds = parse_duration_tag(value)
+            if seconds > 0:
+                return seconds
+    return 0.0
 
 
 def _bit_depth(stream: dict[str, Any]) -> int:
@@ -331,7 +487,7 @@ async def probe(path: str | Path, timeout: float = 120.0) -> MediaInfo:
             info.size = os.path.getsize(path)
         except OSError:
             pass
-    info.duration = float(fmt.get("duration") or 0.0)
+    info.duration = _to_float(fmt.get("duration"))
     try:
         info.overall_bitrate = int(fmt.get("bit_rate") or 0)
     except (TypeError, ValueError):
@@ -356,8 +512,8 @@ async def probe(path: str | Path, timeout: float = 120.0) -> MediaInfo:
                 "codec": s.get("codec_name", ""),
                 "channels": s.get("channels", 2),
                 "channel_layout": s.get("channel_layout", ""),
-                "bitrate": int(s.get("bit_rate") or 0),
-                "sample_rate": int(s.get("sample_rate") or 0),
+                "bitrate": _to_int(s.get("bit_rate")),
+                "sample_rate": _to_int(s.get("sample_rate")),
                 "language": (tags.get("language") or "und").lower(),
                 "title": tags.get("title", ""),
                 "default": bool(disposition.get("default")),
@@ -399,7 +555,7 @@ async def probe(path: str | Path, timeout: float = 120.0) -> MediaInfo:
         info.fps = _parse_fps(video.get("r_frame_rate")) or 24.0
 
     if not info.duration:
-        info.duration = float((video.get("tags") or {}).get("DURATION-eng", 0) or 0) or 0.0
+        info.duration = _to_float(video.get("duration")) or _duration_from_tags(video.get("tags"))
 
     try:
         info.video_bitrate = int(video.get("bit_rate") or 0)
@@ -426,6 +582,75 @@ _PROGRESS_KEYS = {
 }
 
 
+#: A pipe line longer than this is cut, not buffered whole.  asyncio's own
+#: ``readline`` gives up at 64 KiB with an exception - which used to end the
+#: reader, leave the pipe unread and stall ffmpeg as soon as it filled.
+_MAX_LINE = 64 * 1024
+#: What a single stderr line may occupy in the kept log tail.
+_MAX_LOG_LINE = 4000
+
+
+async def _read_lines(stream: asyncio.StreamReader) -> AsyncIterator[bytes]:
+    """Yield lines until EOF, whatever their length.
+
+    A line longer than the stream buffer comes out in pieces instead of
+    raising; the caller only ever sees bytes.
+    """
+    while True:
+        try:
+            line = await stream.readuntil(b"\n")
+        except asyncio.IncompleteReadError as exc:
+            if exc.partial:
+                yield exc.partial
+            return
+        except asyncio.LimitOverrunError as exc:
+            # No newline within the buffer: hand out what is there as one
+            # piece and carry on - the remainder of the line follows next.
+            yield await stream.readexactly(max(1, exc.consumed))
+            continue
+        yield line
+
+
+async def _drain(stream: asyncio.StreamReader) -> None:
+    """Read and discard until EOF, so the writer can never block on this pipe."""
+    while True:
+        try:
+            chunk = await stream.read(_MAX_LINE)
+        except Exception:  # pragma: no cover - a broken pipe is as good as EOF
+            return
+        if not chunk:
+            return
+
+
+def _parse_progress_line(progress: Progress, text: str) -> str | None:
+    """Fold one ``key=value`` line into ``progress``; returns the key it set."""
+    key, sep, value = text.partition("=")
+    if not sep or key not in _PROGRESS_KEYS:
+        return None
+    try:
+        if key == "frame":
+            progress.frame = int(value)
+        elif key == "fps":
+            progress.fps = float(value)
+        elif key == "total_size":
+            progress.total_size = int(value)
+        elif key == "out_time_us":
+            progress.out_time = int(value) / 1_000_000
+        elif key == "out_time_ms":
+            # ffmpeg reports out_time_ms in microseconds despite the name
+            progress.out_time = int(value) / 1_000_000
+        elif key == "bitrate":
+            progress.bitrate_kbps = float(value.replace("kbits/s", "").strip() or 0)
+        elif key == "speed":
+            progress.speed = float(value.replace("x", "").strip() or 0)
+        elif key == "progress":
+            progress.done = value == "end"
+    except (ValueError, TypeError):
+        # "N/A" and friends - keep the previous value.
+        return None if key != "progress" else key
+    return key
+
+
 async def run_with_progress(
     args: list[str],
     on_progress: Callable[[Progress], Any] | None = None,
@@ -436,8 +661,14 @@ async def run_with_progress(
 ) -> tuple[int, str]:
     """Run ffmpeg, streaming ``-progress`` updates to ``on_progress``.
 
-    Returns (returncode, tail of stderr).  Kills the process if ``cancel_event``
-    fires or ``timeout`` elapses.
+    Returns (returncode, tail of stderr).  Stops the process if ``cancel_event``
+    fires (SIGTERM, SIGKILL after 10 s) or ``timeout`` elapses, and kills it
+    outright if the calling task is cancelled or anything else goes wrong - an
+    ffmpeg must never outlive the call that started it.
+
+    Both pipes are read until EOF no matter what: a failing progress callback or
+    an absurdly long log line is logged and skipped, because a pipe nobody reads
+    fills up and freezes ffmpeg mid-encode.
     """
     # -stats_period sets how often ffmpeg emits a -progress block.  Left to the
     # default it is coarse enough that a progress bar visibly steps rather than
@@ -451,97 +682,96 @@ async def run_with_progress(
         cmd = ["nice", "-n", str(nice), *cmd]
 
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        *cmd, stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     tail: list[str] = []
     progress = Progress()
+    callback_errors = 0
 
     async def pump_stderr() -> None:
         assert proc.stderr is not None
-        while True:
-            line = await proc.stderr.readline()
-            if not line:
-                break
-            text = line.decode("utf-8", "replace").rstrip()
-            if text:
-                tail.append(text)
-                if len(tail) > log_lines:
-                    del tail[0 : len(tail) - log_lines]
+        try:
+            async for line in _read_lines(proc.stderr):
+                text = line.decode("utf-8", "replace").rstrip()
+                if text:
+                    tail.append(text[:_MAX_LOG_LINE])
+                    if len(tail) > log_lines:
+                        del tail[0 : len(tail) - log_lines]
+        except Exception:
+            log.exception("reading ffmpeg's stderr failed - discarding the rest")
+            await _drain(proc.stderr)
 
     async def pump_stdout() -> None:
+        nonlocal callback_errors
         assert proc.stdout is not None
-        while True:
-            line = await proc.stdout.readline()
-            if not line:
-                break
-            text = line.decode("utf-8", "replace").strip()
-            if "=" not in text:
-                continue
-            key, _, value = text.partition("=")
-            if key not in _PROGRESS_KEYS:
-                continue
-            try:
-                if key == "frame":
-                    progress.frame = int(value)
-                elif key == "fps":
-                    progress.fps = float(value)
-                elif key == "total_size":
-                    progress.total_size = int(value)
-                elif key == "out_time_us":
-                    progress.out_time = int(value) / 1_000_000
-                elif key == "out_time_ms":
-                    # ffmpeg reports out_time_ms in microseconds despite the name
-                    progress.out_time = int(value) / 1_000_000
-                elif key == "bitrate":
-                    progress.bitrate_kbps = float(value.replace("kbits/s", "").strip() or 0)
-                elif key == "speed":
-                    progress.speed = float(value.replace("x", "").strip() or 0)
-                elif key == "progress":
-                    progress.done = value == "end"
-                    if on_progress:
-                        res = on_progress(progress)
-                        if asyncio.iscoroutine(res):
-                            await res
-            except (ValueError, TypeError):
-                continue
+        try:
+            async for line in _read_lines(proc.stdout):
+                text = line.decode("utf-8", "replace").strip()
+                if _parse_progress_line(progress, text) != "progress" or not on_progress:
+                    continue
+                try:
+                    res = on_progress(progress)
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception:
+                    # The encode is fine; only the reporting broke.  Say so
+                    # once (and then now and then), and keep reading.
+                    callback_errors += 1
+                    if callback_errors == 1 or callback_errors % 500 == 0:
+                        log.exception("progress callback failed (%d times so far)", callback_errors)
+        except Exception:
+            log.exception("reading ffmpeg's progress failed - discarding the rest")
+            await _drain(proc.stdout)
 
     async def watch_cancel() -> None:
-        if cancel_event is None:
-            await asyncio.Future()  # never resolves
         assert cancel_event is not None
         await cancel_event.wait()
-        if proc.returncode is None:
-            proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=10)
-            except asyncio.TimeoutError:
-                proc.kill()
+        await _terminate(proc, grace=10)
 
-    tasks = [
+    pumps = [
         asyncio.create_task(pump_stdout()),
         asyncio.create_task(pump_stderr()),
     ]
-    cancel_task = asyncio.create_task(watch_cancel())
+    cancel_task = asyncio.create_task(watch_cancel()) if cancel_event is not None else None
     try:
         await asyncio.wait_for(proc.wait(), timeout=timeout)
     except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+        await _kill(proc)
         raise FFmpegError(f"encode exceeded {timeout}s", -9, "\n".join(tail[-30:]))
+    except BaseException:
+        # Task cancelled (worker shutdown, job aborted from outside) or an
+        # unexpected error: the process is killed here rather than orphaned,
+        # and this also completes a SIGTERM escalation that was in progress.
+        await _kill(proc)
+        raise
     finally:
-        cancel_task.cancel()
-        for t in tasks:
-            try:
-                await asyncio.wait_for(t, timeout=5)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                t.cancel()
+        if proc.returncode is None:  # pragma: no cover - every path above reaps
+            await _kill(proc)
+        if cancel_task is not None:
+            # The process has exited, so there is nothing left to escalate.
+            cancel_task.cancel()
+        done, pending = await asyncio.wait(pumps, timeout=5)
+        for task in pending:
+            task.cancel()
+        for task in done:
+            if not task.cancelled() and task.exception() is not None:
+                log.warning("ffmpeg output reader failed: %r", task.exception())
 
     return proc.returncode or 0, "\n".join(tail)
 
 
-async def run_simple(args: list[str], timeout: float | None = 900.0) -> tuple[int, str, str]:
-    """Run ffmpeg and wait, no progress parsing."""
-    return await _run([FFMPEG, "-hide_banner", "-nostdin", *args], timeout=timeout)
+async def run_simple(
+    args: list[str], timeout: float | None = 900.0, cancel_event: asyncio.Event | None = None,
+) -> tuple[int, str, str]:
+    """Run ffmpeg and wait, no progress parsing.
+
+    ``cancel_event`` stops the process early; that raises
+    :class:`FFmpegCancelled` (an :class:`FFmpegError`).
+    """
+    return await _run(
+        [FFMPEG, "-hide_banner", "-nostdin", *args], timeout=timeout, cancel_event=cancel_event
+    )
 
 
 _encoder_cache: set[str] | None = None
@@ -587,7 +817,7 @@ async def version() -> str:
 
 async def extract_segment(
     source: str, start: float, duration: float, dest: str, timeout: float = 300.0,
-    exact: bool = False,
+    exact: bool = False, cancel_event: asyncio.Event | None = None,
 ) -> None:
     """Cut a lossless slice used for trial encodes and VMAF probes.
 
@@ -595,6 +825,8 @@ async def extract_segment(
     keyframe before ``start``, and two files with different keyframe grids -
     a source and its encode - then yield slices that do not line up, which
     scores a good encode as a bad one.
+
+    ``cancel_event`` stops the cut early (raises :class:`FFmpegCancelled`).
     """
     code, err = 1, ""
     args = [
@@ -603,7 +835,7 @@ async def extract_segment(
         "-avoid_negative_ts", "make_zero", "-f", "matroska", dest,
     ]
     if not exact:
-        code, _, err = await run_simple(args, timeout=timeout)
+        code, _, err = await run_simple(args, timeout=timeout, cancel_event=cancel_event)
     if code != 0 or not os.path.exists(dest) or os.path.getsize(dest) < 1024:
         # Stream copy can land between keyframes: re-cut by decoding instead.
         args = [
@@ -611,6 +843,6 @@ async def extract_segment(
             "-map", "0:v:0", "-c:v", "ffv1", "-level", "3", "-an", "-sn", "-dn",
             "-f", "matroska", dest,
         ]
-        code, _, err = await run_simple(args, timeout=timeout)
+        code, _, err = await run_simple(args, timeout=timeout, cancel_event=cancel_event)
         if code != 0:
             raise FFmpegError(f"segment extraction failed: {err.strip()[-300:]}", code, err[-1500:])
