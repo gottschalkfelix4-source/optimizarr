@@ -354,6 +354,10 @@ def test_success_rereads_the_new_file_into_the_row(tmp_path, monkeypatch):
     assert media.duration == 1399.5
     assert media.size == 500 and media.mtime == os.stat(source).st_mtime
     assert media.state == FileState.DONE.value
+    # Estimate replaced by the real result - bytes and percent agree.
+    assert media.estimated_size == 500
+    assert media.estimated_saving_bytes == 500
+    assert media.estimated_saving_pct == pytest.approx(50.0)
 
 
 # --- 11. retries ------------------------------------------------------------- #

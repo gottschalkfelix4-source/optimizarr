@@ -1465,7 +1465,14 @@ def _record_success(
                     media.video_codec = "av1"
                     media.bit_depth = 10 if "10" in plan.pix_fmt else 8
                 media.size = outcome.output_size
-                media.estimated_saving_bytes = max(0, outcome.input_size - outcome.output_size)
+                # The estimate is replaced by what actually happened - bytes
+                # and percent together, or the library shows a saving with 0 %.
+                saved = max(0, outcome.input_size - outcome.output_size)
+                media.estimated_size = outcome.output_size
+                media.estimated_saving_bytes = saved
+                media.estimated_saving_pct = (
+                    saved / outcome.input_size * 100.0 if outcome.input_size else 0.0
+                )
                 media.decision_reason = outcome.reason
                 media.error = ""
                 try:
