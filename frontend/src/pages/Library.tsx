@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ChevronLeft,
   ChevronRight,
+  Eye,
   EyeOff,
   FileVideo,
   Microscope,
@@ -13,13 +14,18 @@ import {
   Zap,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { endpoints, type AnalysisResult, type DryRunResult, type MediaFile } from "../lib/api";
 import {
   bytes,
   bitrate,
+  clampPage,
   confidenceLabel,
   duration,
+  hdrChip,
+  hdrLabel,
+  ignoreAction,
+  isDolbyVision,
   percent,
   relativeTime,
   resolutionLabel,
@@ -30,6 +36,7 @@ import { useToast } from "../lib/live";
 import {
   Callout,
   EmptyState,
+  ErrorState,
   Modal,
   Panel,
   Select,
@@ -44,7 +51,7 @@ const STATE_FILTERS = [
   { value: "all", label: "Alle" },
   { value: "actionable", label: "In Arbeit" },
   { value: "done", label: "Konvertiert" },
-  { value: "skipped", label: "Uebersprungen" },
+  { value: "skipped", label: "Übersprungen" },
   { value: "failed", label: "Fehler" },
   { value: "ignored", label: "Ignoriert" },
   { value: "new", label: "Noch nicht analysiert" },
@@ -56,14 +63,19 @@ const FORCEABLE_STATES = new Set(["skipped", "ignored", "failed", "new", "probed
 const SORT_OPTIONS = [
   { value: "saving", label: "Ersparnis (absolut)" },
   { value: "saving_pct", label: "Ersparnis (Prozent)" },
-  { value: "size", label: "Dateigroesse" },
+  { value: "size", label: "Dateigröße" },
   { value: "duration", label: "Laufzeit" },
   { value: "analyzed", label: "Zuletzt analysiert" },
   { value: "name", label: "Name" },
 ];
 
+/** Pushed with the history entry that opens a file, so closing can go back. */
+const FILE_MODAL_STATE = { fileModal: true };
+
 export default function Library() {
   const [params, setParams] = useSearchParams();
+  const navigate = useNavigate();
+  const location = useLocation();
   const { push } = useToast();
   const queryClient = useQueryClient();
 
@@ -73,10 +85,28 @@ export default function Library() {
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [libraryId, setLibraryId] = useState<string>("");
   const [page, setPage] = useState(1);
-  const [selected, setSelected] = useState<Set<number>>(new Set());
-  const [detailId, setDetailId] = useState<number | null>(
-    params.get("file") ? Number(params.get("file")) : null,
-  );
+  // Selected file -> its estimated saving.  Kept across pages, so the sum
+  // covers every selected file, not only those on the page in view.
+  const [selected, setSelected] = useState<Map<number, number>>(new Map());
+
+  // The open file lives in the URL (?file=), so the browser's back button
+  // closes the dialog and links from other pages open it directly.
+  const fileParam = Number(params.get("file"));
+  const detailId = Number.isInteger(fileParam) && fileParam > 0 ? fileParam : null;
+  const openDetail = (id: number) => {
+    const next = new URLSearchParams(params);
+    next.set("file", String(id));
+    setParams(next, { state: FILE_MODAL_STATE });
+  };
+  const closeDetail = () => {
+    if ((location.state as typeof FILE_MODAL_STATE | null)?.fileModal) {
+      navigate(-1);
+      return;
+    }
+    const next = new URLSearchParams(params);
+    next.delete("file");
+    setParams(next, { replace: true });
+  };
 
   useEffect(() => {
     const timer = window.setTimeout(() => setDebouncedSearch(search), 350);
@@ -90,25 +120,36 @@ export default function Library() {
     queryFn: endpoints.libraryPaths,
   });
 
-  const { data, isLoading, isFetching } = useQuery({
+  const { data, isLoading, isFetching, isError, error, refetch } = useQuery({
     queryKey: ["files", state, sort, debouncedSearch, libraryId, page],
-    queryFn: () =>
-      endpoints.files({
-        state,
-        sort,
-        search: debouncedSearch,
-        library_id: libraryId || undefined,
-        page,
-        page_size: 50,
-      }),
+    queryFn: ({ signal }) =>
+      endpoints.files(
+        {
+          state,
+          sort,
+          search: debouncedSearch,
+          library_id: libraryId || undefined,
+          page,
+          page_size: 50,
+        },
+        { signal },
+      ),
     placeholderData: (prev) => prev,
   });
+
+  // Files leave the filter (converted, ignored, queued elsewhere) and the last
+  // page can disappear under the reader - step back instead of showing nothing.
+  useEffect(() => {
+    if (!data) return;
+    const clamped = clampPage(page, data.pages);
+    if (clamped !== page) setPage(clamped);
+  }, [data, page]);
 
   const enqueue = useMutation({
     mutationFn: (fileIds: number[]) => endpoints.enqueue({ file_ids: fileIds }),
     onSuccess: (result) => {
       push(result.message, result.added ? "success" : "info");
-      setSelected(new Set());
+      setSelected(new Map());
       queryClient.invalidateQueries({ queryKey: ["files"] });
       queryClient.invalidateQueries({ queryKey: ["jobs"] });
     },
@@ -118,13 +159,13 @@ export default function Library() {
   const ignore = useMutation({
     mutationFn: ({ id, ignored }: { id: number; ignored: boolean }) =>
       endpoints.ignoreFile(id, ignored),
-    onSuccess: () => {
+    onSuccess: (_result, { ignored }) => {
       queryClient.invalidateQueries({ queryKey: ["files"] });
       queryClient.invalidateQueries({ queryKey: ["stats"] });
       queryClient.invalidateQueries({ queryKey: ["series"] });
       queryClient.invalidateQueries({ queryKey: ["movies"] });
       queryClient.invalidateQueries({ queryKey: ["jobs"] });
-      push("Status geaendert.", "success");
+      push(ignored ? "Datei wird ignoriert." : "Datei wird wieder berücksichtigt.", "success");
     },
     onError: (e: Error) => push(e.message, "error"),
   });
@@ -134,25 +175,28 @@ export default function Library() {
 
   const toggleAll = () => {
     setSelected((prev) => {
-      if (allSelected) {
-        const next = new Set(prev);
-        items.forEach((f) => next.delete(f.id));
-        return next;
-      }
-      return new Set([...prev, ...items.map((f) => f.id)]);
+      const next = new Map(prev);
+      if (allSelected) items.forEach((f) => next.delete(f.id));
+      else items.forEach((f) => next.set(f.id, f.estimated_saving_bytes));
+      return next;
     });
   };
 
-  const toggleOne = (id: number) =>
+  const toggleOne = (file: MediaFile) =>
     setSelected((prev) => {
-      const next = new Set(prev);
-      next.has(id) ? next.delete(id) : next.add(id);
+      const next = new Map(prev);
+      if (next.has(file.id)) next.delete(file.id);
+      else next.set(file.id, file.estimated_saving_bytes);
       return next;
     });
 
   const selectedSaving = useMemo(
-    () => items.filter((f) => selected.has(f.id)).reduce((sum, f) => sum + f.estimated_saving_bytes, 0),
-    [items, selected],
+    () => [...selected.values()].reduce((sum, saving) => sum + Math.max(0, saving), 0),
+    [selected],
+  );
+  const selectedElsewhere = useMemo(
+    () => [...selected.keys()].filter((id) => !items.some((f) => f.id === id)).length,
+    [selected, items],
   );
 
   return (
@@ -163,30 +207,24 @@ export default function Library() {
           <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-ink-500" />
           <input
             className="field pl-9"
-            placeholder="Nach Dateiname oder Ordner suchen..."
+            placeholder="Nach Dateiname oder Ordner suchen …"
+            aria-label="Dateien durchsuchen"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
           />
         </div>
         <div className="w-44">
-          <Select
-            value={state}
-            onChange={setState}
-            options={STATE_FILTERS}
-          />
+          <Select value={state} onChange={setState} options={STATE_FILTERS} ariaLabel="Status" />
         </div>
         <div className="w-52">
-          <Select
-            value={sort}
-            onChange={setSort}
-            options={SORT_OPTIONS}
-          />
+          <Select value={sort} onChange={setSort} options={SORT_OPTIONS} ariaLabel="Sortierung" />
         </div>
         {(libraries?.length ?? 0) > 1 && (
           <div className="w-44">
             <Select
               value={libraryId}
               onChange={setLibraryId}
+              ariaLabel="Bibliotheksordner"
               options={[
                 { value: "", label: "Alle Ordner" },
                 ...(libraries ?? []).map((l) => ({ value: String(l.id), label: l.name })),
@@ -214,20 +252,23 @@ export default function Library() {
         {selected.size > 0 && (
           <div className="ml-auto flex flex-wrap items-center gap-2">
             <span className="text-ink-300">
-              {selected.size} ausgewaehlt
+              {number(selected.size)} ausgewählt
+              {selectedElsewhere > 0 && (
+                <span className="text-ink-500"> (davon {number(selectedElsewhere)} auf anderen Seiten)</span>
+              )}
               {selectedSaving > 0 && (
-                <span className="text-save-400"> · {bytes(selectedSaving)}</span>
+                <span className="text-save-400"> · ca. {bytes(selectedSaving)} Ersparnis</span>
               )}
             </span>
-            <button className="btn-ghost btn-sm" onClick={() => setSelected(new Set())}>
+            <button className="btn-ghost btn-sm" onClick={() => setSelected(new Map())}>
               Auswahl aufheben
             </button>
             <button
               className="btn-primary btn-sm"
-              onClick={() => enqueue.mutate([...selected])}
+              onClick={() => enqueue.mutate([...selected.keys()])}
               disabled={enqueue.isPending}
             >
-              {enqueue.isPending ? <Spinner className="size-3.5" /> : <Play className="size-3.5" />}
+              {enqueue.isPending ? <Spinner className="size-3.5" /> : <Play className="size-3.5" aria-hidden="true" />}
               Konvertieren
             </button>
           </div>
@@ -236,7 +277,9 @@ export default function Library() {
 
       {/* ---------------- table ---------------- */}
       <Panel bodyClassName="p-0">
-        {isLoading ? (
+        {isError && !data ? (
+          <ErrorState error={error} onRetry={() => refetch()} title="Dateien konnten nicht geladen werden" />
+        ) : isLoading ? (
           <div className="space-y-2 p-4">
             {Array.from({ length: 8 }).map((_, i) => (
               <Skeleton key={i} className="h-12" />
@@ -263,16 +306,18 @@ export default function Library() {
                       checked={allSelected}
                       onChange={toggleAll}
                       className="size-4 cursor-pointer rounded border-ink-600 bg-ink-800 accent-brand-500"
-                      aria-label="Alle auswaehlen"
+                      aria-label="Alle auf dieser Seite auswählen"
                     />
                   </th>
                   <th className="w-[38%] px-2 py-3 font-medium">Datei</th>
                   <th className="w-40 px-3 py-3 font-medium">Format</th>
-                  <th className="w-24 px-3 py-3 text-right font-medium">Groesse</th>
+                  <th className="w-24 px-3 py-3 text-right font-medium">Größe</th>
                   <th className="w-24 px-3 py-3 text-right font-medium">Erwartet</th>
                   <th className="w-28 px-3 py-3 text-right font-medium">Ersparnis</th>
                   <th className="w-36 px-3 py-3 font-medium">Status</th>
-                  <th className="w-24 px-3 py-3" />
+                  <th className="w-24 px-3 py-3">
+                    <span className="sr-only">Aktionen</span>
+                  </th>
                 </tr>
               </thead>
               <tbody>
@@ -281,10 +326,10 @@ export default function Library() {
                     key={file.id}
                     file={file}
                     selected={selected.has(file.id)}
-                    onToggle={() => toggleOne(file.id)}
-                    onOpen={() => setDetailId(file.id)}
+                    onToggle={() => toggleOne(file)}
+                    onOpen={() => openDetail(file.id)}
                     onQueue={() => enqueue.mutate([file.id])}
-                    onIgnore={() => ignore.mutate({ id: file.id, ignored: !file.ignored })}
+                    onIgnore={(ignored) => ignore.mutate({ id: file.id, ignored })}
                   />
                 ))}
               </tbody>
@@ -303,30 +348,21 @@ export default function Library() {
                 onClick={() => setPage((p) => Math.max(1, p - 1))}
                 disabled={page <= 1}
               >
-                <ChevronLeft className="size-3.5" /> Zurueck
+                <ChevronLeft className="size-3.5" aria-hidden="true" /> Zurück
               </button>
               <button
                 className="btn-ghost btn-sm"
                 onClick={() => setPage((p) => Math.min(data?.pages ?? 1, p + 1))}
                 disabled={page >= (data?.pages ?? 1)}
               >
-                Weiter <ChevronRight className="size-3.5" />
+                Weiter <ChevronRight className="size-3.5" aria-hidden="true" />
               </button>
             </div>
           </div>
         )}
       </Panel>
 
-      <FileDetail
-        fileId={detailId}
-        onClose={() => {
-          setDetailId(null);
-          if (params.get("file")) {
-            params.delete("file");
-            setParams(params, { replace: true });
-          }
-        }}
-      />
+      <FileDetail fileId={detailId} onClose={closeDetail} />
     </div>
   );
 }
@@ -344,9 +380,10 @@ function FileRow({
   onToggle: () => void;
   onOpen: () => void;
   onQueue: () => void;
-  onIgnore: () => void;
+  onIgnore: (ignored: boolean) => void;
 }) {
   const canQueue = file.state === "candidate" && !file.ignored;
+  const ignore = ignoreAction(file);
   return (
     <tr className={cn("table-row", selected && "bg-brand-600/8")}>
       <td className="px-4 py-2.5">
@@ -355,7 +392,7 @@ function FileRow({
           checked={selected}
           onChange={onToggle}
           className="size-4 cursor-pointer rounded border-ink-600 bg-ink-800 accent-brand-500"
-          aria-label={`${file.name} auswaehlen`}
+          aria-label={`${file.name} auswählen`}
         />
       </td>
       <td className="max-w-0 px-2 py-2.5">
@@ -373,8 +410,16 @@ function FileRow({
         <span className="mx-1 text-ink-600">·</span>
         {resolutionLabel(file.width, file.height)}
         {file.is_hdr && (
-          <span className="ml-1.5 rounded bg-warn-500/15 px-1 text-[10px] font-medium text-warn-400">
-            HDR
+          <span
+            className={cn(
+              "ml-1.5 rounded px-1 text-[10px] font-medium",
+              isDolbyVision(file.hdr_format)
+                ? "bg-brand-500/15 text-brand-400"
+                : "bg-warn-500/15 text-warn-400",
+            )}
+            title={hdrLabel(file.hdr_format)}
+          >
+            {hdrChip(file.hdr_format)}
           </span>
         )}
         <span className="mt-0.5 block text-ink-500">
@@ -408,24 +453,33 @@ function FileRow({
             <button
               onClick={onQueue}
               className="rounded-md p-1.5 text-ink-400 transition-colors hover:bg-brand-600/20 hover:text-brand-400"
-              title="Zur Warteschlange hinzufuegen"
+              title="Zur Warteschlange hinzufügen"
+              aria-label={`${file.name} zur Warteschlange hinzufügen`}
             >
-              <Play className="size-3.5" />
+              <Play className="size-3.5" aria-hidden="true" />
             </button>
           )}
-          <button
-            onClick={onIgnore}
-            className="rounded-md p-1.5 text-ink-400 transition-colors hover:bg-ink-700 hover:text-ink-200"
-            title={file.ignored ? "Nicht mehr ignorieren" : "Datei ignorieren"}
-          >
-            <EyeOff className="size-3.5" />
-          </button>
+          {ignore && (
+            <button
+              onClick={() => onIgnore(ignore.ignored)}
+              className="rounded-md p-1.5 text-ink-400 transition-colors hover:bg-ink-700 hover:text-ink-200"
+              title={ignore.label}
+              aria-label={`${file.name}: ${ignore.label}`}
+            >
+              {ignore.ignored ? (
+                <EyeOff className="size-3.5" aria-hidden="true" />
+              ) : (
+                <Eye className="size-3.5" aria-hidden="true" />
+              )}
+            </button>
+          )}
           <button
             onClick={onOpen}
             className="rounded-md p-1.5 text-ink-400 transition-colors hover:bg-ink-700 hover:text-ink-200"
             title="Details"
+            aria-label={`Details zu ${file.name}`}
           >
-            <SlidersHorizontal className="size-3.5" />
+            <SlidersHorizontal className="size-3.5" aria-hidden="true" />
           </button>
         </div>
       </td>
@@ -442,9 +496,9 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
   const queryClient = useQueryClient();
   const [analysisDepth, setAnalysisDepth] = useState("sample");
 
-  const { data: file, isLoading } = useQuery({
+  const { data: file, isLoading, isError, error, refetch } = useQuery({
     queryKey: ["files", "detail", fileId],
-    queryFn: () => endpoints.file(fileId!),
+    queryFn: ({ signal }) => endpoints.file(fileId!, { signal }),
     enabled: fileId !== null,
   });
 
@@ -465,8 +519,8 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
       if (result.analysis) setAnalysis({ fileId: id, result: result.analysis });
       push(
         result.analysis?.decision === "convert"
-          ? "Analyse fertig - lohnt sich."
-          : "Analyse fertig - lohnt sich nicht.",
+          ? "Analyse fertig – lohnt sich."
+          : "Analyse fertig – lohnt sich nicht.",
         result.analysis?.decision === "convert" ? "success" : "info",
       );
       queryClient.invalidateQueries({ queryKey: ["files"] });
@@ -480,7 +534,7 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
       setDryState({ fileId: id, result });
       push(
         result.ok
-          ? "Trockenlauf erfolgreich - der Plan funktioniert auf dieser Datei."
+          ? "Trockenlauf erfolgreich – der Plan funktioniert auf dieser Datei."
           : `Trockenlauf fehlgeschlagen: ${result.error_line}`,
         result.ok ? "success" : "error",
       );
@@ -521,6 +575,7 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
             <Select
               value={analysisDepth}
               onChange={setAnalysisDepth}
+              ariaLabel="Analysetiefe"
               options={[
                 { value: "quick", label: "Schnell (Metadaten)" },
                 { value: "sample", label: "Testkodierung" },
@@ -533,19 +588,19 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
             onClick={() => fileId !== null && analyze.mutate(fileId)}
             disabled={analyze.isPending}
           >
-            {analyze.isPending ? <Spinner className="size-4" /> : <Microscope className="size-4" />}
+            {analyze.isPending ? <Spinner className="size-4" /> : <Microscope className="size-4" aria-hidden="true" />}
             Neu analysieren
           </button>
           <button
             className="btn-ghost"
             onClick={() => fileId !== null && dryRun.mutate(fileId)}
             disabled={dryRun.isPending || !plan}
-            title="Den geplanten Befehl 15 Sekunden lang wirklich ausfuehren"
+            title="Den geplanten Befehl 15 Sekunden lang wirklich ausführen"
           >
             {dryRun.isPending ? (
               <Spinner className="size-4" />
             ) : (
-              <TerminalSquare className="size-4" />
+              <TerminalSquare className="size-4" aria-hidden="true" />
             )}
             Trockenlauf
           </button>
@@ -554,9 +609,9 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
               className="btn-primary"
               onClick={() => enqueue.mutate(true)}
               disabled={enqueue.isPending}
-              title="Ausschluss und Mindestersparnis fuer diese Datei uebergehen"
+              title="Ausschluss und Mindestersparnis für diese Datei übergehen"
             >
-              <Zap className="size-4" />
+              <Zap className="size-4" aria-hidden="true" />
               Trotzdem konvertieren
             </button>
           ) : (
@@ -572,14 +627,16 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
                     : undefined
               }
             >
-              <Play className="size-4" />
+              <Play className="size-4" aria-hidden="true" />
               Konvertieren
             </button>
           )}
         </>
       }
     >
-      {isLoading || !file ? (
+      {isError && !file ? (
+        <ErrorState compact error={error} onRetry={() => refetch()} title="Datei konnte nicht geladen werden" />
+      ) : isLoading || !file ? (
         <div className="space-y-3">
           <Skeleton className="h-20" />
           <Skeleton className="h-32" />
@@ -599,7 +656,7 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
               <p className="text-sm leading-relaxed text-ink-100">{file.decision_reason || "Noch nicht analysiert."}</p>
               {conf && (
                 <span className={cn("shrink-0 text-xs font-medium", conf.className)}>
-                  Sicherheit: {conf.label}
+                  Treffsicherheit: {conf.label}
                 </span>
               )}
             </div>
@@ -630,12 +687,18 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
               </h4>
               <dl className="space-y-1.5 text-sm">
                 <Row label="Codec" value={file.video_codec.toUpperCase()} />
-                <Row label="Aufloesung" value={`${file.width}x${file.height}`} />
-                <Row label="Bildrate" value={`${file.fps.toFixed(3)} fps`} />
+                <Row
+                  label="Auflösung"
+                  value={`${file.width}×${file.height} (${resolutionLabel(file.width, file.height)})`}
+                />
+                <Row label="Bildrate" value={`${number(file.fps, 3)} fps`} />
                 <Row label="Bitrate" value={bitrate(file.video_bitrate)} />
-                <Row label="Farbtiefe" value={`${file.bit_depth} Bit${file.is_hdr ? ` · ${file.hdr_format.toUpperCase()}` : ""}`} />
+                <Row
+                  label="Farbtiefe"
+                  value={`${file.bit_depth} Bit${file.is_hdr ? ` · ${hdrLabel(file.hdr_format)}` : ""}`}
+                />
                 <Row label="Laufzeit" value={duration(file.duration)} />
-                <Row label="Groesse" value={bytes(file.size)} />
+                <Row label="Größe" value={bytes(file.size)} />
               </dl>
             </div>
 
@@ -646,19 +709,19 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
               {plan ? (
                 <dl className="space-y-1.5 text-sm">
                   <Row label="Encoder" value={plan.encoder} />
-                  <Row label="Qualitaet" value={`CRF ${plan.crf}${plan.encoder === "libsvtav1" ? ` · Preset ${plan.preset}` : ""}`} />
+                  <Row label="Qualität" value={`CRF ${plan.crf}${plan.encoder === "libsvtav1" ? ` · Preset ${plan.preset}` : ""}`} />
                   <Row label="Pixelformat" value={plan.pix_fmt} />
                   {plan.film_grain > 0 && <Row label="Filmkorn-Synthese" value={`Stufe ${plan.film_grain}`} />}
                   {plan.target_height > 0 && <Row label="Skalierung" value={`auf ${plan.target_height}p`} />}
                   <Row label="Container" value={plan.container.toUpperCase()} />
                   <Row
-                    label="Erwartete Groesse"
+                    label="Erwartete Größe"
                     value={bytes(file.estimated_size)}
                     valueClass="text-save-400"
                   />
                 </dl>
               ) : (
-                <p className="text-sm text-ink-400">Noch kein Plan - Datei zuerst analysieren.</p>
+                <p className="text-sm text-ink-400">Noch kein Plan – Datei zuerst analysieren.</p>
               )}
             </div>
           </div>
@@ -677,7 +740,7 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
                       key={`a${stream.index}`}
                       className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs"
                     >
-                      <span className="w-14 shrink-0 text-ink-500">Audio</span>
+                      <span className="w-20 shrink-0 text-ink-500">Audio</span>
                       <span className="text-ink-200">
                         {stream.codec.toUpperCase()} · {stream.channel_layout || `${stream.channels}ch`} ·{" "}
                         {stream.language}
@@ -711,10 +774,10 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
                       key={`s${stream.index}`}
                       className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs"
                     >
-                      <span className="w-14 shrink-0 text-ink-500">Unterti.</span>
+                      <span className="w-20 shrink-0 text-ink-500">Untertitel</span>
                       <span className="text-ink-200">
                         {stream.codec} · {stream.language}
-                        {stream.forced && " · forced"}
+                        {stream.forced && " · erzwungen"}
                       </span>
                       {action && (
                         <span
@@ -739,7 +802,7 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
           {freshAnalysis?.reasons?.length ? (
             <div className="rounded-lg border border-ink-700/70 bg-ink-850/40 p-4">
               <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink-400">
-                Wie Optimizarr zu dieser Einschaetzung kommt
+                Wie Optimizarr zu dieser Einschätzung kommt
               </h4>
               <ul className="space-y-1.5 text-sm text-ink-300">
                 {freshAnalysis.reasons.map((reason, i) => (
@@ -789,18 +852,18 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
                 )}
               >
                 {dry.ok
-                  ? "Der geplante Befehl laeuft auf dieser Datei durch."
+                  ? "Der geplante Befehl läuft auf dieser Datei durch."
                   : dry.error_line}
               </p>
               {!dry.ok && dry.video_at_fault === false && (
                 <p className="mt-1 text-xs text-warn-400">
-                  Der Fehler kommt nicht vom Video-Encoder - ein Umweg ueber die CPU wuerde
+                  Der Fehler kommt nicht vom Video-Encoder – ein Umweg über die CPU würde
                   genauso enden.
                 </p>
               )}
               <details className="mt-3">
                 <summary className="cursor-pointer text-xs text-ink-400">
-                  Vollstaendige ffmpeg-Ausgabe und Befehl
+                  Vollständige ffmpeg-Ausgabe und Befehl
                 </summary>
                 <pre className="mt-2 max-h-72 overflow-auto rounded border border-ink-700/70 bg-ink-950/70 p-2 font-mono text-[10px] leading-relaxed text-ink-300">
                   {`${dry.command}\n\n${dry.output}`}
@@ -817,7 +880,7 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
 }
 
 const DEPTH_LABELS: Record<string, string> = {
-  quick: "Schnellschaetzung",
+  quick: "Schnellschätzung",
   sample: "Testkodierung",
   vmaf: "Testkodierung + VMAF",
 };

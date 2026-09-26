@@ -8,16 +8,151 @@ export class ApiError extends Error {
   }
 }
 
+/** Header the backend requires on every state-changing request (CSRF guard). */
+export const CSRF_HEADER = "X-Optimizarr";
+
+/** What the backend sends instead of a stored secret. */
+export const SECRET_MASK = "********";
+
+/** Request options the query functions pass through - mainly the abort signal. */
+export interface RequestOpts {
+  signal?: AbortSignal;
+}
+
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+/** Merge caller options with the defaults.  Headers are merged, never replaced:
+ *  spreading ``init`` after the default headers used to drop them again, and the
+ *  CSRF marker must survive whatever a caller passes. */
+export function buildInit(init: RequestInit = {}): RequestInit {
+  const method = (init.method ?? "GET").toUpperCase();
+  const headers = new Headers(init.headers);
+  if (init.body !== undefined && init.body !== null && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+  if (!SAFE_METHODS.has(method)) headers.set(CSRF_HEADER, "1");
+  return { ...init, method, headers };
+}
+
+/* ---- validation errors in German ------------------------------------------ */
+
+const FIELD_LABELS: Record<string, string> = {
+  min_file_size_mb: "Mindestgröße",
+  min_duration_seconds: "Mindestlaufzeit",
+  scan_interval_hours: "Automatischer Scan",
+  reanalyze_after_days: "Analyse neu aufrollen nach",
+  min_saving_mb: "Mindestersparnis absolut",
+  min_saving_percent: "Mindestersparnis",
+  analysis_workers: "Parallele Analysen",
+  trust_learning_after_samples: "Volles Vertrauen ab",
+  crf: "Basis-Qualität (CRF)",
+  crf_min: "CRF-Untergrenze",
+  crf_max: "CRF-Obergrenze",
+  max_width: "Maximale Breite",
+  keyframe_interval_seconds: "Keyframe-Abstand",
+  max_encode_hours: "Abbruch nach",
+  opus_bitrate_per_channel: "Opus-Bitrate je Kanal",
+  bloat_threshold_kbps_per_channel: "Schwelle für aufgeblähte Spuren",
+  max_duration_drift_seconds: "Erlaubte Laufzeit-Abweichung",
+  trash_retention_days: "Aufbewahrung",
+  uid: "Benutzer-ID (UID)",
+  gid: "Gruppen-ID (GID)",
+  file_mode: "Dateirechte",
+  max_concurrent_jobs: "Gleichzeitige Konvertierungen",
+  cpu_threads: "CPU-Threads",
+  nice_level: "Prozesspriorität",
+  min_free_disk_gb: "Mindestens freier Speicher",
+  schedule_start: "Beginn des Zeitfensters",
+  schedule_end: "Ende des Zeitfensters",
+  schedule_days: "Wochentage",
+  openai_max_tokens: "Maximale Antwortlänge",
+  max_calls_per_scan: "Maximale Anfragen pro Scan",
+  max_crf_delta: "Maximale CRF-Verschiebung",
+  timeout_seconds: "Zeitlimit pro Anfrage",
+  username: "Benutzername",
+  password: "Passwort",
+  webhook_url: "Webhook-Adresse",
+  dashboard_refresh_seconds: "Aktualisierung der Übersicht",
+};
+
+/** Whether a message is one of pydantic's English rule texts. */
+const PYDANTIC_TEXT = /^(Input should|String should|Field required|Value error|Extra inputs)/;
+
+/** Translate one pydantic rule ("Input should be ...") into German. */
+function germanRule(message: string, type = ""): string {
+  const num = (re: RegExp) => message.match(re)?.[1];
+  let n: string | undefined;
+  if ((n = num(/less than or equal to (-?[\d.]+)/))) return `darf höchstens ${n} sein`;
+  if ((n = num(/greater than or equal to (-?[\d.]+)/))) return `muss mindestens ${n} sein`;
+  if ((n = num(/less than (-?[\d.]+)/))) return `muss kleiner als ${n} sein`;
+  if ((n = num(/greater than (-?[\d.]+)/))) return `muss größer als ${n} sein`;
+  if (/valid integer/.test(message) || type.startsWith("int_")) return "muss eine ganze Zahl sein";
+  if (/valid number/.test(message) || type.startsWith("float_")) return "muss eine Zahl sein";
+  if (/match pattern/.test(message) || type === "string_pattern_mismatch") {
+    return "hat ein ungültiges Format";
+  }
+  if (/at least \d+ character/.test(message) || type === "string_too_short") return "ist zu kurz";
+  if (/at most \d+ character/.test(message) || type === "string_too_long") return "ist zu lang";
+  if (/Field required/.test(message) || type === "missing") return "fehlt";
+  if (type === "literal_error" || /^Input should be '/.test(message)) {
+    return "ist kein erlaubter Wert";
+  }
+  return "ist ungültig";
+}
+
+function fieldLabel(path: string): string {
+  const parts = path.split(".").filter((p) => p && p !== "body");
+  const last = parts[parts.length - 1] ?? path;
+  return FIELD_LABELS[last] ?? parts.join(".");
+}
+
+/** Turn an error ``detail`` into a German sentence.  Handles FastAPI's list of
+ *  validation errors and the raw pydantic text the settings endpoint embeds. */
+export function describeErrorDetail(detail: unknown): string {
+  if (Array.isArray(detail)) {
+    const parts = detail.map((item) => {
+      const entry = item as { loc?: unknown[]; msg?: string; type?: string };
+      const path = (entry.loc ?? []).map(String).join(".");
+      return `${fieldLabel(path)}: ${germanRule(entry.msg ?? "", entry.type)}`;
+    });
+    return parts.length ? `Ungültige Eingabe – ${parts.join("; ")}` : "Ungültige Eingabe.";
+  }
+  if (typeof detail !== "string") return JSON.stringify(detail);
+
+  // Raw pydantic text: "1 validation error for X\nfield\n  Input should ... [type=...]".
+  if (/validation errors? for /.test(detail)) {
+    const parts: string[] = [];
+    const re = /^(\S[^\n]*)\n\s+([^\n]*?)\s*\[type=(\w+)/gm;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(detail)) !== null) {
+      parts.push(`${fieldLabel(m[1].trim())}: ${germanRule(m[2], m[3])}`);
+    }
+    return parts.length ? `Ungültige Einstellungen – ${parts.join("; ")}` : detail;
+  }
+
+  // Summarised: "Ungueltige Einstellungen: queue.nice_level: Input should ...; ...".
+  const summary = /^Ung(?:ue|ü)ltige Einstellungen:\s*(.+)$/s.exec(detail);
+  if (summary) {
+    const parts = summary[1].split(/;\s*/).map((part) => {
+      const m = /^([\w.]+):\s*(.+)$/s.exec(part.trim());
+      if (!m) return part.trim();
+      const message = m[2].trim();
+      // German messages from the server's own validators stay as they are.
+      const rule = PYDANTIC_TEXT.test(message) ? germanRule(message) : message;
+      return `${fieldLabel(m[1])}: ${rule}`;
+    });
+    return `Ungültige Einstellungen – ${parts.join("; ")}`;
+  }
+  return detail;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`/api${path}`, {
-    headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
-    ...init,
-  });
+  const response = await fetch(`/api${path}`, buildInit(init));
   if (!response.ok) {
     let detail = `${response.status} ${response.statusText}`;
     try {
       const body = await response.json();
-      if (body?.detail) detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+      if (body?.detail !== undefined) detail = describeErrorDetail(body.detail);
     } catch {
       /* keep the status line */
     }
@@ -27,14 +162,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
+const json = (body: unknown) => (body === undefined ? undefined : JSON.stringify(body));
+
 export const api = {
-  get: <T,>(path: string) => request<T>(path),
-  post: <T,>(path: string, body?: unknown) =>
-    request<T>(path, { method: "POST", body: body === undefined ? undefined : JSON.stringify(body) }),
-  put: <T,>(path: string, body: unknown) =>
-    request<T>(path, { method: "PUT", body: JSON.stringify(body) }),
+  get: <T,>(path: string, opts?: RequestOpts) => request<T>(path, { signal: opts?.signal }),
+  post: <T,>(path: string, body?: unknown, opts?: RequestOpts) =>
+    request<T>(path, { method: "POST", body: json(body), signal: opts?.signal }),
+  put: <T,>(path: string, body: unknown) => request<T>(path, { method: "PUT", body: json(body) }),
   patch: <T,>(path: string, body: unknown) =>
-    request<T>(path, { method: "PATCH", body: JSON.stringify(body) }),
+    request<T>(path, { method: "PATCH", body: json(body) }),
   del: <T,>(path: string) => request<T>(path, { method: "DELETE" }),
 };
 
@@ -64,6 +200,7 @@ export interface MediaFile {
   video_bitrate: number;
   bit_depth: number;
   is_hdr: boolean;
+  /** "hdr10", "hdr10plus", "hlg", "dolby_vision" or "dolby_vision_p<N>". */
   hdr_format: string;
   interlaced: boolean;
   state: FileState;
@@ -210,7 +347,6 @@ export interface LibraryPathEntry {
   path: string;
   name: string;
   enabled: boolean;
-  profile: string | null;
   file_count?: number;
   total_size?: number;
   candidates?: number;
@@ -286,11 +422,16 @@ export interface ScanState {
   new?: number;
 }
 
+/** Why the queue does not start anything right now ("" = it would). */
+export type BlockedKind = "" | "paused" | "schedule" | "disk" | "scan";
+
 export interface QueueStatus {
   running_jobs: number[];
   paused: boolean;
   schedule_ok: boolean;
   blocked_reason: string;
+  /** Missing on backends that predate it - see ``blockedKind`` in format.ts. */
+  blocked_kind?: BlockedKind;
   max_concurrent: number;
 }
 
@@ -310,9 +451,11 @@ export interface Stats {
   model: ModelStats;
 }
 
+export type HistoryLevel = "info" | "success" | "warning" | "error";
+
 export interface HistoryItem {
   id: number;
-  level: "info" | "success" | "warning" | "error";
+  level: HistoryLevel;
   category: string;
   message: string;
   file_id: number | null;
@@ -340,6 +483,13 @@ export interface FileListResponse {
   page_size: number;
   pages: number;
   aggregate: { count: number; total_size: number; potential_saving: number };
+}
+
+export interface JobListResponse {
+  items: Job[];
+  /** Per state, over all jobs - not just the ones in ``items``. */
+  counts: Partial<Record<JobState, number>>;
+  worker: QueueStatus;
 }
 
 export type AdvisorProviderId = "anthropic" | "openai_compatible" | "openai_codex";
@@ -415,6 +565,7 @@ export interface Settings {
     skip_codecs: string[];
     skip_if_bitrate_below_kbps: number;
     analysis_workers: number;
+    dolby_vision: "skip" | "hdr10_fallback";
     use_learning_model: boolean;
     trust_learning_after_samples: number;
   };
@@ -452,6 +603,7 @@ export interface Settings {
     output_dir: string;
     sidecar_suffix: string;
     original_action: "delete" | "trash" | "keep";
+    /** Empty = ``<library root>/.optimizarr-trash``. */
     trash_dir: string;
     trash_retention_days: number;
     preserve_mtime: boolean;
@@ -490,9 +642,11 @@ export interface Settings {
   advisor: {
     enabled: boolean;
     provider: AdvisorProviderId;
+    /** Secret: ``SECRET_MASK`` when stored, "" when not. */
     api_key: string;
     model: string;
     openai_base_url: string;
+    /** Secret: ``SECRET_MASK`` when stored, "" when not. */
     openai_api_key: string;
     openai_model: string;
     openai_structured_mode: "auto" | "json_schema" | "json_object" | "prompt";
@@ -510,14 +664,19 @@ export interface Settings {
     include_filename: boolean;
   };
   notifications: {
+    /** Secret: ``SECRET_MASK`` when stored, "" when not. */
     webhook_url: string;
     notify_on_job_done: boolean;
     notify_on_job_failed: boolean;
     notify_on_scan_done: boolean;
   };
+  security: {
+    auth_enabled: boolean;
+    username: string;
+    /** Secret: ``SECRET_MASK`` when set, "" when not.  Hashed by the server. */
+    password: string;
+  };
   ui: {
-    theme: "dark" | "light" | "system";
-    language: "de" | "en";
     size_unit: "binary" | "decimal";
     dashboard_refresh_seconds: number;
   };
@@ -631,26 +790,49 @@ export interface EnqueueResult {
   message: string;
 }
 
+export interface BrowseResult {
+  path: string;
+  parent: string | null;
+  entries: { name: string; path: string; readable: boolean }[];
+}
+
 /* -------------------------------------------------------------------------- */
 /* Endpoints                                                                  */
 /* -------------------------------------------------------------------------- */
 
+/** Query string from the defined, non-empty values. */
+function query(params: Record<string, string | number | undefined>): string {
+  const q = new URLSearchParams();
+  Object.entries(params).forEach(([k, v]) => {
+    if (v !== undefined && v !== "") q.set(k, String(v));
+  });
+  const s = q.toString();
+  return s ? `?${s}` : "";
+}
+
+// GET endpoints take ``opts`` last so they can be handed to useQuery as the
+// query function directly: react-query passes its context, whose ``signal``
+// aborts the request when the result is no longer wanted.
 export const endpoints = {
-  systemInfo: () => api.get<SystemInfo>("/system/info"),
+  systemInfo: (opts?: RequestOpts) => api.get<SystemInfo>("/system/info", opts),
   detectHardware: () => api.post<HardwareReport>("/system/detect-hardware"),
-  renderDevices: () =>
+  renderDevices: (opts?: RequestOpts) =>
     api.get<{ devices: { path: string; writable: boolean; is_render_node: boolean }[]; dri_present: boolean }>(
       "/system/render-devices",
+      opts,
     ),
   refitModel: () => api.post<ModelStats>("/system/refit-model"),
 
-  advisorOverview: () => api.get<AdvisorOverview>("/advisor/providers"),
+  advisorOverview: (opts?: RequestOpts) => api.get<AdvisorOverview>("/advisor/providers", opts),
   advisorTest: (payload: Record<string, string>) =>
     api.post<AdvisorTestResult>("/advisor/test", payload),
+  /** POST, so the key never ends up in a URL or an access log. An empty key
+   *  lets the server use the stored one - only for the stored base URL. */
   advisorOpenAIModels: (baseUrl: string, apiKey: string) =>
-    api.get<{ ok: boolean; models: string[]; message: string }>(
-      `/advisor/openai/models?base_url=${encodeURIComponent(baseUrl)}&api_key=${encodeURIComponent(apiKey)}`,
-    ),
+    api.post<{ ok: boolean; models: string[]; message: string }>("/advisor/openai/models", {
+      base_url: baseUrl,
+      api_key: apiKey || null,
+    }),
   codexStart: () =>
     api.post<{ authorize_url: string; state: string; redirect_uri: string; instructions: string }>(
       "/advisor/codex/start",
@@ -670,35 +852,33 @@ export const endpoints = {
       `/advisor/codex/models?refresh=${refresh}`,
     ),
 
-  settings: () => api.get<Settings>("/settings"),
+  settings: (opts?: RequestOpts) => api.get<Settings>("/settings", opts),
   saveSettings: (patch: SettingsPatch) => api.put<SettingsSaveResult>("/settings", patch),
   applyProfile: (name: string) => api.post<Settings>(`/settings/profile/${name}`),
-  testAdvisor: (payload: { api_key?: string; model?: string }) =>
-    api.post<{ ok: boolean; message: string }>("/settings/test-advisor", payload),
   resetSettings: () => api.post<SettingsSaveResult>("/settings/reset"),
+  /** An empty or masked URL tests the stored one. */
+  testNotification: (webhookUrl?: string) =>
+    api.post<{ ok: boolean; message: string }>(
+      "/notifications/test",
+      webhookUrl ? { webhook_url: webhookUrl } : {},
+    ),
 
-  libraryPaths: () => api.get<LibraryPathEntry[]>("/library/paths"),
-  libraryCodecs: () => api.get<LibraryCodecs>("/library/codecs"),
+  libraryPaths: (opts?: RequestOpts) => api.get<LibraryPathEntry[]>("/library/paths", opts),
+  libraryCodecs: (opts?: RequestOpts) => api.get<LibraryCodecs>("/library/codecs", opts),
   addLibraryPath: (payload: { path: string; name?: string }) =>
     api.post<LibraryPathEntry>("/library/paths", payload),
   updateLibraryPath: (id: number, payload: Partial<LibraryPathEntry>) =>
     api.patch<LibraryPathEntry>(`/library/paths/${id}`, payload),
-  deleteLibraryPath: (id: number) => api.del<{ ok: boolean }>(`/library/paths/${id}`),
-  browse: (path: string) =>
-    api.get<{ path: string; parent: string | null; entries: { name: string; path: string; readable: boolean }[] }>(
-      `/library/browse?path=${encodeURIComponent(path)}`,
-    ),
+  deleteLibraryPath: (id: number) =>
+    api.del<{ ok: boolean; jobs_cancelled?: number; jobs_removed?: number }>(`/library/paths/${id}`),
+  browse: (path: string, opts?: RequestOpts) =>
+    api.get<BrowseResult>(`/library/browse${query({ path })}`, opts),
 
-  files: (params: Record<string, string | number | undefined>) => {
-    const query = new URLSearchParams();
-    Object.entries(params).forEach(([k, v]) => {
-      if (v !== undefined && v !== "") query.set(k, String(v));
-    });
-    return api.get<FileListResponse>(`/files?${query.toString()}`);
-  },
-  file: (id: number) => api.get<MediaFile>(`/files/${id}`),
+  files: (params: Record<string, string | number | undefined>, opts?: RequestOpts) =>
+    api.get<FileListResponse>(`/files${query(params)}`, opts),
+  file: (id: number, opts?: RequestOpts) => api.get<MediaFile>(`/files/${id}`, opts),
   analyzeFile: (id: number, depth?: string) =>
-    api.post<MediaFile>(`/files/${id}/analyze${depth ? `?depth=${depth}` : ""}`),
+    api.post<MediaFile>(`/files/${id}/analyze${query({ depth })}`),
   dryRun: (id: number, seconds = 15) =>
     api.post<DryRunResult>(`/files/${id}/dry-run`, { seconds }),
   ignoreFile: (id: number, ignored: boolean) =>
@@ -707,12 +887,11 @@ export const endpoints = {
   startScan: (payload?: { depth?: string; file_ids?: number[] }) =>
     api.post<{ ok: boolean; status: ScanState }>("/scan", payload ?? {}),
   cancelScan: () => api.post<{ ok: boolean }>("/scan/cancel"),
-  scanStatus: () => api.get<{ live: ScanState; last_run: unknown }>("/scan/status"),
 
-  jobs: (state?: string) => api.get<{ items: Job[]; counts: Record<string, number>; worker: QueueStatus }>(
-    `/jobs${state ? `?state=${state}` : ""}`,
-  ),
-  job: (id: number) => api.get<Job>(`/jobs/${id}`),
+  /** ``state``: "active" (queued + running), "finished", or one job state. */
+  jobs: (params: { state?: string; limit?: number } = {}, opts?: RequestOpts) =>
+    api.get<JobListResponse>(`/jobs${query(params)}`, opts),
+  job: (id: number, opts?: RequestOpts) => api.get<Job>(`/jobs/${id}`, opts),
   enqueue: (payload: {
     file_ids?: number[];
     all_candidates?: boolean;
@@ -725,15 +904,17 @@ export const endpoints = {
   clearFinished: () => api.del<{ removed: number }>("/jobs/finished"),
   pauseQueue: (paused: boolean) => api.post<{ paused: boolean }>("/queue/pause", { paused }),
 
-  series: () => api.get<{ items: SeriesSummary[]; totals: SeriesTally }>("/series"),
-  seriesDetail: (key: string) =>
-    api.get<SeriesDetail>(`/series/detail?key=${encodeURIComponent(key)}`),
+  series: (opts?: RequestOpts) =>
+    api.get<{ items: SeriesSummary[]; totals: SeriesTally }>("/series", opts),
+  seriesDetail: (key: string, opts?: RequestOpts) =>
+    api.get<SeriesDetail>(`/series/detail${query({ key })}`, opts),
   enqueueSeries: (payload: { key: string; season?: number; force?: boolean }) =>
     api.post<EnqueueResult>("/series/enqueue", payload),
-  movies: () => api.get<{ items: MovieSummary[]; totals: SeriesTally }>("/movies"),
+  movies: (opts?: RequestOpts) =>
+    api.get<{ items: MovieSummary[]; totals: SeriesTally }>("/movies", opts),
 
-  stats: () => api.get<Stats>("/stats"),
-  modelStats: () =>
+  stats: (opts?: RequestOpts) => api.get<Stats>("/stats", opts),
+  modelStats: (opts?: RequestOpts) =>
     api.get<{
       stats: ModelStats;
       samples: {
@@ -746,6 +927,11 @@ export const endpoints = {
         source_codec: string;
         vmaf: number | null;
       }[];
-    }>("/stats/model"),
-  history: (limit = 60) => api.get<HistoryItem[]>(`/history?limit=${limit}`),
+    }>("/stats/model", opts),
+  /** ``level`` is filtered by the server, so the limit applies to that level. */
+  history: (params: { limit?: number; level?: string } = {}, opts?: RequestOpts) =>
+    api.get<HistoryItem[]>(
+      `/history${query({ limit: params.limit ?? 60, level: params.level === "all" ? undefined : params.level })}`,
+      opts,
+    ),
 };

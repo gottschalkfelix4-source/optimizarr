@@ -12,7 +12,7 @@ import {
   fileReason,
   pick,
 } from "../components/groups";
-import { EmptyState, Panel, Select, Skeleton, StateBadge } from "../components/ui";
+import { EmptyState, ErrorState, Panel, Select, Skeleton, StateBadge } from "../components/ui";
 import {
   endpoints,
   type EnqueueResult,
@@ -36,9 +36,9 @@ const FILTERS = [
 const SORTS = [
   { value: "title", label: "Titel" },
   { value: "year", label: "Jahr (neueste zuerst)" },
-  { value: "size", label: "Groesse" },
+  { value: "size", label: "Größe" },
   { value: "saved", label: "Gespart" },
-  { value: "potential", label: "Noch moeglich" },
+  { value: "potential", label: "Noch möglich" },
 ];
 
 /** Rows rendered at once - big movie libraries run into the thousands. */
@@ -60,7 +60,7 @@ export default function MoviesPage() {
 
   useEffect(() => setLimit(PAGE), [search, filter, sort]);
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: ["movies"],
     queryFn: endpoints.movies,
     refetchInterval: 30000,
@@ -151,7 +151,7 @@ export default function MoviesPage() {
           tone="save"
         />
         <Stat
-          label="Noch moeglich"
+          label="Noch möglich"
           value={bytes(totals?.potential_saving)}
           hint={`${number(totals?.counts.pending ?? 0)} Kandidaten`}
         />
@@ -166,16 +166,17 @@ export default function MoviesPage() {
               <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-ink-500" />
               <input
                 className="field pl-9"
-                placeholder="Film oder Jahr suchen..."
+                placeholder="Film oder Jahr suchen …"
+                aria-label="Film oder Jahr suchen"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
               />
             </div>
             <div className="w-44">
-              <Select value={filter} onChange={setFilter} options={FILTERS} />
+              <Select value={filter} onChange={setFilter} options={FILTERS} ariaLabel="Filter" />
             </div>
             <div className="w-52">
-              <Select value={sort} onChange={setSort} options={SORTS} />
+              <Select value={sort} onChange={setSort} options={SORTS} ariaLabel="Sortierung" />
             </div>
           </>
         }
@@ -204,7 +205,9 @@ export default function MoviesPage() {
           </div>
         )}
 
-        {isLoading ? (
+        {isError && !data ? (
+          <ErrorState error={error} onRetry={() => refetch()} title="Filme konnten nicht geladen werden" />
+        ) : isLoading ? (
           <div className="space-y-2 p-4">
             {Array.from({ length: 8 }).map((_, i) => (
               <Skeleton key={i} className="h-12" />
@@ -218,7 +221,7 @@ export default function MoviesPage() {
               movieCount
                 ? undefined
                 : "Als Film gilt jeder Ordner einer Bibliothek ohne Staffeln oder Folgen, " +
-                  "z.B. Filme/Dune (2021)/Dune (2021).mkv."
+                  "z. B. Filme/Dune (2021)/Dune (2021).mkv."
             }
           />
         ) : (
@@ -227,13 +230,17 @@ export default function MoviesPage() {
               <table className="w-full text-sm">
                 <thead className="border-b border-ink-800/80 text-left text-xs text-ink-500">
                   <tr>
-                    <th className="w-8 px-3 py-2" />
+                    <th className="w-8 px-3 py-2">
+                      <span className="sr-only">Aufklappen</span>
+                    </th>
                     <th className="px-2 py-2 font-medium">Titel</th>
                     <th className="hidden px-3 py-2 font-medium md:table-cell">Datei</th>
-                    <th className="px-3 py-2 text-right font-medium">Groesse</th>
+                    <th className="px-3 py-2 text-right font-medium">Größe</th>
                     <th className="hidden px-3 py-2 text-right font-medium sm:table-cell">Ersparnis</th>
                     <th className="px-3 py-2 font-medium">Status</th>
-                    <th className="w-12 px-3 py-2" />
+                    <th className="w-12 px-3 py-2">
+                      <span className="sr-only">Aktionen</span>
+                    </th>
                   </tr>
                 </thead>
                 <tbody>

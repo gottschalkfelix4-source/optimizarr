@@ -14,7 +14,7 @@ import {
   fileReason,
   share,
 } from "../components/groups";
-import { EmptyState, Panel, Select, Skeleton, StateBadge } from "../components/ui";
+import { EmptyState, ErrorState, Panel, Select, Skeleton, StateBadge } from "../components/ui";
 import {
   endpoints,
   type EnqueueResult,
@@ -30,16 +30,16 @@ const FILTERS = [
   { value: "open", label: "Noch nicht fertig" },
   { value: "complete", label: "Komplett in AV1" },
   { value: "candidates", label: "Mit Kandidaten" },
-  { value: "excluded", label: "Mit Ausschluessen" },
+  { value: "excluded", label: "Mit Ausschlüssen" },
   { value: "failed", label: "Mit Fehlern" },
 ];
 
 const SORTS = [
   { value: "name", label: "Name" },
   { value: "progress", label: "Fortschritt (offen zuerst)" },
-  { value: "size", label: "Groesse" },
+  { value: "size", label: "Größe" },
   { value: "saved", label: "Gespart" },
-  { value: "potential", label: "Noch moeglich" },
+  { value: "potential", label: "Noch möglich" },
 ];
 
 export default function SeriesPage() {
@@ -48,7 +48,7 @@ export default function SeriesPage() {
   const [sort, setSort] = useState("name");
   const [open, setOpen] = useState<Set<string>>(new Set());
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: ["series"],
     queryFn: endpoints.series,
     refetchInterval: 30000,
@@ -115,7 +115,7 @@ export default function SeriesPage() {
           tone="save"
         />
         <Stat
-          label="Noch moeglich"
+          label="Noch möglich"
           value={bytes(totals?.potential_saving)}
           hint={`${number(totals?.counts.pending ?? 0)} Kandidaten`}
         />
@@ -123,30 +123,33 @@ export default function SeriesPage() {
 
       <Panel
         title="Serien"
-        subtitle="Nach Serie und Staffel gruppiert - erkannt an der Ordnerstruktur"
+        subtitle="Nach Serie und Staffel gruppiert – erkannt an der Ordnerstruktur"
         actions={
           <>
             <div className="relative w-56">
               <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-ink-500" />
               <input
                 className="field pl-9"
-                placeholder="Serie suchen..."
+                placeholder="Serie suchen …"
+                aria-label="Serie suchen"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
               />
             </div>
             <div className="w-44">
-              <Select value={filter} onChange={setFilter} options={FILTERS} />
+              <Select value={filter} onChange={setFilter} options={FILTERS} ariaLabel="Filter" />
             </div>
             <div className="w-56">
-              <Select value={sort} onChange={setSort} options={SORTS} />
+              <Select value={sort} onChange={setSort} options={SORTS} ariaLabel="Sortierung" />
             </div>
           </>
         }
         bodyClassName="p-0"
       >
         <Legend />
-        {isLoading ? (
+        {isError && !data ? (
+          <ErrorState error={error} onRetry={() => refetch()} title="Serien konnten nicht geladen werden" />
+        ) : isLoading ? (
           <div className="space-y-2 p-4">
             {Array.from({ length: 6 }).map((_, i) => (
               <Skeleton key={i} className="h-14" />
@@ -159,7 +162,7 @@ export default function SeriesPage() {
             description={
               hasSeries
                 ? undefined
-                : "Serien werden an der Ordnerstruktur erkannt, z.B. Serie/Staffel 01/Serie - S01E01.mkv. " +
+                : "Serien werden an der Ordnerstruktur erkannt, z. B. Serie/Staffel 01/Serie - S01E01.mkv. " +
                   "Sobald ein Scan solche Dateien findet, erscheinen sie hier."
             }
           />
@@ -225,7 +228,7 @@ function SeriesRow({
             <span className="block text-ink-600">-</span>
           )}
           {series.potential_saving > 0 && (
-            <span className="block text-ink-500">~ -{bytes(series.potential_saving)} moeglich</span>
+            <span className="block text-ink-500">~ -{bytes(series.potential_saving)} möglich</span>
           )}
         </span>
       </button>
@@ -241,9 +244,9 @@ function SeriesDetailView({ seriesKey }: { seriesKey: string }) {
     null,
   );
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: ["series", "detail", seriesKey],
-    queryFn: () => endpoints.seriesDetail(seriesKey),
+    queryFn: ({ signal }) => endpoints.seriesDetail(seriesKey, { signal }),
   });
 
   const onResult = (result: EnqueueResult) => {
@@ -269,6 +272,14 @@ function SeriesDetailView({ seriesKey }: { seriesKey: string }) {
     onSuccess: onResult,
     onError: (e: Error) => push(e.message, "error"),
   });
+
+  if (isError && !data) {
+    return (
+      <div className="border-t border-ink-800/80 bg-ink-950/30">
+        <ErrorState compact error={error} onRetry={() => refetch()} />
+      </div>
+    );
+  }
 
   if (isLoading || !data) {
     return (
@@ -317,7 +328,7 @@ function SeriesDetailView({ seriesKey }: { seriesKey: string }) {
             key={String(season.season)}
             season={season}
             busy={busy}
-            onQueue={() => enqueueGroup.mutate({ season: season.season ?? undefined, force: false })}
+            onQueue={() => enqueueGroup.mutate({ season: seasonParam(season), force: false })}
             onForce={() => setConfirm({ season, count: countFor(season.files, true) })}
             onEpisode={(id, force) => enqueueFile.mutate({ id, force })}
           />
@@ -333,7 +344,10 @@ function SeriesDetailView({ seriesKey }: { seriesKey: string }) {
         onClose={() => setConfirm(null)}
         onConfirm={() =>
           confirm &&
-          enqueueGroup.mutate({ season: confirm.season?.season ?? undefined, force: true })
+          enqueueGroup.mutate({
+            season: confirm.season ? seasonParam(confirm.season) : undefined,
+            force: true,
+          })
         }
       />
     </div>
@@ -357,6 +371,7 @@ function SeasonBlock({
   const [open, setOpen] = useState(season.in_av1 < season.episodes);
   const pending = countFor(season.files, false);
   const forceable = countFor(season.files, true);
+  const loose = season.season === null;
 
   return (
     <div className="overflow-hidden rounded-lg border border-ink-800 bg-ink-900/60">
@@ -383,26 +398,24 @@ function SeasonBlock({
             <span className="text-save-400"> · -{bytes(season.saved_bytes)}</span>
           )}
         </span>
-        {/* Loose files have no season to address; they are reachable per row. */}
-        {season.season !== null && (
-          <div className="flex gap-1">
-            <IconButton
-              title={`Kandidaten dieser Staffel einreihen (${pending})`}
-              disabled={!pending || busy}
-              onClick={onQueue}
-            >
-              <Play className="size-3.5" />
-            </IconButton>
-            <IconButton
-              tone="warn"
-              title={`Staffel trotzdem konvertieren (${forceable})`}
-              disabled={!forceable || busy}
-              onClick={onForce}
-            >
-              <Zap className="size-3.5" />
-            </IconButton>
-          </div>
-        )}
+        {/* Loose files ("Ohne Staffel") are addressed as season -1. */}
+        <div className="flex gap-1">
+          <IconButton
+            title={`Kandidaten ${loose ? "ohne Staffel" : "dieser Staffel"} einreihen (${pending})`}
+            disabled={!pending || busy}
+            onClick={onQueue}
+          >
+            <Play className="size-3.5" aria-hidden="true" />
+          </IconButton>
+          <IconButton
+            tone="warn"
+            title={`${loose ? "Dateien ohne Staffel" : "Staffel"} trotzdem konvertieren (${forceable})`}
+            disabled={!forceable || busy}
+            onClick={onForce}
+          >
+            <Zap className="size-3.5" aria-hidden="true" />
+          </IconButton>
+        </div>
       </div>
       {open && (
         <div className="overflow-x-auto border-t border-ink-800">
@@ -423,6 +436,11 @@ function SeasonBlock({
       )}
     </div>
   );
+}
+
+/** The API's season number for a group: -1 addresses the files without one. */
+export function seasonParam(season: Pick<SeriesSeason, "season">): number {
+  return season.season ?? -1;
 }
 
 function episodeCode(ep: SeriesEpisode): string {

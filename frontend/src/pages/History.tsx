@@ -4,7 +4,7 @@ import { AlertTriangle, CheckCircle2, History as HistoryIcon, Info, XCircle } fr
 import { useState } from "react";
 import { endpoints, type HistoryItem } from "../lib/api";
 import { bytes, dateTime, relativeTime } from "../lib/format";
-import { EmptyState, Panel, Select, Skeleton, cn } from "../components/ui";
+import { EmptyState, ErrorState, Panel, Select, Skeleton, cn } from "../components/ui";
 
 const LEVEL_META = {
   success: { icon: CheckCircle2, className: "text-save-400" },
@@ -12,6 +12,14 @@ const LEVEL_META = {
   warning: { icon: AlertTriangle, className: "text-warn-400" },
   error: { icon: XCircle, className: "text-danger-400" },
 } as const;
+
+const LEVEL_OPTIONS = [
+  { value: "all", label: "Alle Meldungen" },
+  { value: "success", label: "Erfolge" },
+  { value: "warning", label: "Warnungen" },
+  { value: "error", label: "Fehler" },
+  { value: "info", label: "Infos" },
+];
 
 const CATEGORY_LABELS: Record<string, string> = {
   scan: "Scan",
@@ -23,13 +31,17 @@ const CATEGORY_LABELS: Record<string, string> = {
 export default function HistoryPage() {
   const [level, setLevel] = useState("all");
 
-  const { data, isLoading } = useQuery({
-    queryKey: ["history"],
-    queryFn: () => endpoints.history(150),
+  // Filtered by the server: filtering the last 150 entries here left rare
+  // levels (errors) empty although older ones existed.
+  const { data, isLoading, isError, error, refetch } = useQuery({
+    queryKey: ["history", level],
+    queryFn: ({ signal }) => endpoints.history({ limit: 150, level }, { signal }),
     refetchInterval: 20000,
+    placeholderData: (prev) => prev,
   });
 
-  const items = (data ?? []).filter((item) => level === "all" || item.level === level);
+  const items = data ?? [];
+  const levelLabel = LEVEL_OPTIONS.find((o) => o.value === level)?.label ?? "";
 
   return (
     <Panel
@@ -37,33 +49,33 @@ export default function HistoryPage() {
       subtitle="Alles, was Optimizarr getan hat"
       actions={
         <div className="w-40">
-          <Select
-            value={level}
-            onChange={setLevel}
-            options={[
-              { value: "all", label: "Alle Meldungen" },
-              { value: "success", label: "Erfolge" },
-              { value: "warning", label: "Warnungen" },
-              { value: "error", label: "Fehler" },
-              { value: "info", label: "Infos" },
-            ]}
-          />
+          <Select value={level} onChange={setLevel} options={LEVEL_OPTIONS} ariaLabel="Art der Meldung" />
         </div>
       }
       bodyClassName="p-0"
     >
-      {isLoading ? (
+      {isError && !data ? (
+        <ErrorState error={error} onRetry={() => refetch()} title="Verlauf konnte nicht geladen werden" />
+      ) : isLoading ? (
         <div className="space-y-2 p-4">
           {Array.from({ length: 8 }).map((_, i) => (
             <Skeleton key={i} className="h-14" />
           ))}
         </div>
       ) : items.length === 0 ? (
-        <EmptyState
-          icon={<HistoryIcon className="size-8" />}
-          title="Noch nichts passiert"
-          description="Sobald ein Scan laeuft oder eine Datei konvertiert wird, erscheint es hier."
-        />
+        level === "all" ? (
+          <EmptyState
+            icon={<HistoryIcon className="size-8" />}
+            title="Noch nichts passiert"
+            description="Sobald ein Scan läuft oder eine Datei konvertiert wird, erscheint es hier."
+          />
+        ) : (
+          <EmptyState
+            icon={<HistoryIcon className="size-8" />}
+            title={`Keine Einträge unter „${levelLabel}“`}
+            description="Unter „Alle Meldungen“ steht, was sonst passiert ist."
+          />
+        )
       ) : (
         <ul className="divide-y divide-ink-800/80">
           {items.map((item) => (
@@ -84,7 +96,7 @@ function HistoryRow({ item }: { item: HistoryItem }) {
 
   return (
     <li className="flex items-start gap-3 px-5 py-3">
-      <Icon className={cn("mt-0.5 size-4 shrink-0", meta.className)} />
+      <Icon className={cn("mt-0.5 size-4 shrink-0", meta.className)} aria-hidden="true" />
       <div className="min-w-0 flex-1">
         <p className="text-sm leading-relaxed text-ink-100">{item.message}</p>
         <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-ink-500">

@@ -12,9 +12,10 @@ import {
   Sparkles,
   UserCheck,
 } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import {
   endpoints,
+  SECRET_MASK,
   type AdvisorOverview,
   type AdvisorProviderId,
   type AdvisorTestResult,
@@ -29,11 +30,13 @@ import {
   Modal,
   NumberField,
   Panel,
+  SecretField,
   Select,
   SliderField,
   Spinner,
   Toggle,
   cn,
+  withCurrent,
 } from "./ui";
 
 type UpdateFn = <K extends keyof Settings>(group: K, patch: Partial<Settings[K]>) => void;
@@ -46,9 +49,11 @@ const PROVIDER_ICONS: Record<AdvisorProviderId, typeof Brain> = {
 
 export function AdvisorSettings({
   draft,
+  saved,
   update,
 }: {
   draft: Settings;
+  saved: Settings;
   update: UpdateFn;
 }) {
   const { push } = useToast();
@@ -92,6 +97,7 @@ export function AdvisorSettings({
       queryClient.invalidateQueries({ queryKey: ["advisor"] });
       queryClient.invalidateQueries({ queryKey: ["system"] });
     },
+    onError: (e: Error) => push(e.message, "error"),
   });
 
   const provider = draft.advisor.provider;
@@ -100,11 +106,11 @@ export function AdvisorSettings({
   return (
     <div className="space-y-4">
       <Callout tone="info" icon={<Sparkles className="size-4" />}>
-        Die lokale Analyse entscheidet auch ohne diese Funktion vollstaendig eigenstaendig. Der
-        KI-Berater ergaenzt das, was Messwerte nicht sehen koennen: ob ein Film ein koerniger
-        Klassiker ist, ein flaechiger Anime oder eine dunkle Konzertaufnahme - und passt CRF und
-        Filmkorn entsprechend an. Jede Aenderung wird auf den eingestellten Rahmen begrenzt, und
-        faellt der Dienst aus, gilt einfach die lokale Entscheidung.
+        Die lokale Analyse entscheidet auch ohne diese Funktion vollständig eigenständig. Der
+        KI-Berater ergänzt das, was Messwerte nicht sehen können: ob ein Film ein körniger
+        Klassiker ist, ein flächiger Anime oder eine dunkle Konzertaufnahme – und passt CRF und
+        Filmkorn entsprechend an. Jede Änderung wird auf den eingestellten Rahmen begrenzt, und
+        fällt der Dienst aus, gilt einfach die lokale Entscheidung.
       </Callout>
 
       <Panel title="Anbieter" subtitle="Es ist immer genau einer aktiv">
@@ -113,7 +119,7 @@ export function AdvisorSettings({
             checked={draft.advisor.enabled}
             onChange={(enabled) => update("advisor", { enabled })}
             label="KI-Berater verwenden"
-            hint="Ohne Aktivierung werden keinerlei Daten nach aussen gesendet."
+            hint="Ohne Aktivierung werden keinerlei Daten nach außen gesendet."
           />
 
           {draft.advisor.enabled && (
@@ -150,7 +156,7 @@ export function AdvisorSettings({
                     <p className="mt-2 text-xs leading-relaxed text-ink-400">{entry.hint}</p>
                     {!entry.sdk_installed && (
                       <p className="mt-2 text-xs text-warn-400">
-                        Benoetigtes Paket fehlt im Container.
+                        Benötigtes Paket fehlt im Container.
                       </p>
                     )}
                   </button>
@@ -162,12 +168,19 @@ export function AdvisorSettings({
       </Panel>
 
       {draft.advisor.enabled && provider === "anthropic" && (
-        <AnthropicPanel draft={draft} update={update} onTest={() => test.mutate()} testing={test.isPending} />
+        <AnthropicPanel
+          draft={draft}
+          keyStored={saved.advisor.api_key === SECRET_MASK}
+          update={update}
+          onTest={() => test.mutate()}
+          testing={test.isPending}
+        />
       )}
 
       {draft.advisor.enabled && provider === "openai_compatible" && (
         <OpenAIPanel
           draft={draft}
+          keyStored={saved.advisor.openai_api_key === SECRET_MASK}
           update={update}
           onTest={() => test.mutate()}
           testing={test.isPending}
@@ -198,13 +211,22 @@ export function AdvisorSettings({
 /* Anthropic                                                                  */
 /* -------------------------------------------------------------------------- */
 
+const ANTHROPIC_MODELS = [
+  { value: "claude-opus-5-5", label: "Claude Opus 5.5 (beste Einschätzung)" },
+  { value: "claude-opus-5", label: "Claude Opus 5" },
+  { value: "claude-sonnet-5", label: "Claude Sonnet 5 (günstiger)" },
+  { value: "claude-haiku-4-5", label: "Claude Haiku 4.5 (am günstigsten)" },
+];
+
 function AnthropicPanel({
   draft,
+  keyStored,
   update,
   onTest,
   testing,
 }: {
   draft: Settings;
+  keyStored: boolean;
   update: UpdateFn;
   onTest: () => void;
   testing: boolean;
@@ -213,20 +235,19 @@ function AnthropicPanel({
     <Panel title="Claude (Anthropic API)">
       <div className="grid gap-5 md:grid-cols-2">
         <Field
-          label="API-Schluessel"
+          label="API-Schlüssel"
           hint="Von console.anthropic.com. Wird lokal gespeichert und nur an die Anthropic-API gesendet."
         >
           <div className="flex gap-2">
-            <input
-              type="password"
-              className="field font-mono text-sm"
+            <SecretField
               value={draft.advisor.api_key}
-              onChange={(e) => update("advisor", { api_key: e.target.value })}
-              placeholder="sk-ant-..."
-              autoComplete="off"
+              stored={keyStored}
+              onChange={(api_key) => update("advisor", { api_key })}
+              placeholder="sk-ant-…"
+              ariaLabel="Anthropic-API-Schlüssel"
             />
             <button className="btn-ghost shrink-0" onClick={onTest} disabled={testing}>
-              {testing ? <Spinner className="size-4" /> : <Check className="size-4" />}
+              {testing ? <Spinner className="size-4" /> : <Check className="size-4" aria-hidden="true" />}
               Testen
             </button>
           </div>
@@ -235,11 +256,8 @@ function AnthropicPanel({
           <Select
             value={draft.advisor.model}
             onChange={(model) => update("advisor", { model })}
-            options={[
-              { value: "claude-opus-5", label: "Claude Opus 5 (beste Einschaetzung)" },
-              { value: "claude-sonnet-5", label: "Claude Sonnet 5 (guenstiger)" },
-              { value: "claude-haiku-4-5", label: "Claude Haiku 4.5 (am guenstigsten)" },
-            ]}
+            ariaLabel="Claude-Modell"
+            options={withCurrent(ANTHROPIC_MODELS, draft.advisor.model)}
           />
         </Field>
       </div>
@@ -251,23 +269,28 @@ function AnthropicPanel({
 /* OpenAI-compatible                                                          */
 /* -------------------------------------------------------------------------- */
 
-const PRESET_ENDPOINTS = [
+/** Hosted services get their real address.  Local ones only get a template:
+ *  the IP of the machine running them is not something a preset can know, and
+ *  an example address that looks real would just time out. */
+const PRESET_ENDPOINTS: { label: string; url?: string; template?: string; port?: string; model: string }[] = [
   { label: "OpenAI", url: "https://api.openai.com/v1", model: "gpt-5" },
   { label: "OpenRouter", url: "https://openrouter.ai/api/v1", model: "openai/gpt-5" },
   { label: "Groq", url: "https://api.groq.com/openai/v1", model: "llama-3.3-70b-versatile" },
   { label: "DeepSeek", url: "https://api.deepseek.com/v1", model: "deepseek-chat" },
-  { label: "Ollama (lokal)", url: "http://192.168.1.10:11434/v1", model: "qwen2.5:14b" },
-  { label: "LM Studio (lokal)", url: "http://192.168.1.10:1234/v1", model: "local-model" },
+  { label: "Ollama (lokal)", template: "http://<IP-des-Rechners>:11434/v1", port: ":11434", model: "qwen2.5:14b" },
+  { label: "LM Studio (lokal)", template: "http://<IP-des-Rechners>:1234/v1", port: ":1234", model: "local-model" },
 ];
 
 function OpenAIPanel({
   draft,
+  keyStored,
   update,
   onTest,
   testing,
   result,
 }: {
   draft: Settings;
+  keyStored: boolean;
   update: UpdateFn;
   onTest: () => void;
   testing: boolean;
@@ -275,6 +298,27 @@ function OpenAIPanel({
 }) {
   const { push } = useToast();
   const [models, setModels] = useState<string[]>([]);
+  const [urlTemplate, setUrlTemplate] = useState("");
+  const urlRef = useRef<HTMLInputElement>(null);
+  const baseUrl = draft.advisor.openai_base_url;
+
+  const applyPreset = (preset: (typeof PRESET_ENDPOINTS)[number]) => {
+    const model = draft.advisor.openai_model || preset.model;
+    if (preset.url) {
+      setUrlTemplate("");
+      update("advisor", { openai_base_url: preset.url, openai_model: model });
+      return;
+    }
+    // Local service: keep an address that already points at that port,
+    // otherwise empty the field and show what to fill in.
+    const keep = preset.port && baseUrl.includes(preset.port);
+    setUrlTemplate(preset.template ?? "");
+    update("advisor", { openai_base_url: keep ? baseUrl : "", openai_model: model });
+    urlRef.current?.focus();
+  };
+
+  const presetActive = (preset: (typeof PRESET_ENDPOINTS)[number]) =>
+    preset.url ? baseUrl === preset.url : !!preset.port && baseUrl.includes(preset.port);
 
   const fetchModels = useMutation({
     mutationFn: () =>
@@ -298,15 +342,11 @@ function OpenAIPanel({
             {PRESET_ENDPOINTS.map((preset) => (
               <button
                 key={preset.label}
-                onClick={() =>
-                  update("advisor", {
-                    openai_base_url: preset.url,
-                    openai_model: draft.advisor.openai_model || preset.model,
-                  })
-                }
+                onClick={() => applyPreset(preset)}
+                aria-pressed={presetActive(preset)}
                 className={cn(
                   "rounded-lg border px-3 py-1.5 text-xs transition-colors",
-                  draft.advisor.openai_base_url === preset.url
+                  presetActive(preset)
                     ? "border-brand-500 bg-brand-600/15 text-brand-400"
                     : "border-ink-700 text-ink-400 hover:border-ink-600 hover:text-ink-200",
                 )}
@@ -316,35 +356,38 @@ function OpenAIPanel({
             ))}
           </div>
           <p className="hint">
-            Setzt nur die Adresse - Modell und Schluessel gibst du darunter selbst an.
+            Setzt die Adresse und – falls das Feld noch leer ist – ein Beispielmodell. Bei lokalen
+            Diensten trägst du die IP des Rechners selbst ein; den Schlüssel gibst du darunter an.
           </p>
         </div>
 
         <div className="grid gap-5 md:grid-cols-2">
           <Field
             label="Endpunkt-URL"
-            hint="Ohne /v1 am Ende wird es automatisch ergaenzt. Lokale Dienste brauchen die IP des Rechners, nicht localhost - der Container hat sein eigenes localhost."
+            hint="Ohne /v1 am Ende wird es automatisch ergänzt. Lokale Dienste brauchen die IP des Rechners, nicht localhost – der Container hat sein eigenes localhost."
           >
             <input
+              ref={urlRef}
               className="field font-mono text-sm"
-              value={draft.advisor.openai_base_url}
+              value={baseUrl}
               onChange={(e) => update("advisor", { openai_base_url: e.target.value })}
-              placeholder="http://192.168.1.10:11434/v1"
+              placeholder={urlTemplate || "http://<IP-des-Rechners>:11434/v1"}
+              aria-label="Endpunkt-URL"
               autoComplete="off"
+              spellCheck={false}
             />
           </Field>
 
           <Field
-            label="API-Schluessel"
-            hint="Bei lokalen Diensten ohne Authentifizierung einfach leer lassen."
+            label="API-Schlüssel"
+            hint="Bei lokalen Diensten ohne Authentifizierung einfach leer lassen. Ein gespeicherter Schlüssel wird nur an die gespeicherte Adresse geschickt."
           >
-            <input
-              type="password"
-              className="field font-mono text-sm"
+            <SecretField
               value={draft.advisor.openai_api_key}
-              onChange={(e) => update("advisor", { openai_api_key: e.target.value })}
-              placeholder="sk-... (optional)"
-              autoComplete="off"
+              stored={keyStored}
+              onChange={(openai_api_key) => update("advisor", { openai_api_key })}
+              placeholder="sk-… (optional)"
+              ariaLabel="API-Schlüssel des Endpunkts"
             />
           </Field>
 
@@ -368,6 +411,7 @@ function OpenAIPanel({
                 onClick={() => fetchModels.mutate()}
                 disabled={fetchModels.isPending || !draft.advisor.openai_base_url}
                 title="Modelle vom Endpunkt abrufen"
+                aria-label="Modelle vom Endpunkt abrufen"
               >
                 {fetchModels.isPending ? (
                   <Spinner className="size-4" />
@@ -391,7 +435,7 @@ function OpenAIPanel({
                 { value: "auto", label: "Automatisch aushandeln (empfohlen)" },
                 { value: "json_schema", label: "JSON-Schema erzwingen" },
                 { value: "json_object", label: "Nur JSON-Modus" },
-                { value: "prompt", label: "Nur ueber Prompt-Anweisung" },
+                { value: "prompt", label: "Nur über Prompt-Anweisung" },
               ]}
             />
           </Field>
@@ -414,7 +458,7 @@ function OpenAIPanel({
             Feineinstellungen
           </summary>
           <div className="mt-4 grid gap-5 md:grid-cols-2">
-            <Field label="Maximale Antwortlaenge">
+            <Field label="Maximale Antwortlänge">
               <NumberField
                 value={draft.advisor.openai_max_tokens}
                 onChange={(openai_max_tokens) => update("advisor", { openai_max_tokens })}
@@ -425,7 +469,7 @@ function OpenAIPanel({
             </Field>
             <Field
               label="Temperature"
-              hint="Niedrig heisst berechenbar. Manche Reasoning-Modelle ignorieren den Wert."
+              hint="Niedrig heißt berechenbar. Manche Reasoning-Modelle ignorieren den Wert."
             >
               <SliderField
                 value={draft.advisor.openai_temperature}
@@ -443,7 +487,7 @@ function OpenAIPanel({
                   update("advisor", { openai_send_system_role })
                 }
                 label="System-Nachricht separat senden"
-                hint="Ausschalten, wenn der Dienst die Rolle 'system' nicht kennt - der Text wandert dann in die Nutzernachricht."
+                hint="Ausschalten, wenn der Dienst die Rolle „system“ nicht kennt – der Text wandert dann in die Nutzernachricht."
               />
             </div>
           </div>
@@ -505,9 +549,9 @@ function CodexPanel({
       <div className="space-y-5">
         <Callout tone="warn">
           Dieser Weg meldet sich so an wie das Codex-Kommandozeilenwerkzeug von OpenAI.
-          Vorgesehen ist er fuer OpenAIs eigene Anwendungen - fuer Drittprogramme wie
+          Vorgesehen ist er für OpenAIs eigene Anwendungen – für Drittprogramme wie
           Optimizarr ist das eine Grauzone, und OpenAI kann den Zugang jederzeit
-          einschraenken. Wenn du das vermeiden moechtest, nimm einen Platform-API-Key ueber
+          einschränken. Wenn du das vermeiden möchtest, nimm einen Platform-API-Key über
           den Punkt <strong className="text-ink-100">OpenAI-kompatibler Endpunkt</strong>.
         </Callout>
 
@@ -525,17 +569,17 @@ function CodexPanel({
                   <div className="mt-1 space-y-0.5 text-xs text-ink-400">
                     {status?.expires_at && (
                       <p>
-                        Zugang gueltig bis {dateTime(status.expires_at)}
+                        Zugang gültig bis {dateTime(status.expires_at)}
                         {status.can_refresh
-                          ? " - wird automatisch erneuert."
-                          : " - danach ist eine neue Anmeldung noetig."}
+                          ? " – wird automatisch erneuert."
+                          : " – danach ist eine neue Anmeldung nötig."}
                       </p>
                     )}
                     {status?.last_refresh && <p>Zuletzt erneuert {relativeTime(status.last_refresh)}</p>}
                     {!status?.account_id_present && (
                       <p className="text-warn-400">
-                        Keine Konto-Kennung gefunden - falls Anfragen abgelehnt werden, hilft
-                        eine erneute Anmeldung ueber den Browser.
+                        Keine Konto-Kennung gefunden – falls Anfragen abgelehnt werden, hilft
+                        eine erneute Anmeldung über den Browser.
                       </p>
                     )}
                     {status?.last_error && <p className="text-danger-400">{status.last_error}</p>}
@@ -559,8 +603,8 @@ function CodexPanel({
             <KeyRound className="mx-auto size-8 text-ink-500" />
             <p className="mt-3 font-medium text-ink-100">Noch nicht angemeldet</p>
             <p className="mx-auto mt-1 max-w-md text-sm leading-relaxed text-ink-400">
-              Die Anmeldung laeuft ueber deinen Browser. Weil Optimizarr im Container laeuft,
-              kopierst du dabei einmal eine Adresse hin und her - der Assistent fuehrt dich
+              Die Anmeldung läuft über deinen Browser. Weil Optimizarr im Container läuft,
+              kopierst du dabei einmal eine Adresse hin und her – der Assistent führt dich
               durch die drei Schritte.
             </p>
             <button className="btn-primary mt-4" onClick={onSignIn}>
@@ -575,7 +619,7 @@ function CodexPanel({
             label="Modell"
             hint={
               modelNote ||
-              "Welche Modelle erreichbar sind, gibt OpenAI je nach Konto und Client vor - Liste abrufen."
+              "Welche Modelle erreichbar sind, gibt OpenAI je nach Konto und Client vor – Liste abrufen."
             }
           >
             <div className="flex gap-2">
@@ -595,7 +639,8 @@ function CodexPanel({
                 className="btn-ghost shrink-0"
                 onClick={() => fetchModels.mutate()}
                 disabled={fetchModels.isPending || !signedIn}
-                title="Verfuegbare Modelle vom Konto abrufen"
+                title="Verfügbare Modelle vom Konto abrufen"
+                aria-label="Verfügbare Modelle vom Konto abrufen"
               >
                 {fetchModels.isPending ? (
                   <Spinner className="size-4" />
@@ -616,7 +661,7 @@ function CodexPanel({
           </Field>
           <Field
             label="Denktiefe"
-            hint="Fuer diese Aufgabe reicht die niedrigste Stufe - sie ist schneller und schont das Kontingent."
+            hint="Für diese Aufgabe reicht die niedrigste Stufe – sie ist schneller und schont das Kontingent."
           >
             <Select
               value={draft.advisor.codex_reasoning_effort}
@@ -649,14 +694,22 @@ function CodexSignInModal({ open, onClose }: { open: boolean; onClose: () => voi
     onError: (e: Error) => push(e.message, "error"),
   });
 
+  // Closing - by any route - starts the next attempt from scratch: a pasted
+  // callback address or a half-used login link must not linger.
+  const close = () => {
+    setPasted("");
+    setAuthJson("");
+    setCopied(false);
+    setTab("browser");
+    start.reset();
+    onClose();
+  };
+
   const finish = () => {
     queryClient.invalidateQueries({ queryKey: ["advisor"] });
     queryClient.invalidateQueries({ queryKey: ["settings"] });
     queryClient.invalidateQueries({ queryKey: ["system"] });
-    setPasted("");
-    setAuthJson("");
-    start.reset();
-    onClose();
+    close();
   };
 
   const complete = useMutation({
@@ -684,23 +737,23 @@ function CodexSignInModal({ open, onClose }: { open: boolean; onClose: () => voi
       setCopied(true);
       window.setTimeout(() => setCopied(false), 2000);
     } catch {
-      push("Kopieren nicht moeglich - bitte den Link von Hand markieren.", "error");
+      push("Kopieren nicht möglich – bitte den Link von Hand markieren.", "error");
     }
   };
 
   return (
     <Modal
       open={open}
-      onClose={onClose}
+      onClose={close}
       wide
       title="Mit ChatGPT anmelden"
-      subtitle="Einmalig - danach erneuert sich der Zugang von selbst"
+      subtitle="Einmalig – danach erneuert sich der Zugang von selbst"
     >
       <div className="space-y-5">
         <div className="flex gap-1 rounded-lg border border-ink-700 bg-ink-950/50 p-1">
           {[
-            { id: "browser" as const, label: "Ueber den Browser" },
-            { id: "file" as const, label: "auth.json einfuegen" },
+            { id: "browser" as const, label: "Über den Browser" },
+            { id: "file" as const, label: "auth.json einfügen" },
           ].map((entry) => (
             <button
               key={entry.id}
@@ -734,7 +787,7 @@ function CodexSignInModal({ open, onClose }: { open: boolean; onClose: () => voi
                         className="btn-primary btn-sm"
                       >
                         <ExternalLink className="size-3.5" />
-                        Anmeldeseite oeffnen
+                        Anmeldeseite öffnen
                       </a>
                       <button className="btn-ghost btn-sm" onClick={copyLink}>
                         {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
@@ -742,7 +795,7 @@ function CodexSignInModal({ open, onClose }: { open: boolean; onClose: () => voi
                       </button>
                     </div>
                     <p className="text-xs text-ink-500">
-                      Der Link ist 30 Minuten gueltig.
+                      Der Link ist 30 Minuten gültig.
                     </p>
                   </div>
                 ) : (
@@ -765,7 +818,7 @@ function CodexSignInModal({ open, onClose }: { open: boolean; onClose: () => voi
               body={
                 <p className="text-sm leading-relaxed text-ink-400">
                   Melde dich mit deinem ChatGPT-Konto an. Danach landet der Browser auf einer
-                  Seite, die <strong className="text-ink-200">nicht geladen werden kann</strong> -
+                  Seite, die <strong className="text-ink-200">nicht geladen werden kann</strong> –
                   genau so soll es sein. Kopiere die komplette Adresse aus der Adresszeile; sie
                   beginnt mit{" "}
                   <code className="rounded bg-ink-950 px-1 py-0.5 text-[11px] text-ink-300">
@@ -777,7 +830,7 @@ function CodexSignInModal({ open, onClose }: { open: boolean; onClose: () => voi
 
             <Step
               number={3}
-              title="Adresse hier einfuegen"
+              title="Adresse hier einfügen"
               disabled={!start.data}
               body={
                 <div className="space-y-2">
@@ -785,7 +838,7 @@ function CodexSignInModal({ open, onClose }: { open: boolean; onClose: () => voi
                     className="field h-24 resize-none font-mono text-xs"
                     value={pasted}
                     onChange={(e) => setPasted(e.target.value)}
-                    placeholder="http://localhost:1455/auth/callback?code=..."
+                    placeholder="http://localhost:1455/auth/callback?code=…"
                     spellCheck={false}
                   />
                   <button
@@ -798,7 +851,7 @@ function CodexSignInModal({ open, onClose }: { open: boolean; onClose: () => voi
                     ) : (
                       <Check className="size-3.5" />
                     )}
-                    Anmeldung abschliessen
+                    Anmeldung abschließen
                   </button>
                 </div>
               }
@@ -808,7 +861,7 @@ function CodexSignInModal({ open, onClose }: { open: boolean; onClose: () => voi
           <div className="space-y-3">
             <p className="text-sm leading-relaxed text-ink-400">
               Wenn du das Codex-Kommandozeilenwerkzeug schon auf einem Rechner eingerichtet hast,
-              kannst du dessen Zugangsdaten direkt uebernehmen. Die Datei liegt unter{" "}
+              kannst du dessen Zugangsdaten direkt übernehmen. Die Datei liegt unter{" "}
               <code className="rounded bg-ink-950 px-1 py-0.5 text-[11px] text-ink-300">
                 ~/.codex/auth.json
               </code>{" "}
@@ -831,7 +884,7 @@ function CodexSignInModal({ open, onClose }: { open: boolean; onClose: () => voi
               disabled={importJson.isPending || authJson.trim().length < 20}
             >
               {importJson.isPending ? <Spinner className="size-3.5" /> : <Check className="size-3.5" />}
-              Zugangsdaten uebernehmen
+              Zugangsdaten übernehmen
             </button>
           </div>
         )}
@@ -885,20 +938,20 @@ function SharedBehaviour({
   overview: AdvisorOverview | undefined;
 }) {
   return (
-    <Panel title="Verhalten" subtitle="Gilt fuer jeden Anbieter">
+    <Panel title="Verhalten" subtitle="Gilt für jeden Anbieter">
       <div className="space-y-5">
         <div className="grid gap-5 md:grid-cols-2">
           <Field
             label="Wann gefragt wird"
-            hint="Jede Anfrage kostet - entweder Geld oder Kontingent. 'Nur bei Unsicherheit' fragt genau dann, wenn es etwas bringt."
+            hint="Jede Anfrage kostet – entweder Geld oder Kontingent. „Nur bei unsicherer Einschätzung“ fragt genau dann, wenn es etwas bringt."
           >
             <Select
               value={draft.advisor.mode}
               onChange={(mode) => update("advisor", { mode })}
               options={[
-                { value: "uncertain_only", label: "Nur bei unsicherer Einschaetzung (empfohlen)" },
+                { value: "uncertain_only", label: "Nur bei unsicherer Einschätzung (empfohlen)" },
                 { value: "all_candidates", label: "Bei jedem Kandidaten" },
-                { value: "explain_only", label: "Nur erklaeren, nichts aendern" },
+                { value: "explain_only", label: "Nur erklären, nichts ändern" },
               ]}
             />
           </Field>
@@ -913,7 +966,7 @@ function SharedBehaviour({
           {draft.advisor.mode === "uncertain_only" && (
             <Field
               label="Unsicher unterhalb von"
-              hint="Bezieht sich auf die Sicherheit der lokalen Schaetzung."
+              hint="Bezieht sich auf die Sicherheit der lokalen Schätzung."
             >
               <SliderField
                 value={draft.advisor.uncertain_below_confidence}
@@ -929,7 +982,7 @@ function SharedBehaviour({
           )}
           <Field
             label="Maximale CRF-Verschiebung"
-            hint="Begrenzt, wie stark die KI die Qualitaetseinstellung veraendern darf."
+            hint="Begrenzt, wie stark die KI die Qualitätseinstellung verändern darf."
           >
             <NumberField
               value={draft.advisor.max_crf_delta}
@@ -954,7 +1007,7 @@ function SharedBehaviour({
             checked={draft.advisor.allow_setting_changes}
             onChange={(allow_setting_changes) => update("advisor", { allow_setting_changes })}
             label="Einstellungen anpassen lassen"
-            hint="Aus: die KI liefert nur eine Begruendung, aendert aber keine Werte."
+            hint="Aus: die KI liefert nur eine Begründung, ändert aber keine Werte."
           />
           <Toggle
             checked={draft.advisor.include_filename}
@@ -969,7 +1022,7 @@ function SharedBehaviour({
             {overview.ready ? (
               <>
                 Bereit. In diesem Scan wurden {overview.calls_used} Anfragen gestellt,{" "}
-                {overview.budget_left} bleiben uebrig.
+                {overview.budget_left} bleiben übrig.
               </>
             ) : (
               <span className="text-warn-400">{overview.reason}</span>

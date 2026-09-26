@@ -4,9 +4,12 @@ import {
   AlertTriangle,
   CheckCircle2,
   Clock,
+  FileText,
+  HardDrive,
   Layers,
   Pause,
   RotateCcw,
+  ScanLine,
   Trash2,
   X,
   XCircle,
@@ -15,19 +18,22 @@ import { useState } from "react";
 import { endpoints, type Job } from "../lib/api";
 import type { JobProgress } from "../lib/live";
 import {
+  blockedKind,
   bytes,
   dateTime,
   humanDuration,
   JOB_STATE_LABELS,
+  joinParts,
   number,
-  percent,
   relativeTime,
+  sizeChange,
 } from "../lib/format";
 import { useLive, useToast } from "../lib/live";
 import { useSmoothEta, useSmoothProgress } from "../lib/progress";
 import {
   Callout,
   EmptyState,
+  ErrorState,
   Modal,
   Panel,
   ProgressBar,
@@ -37,16 +43,29 @@ import {
   cn,
 } from "../components/ui";
 
+/** The server's maximum page - everything that is still to do. */
+const ACTIVE_LIMIT = 1000;
+const FINISHED_LIMIT = 100;
+
 export default function Queue() {
   const { push } = useToast();
   const { jobProgress } = useLive();
   const queryClient = useQueryClient();
   const [logJobId, setLogJobId] = useState<number | null>(null);
 
-  const { data, isLoading } = useQuery({
-    queryKey: ["jobs"],
-    queryFn: () => endpoints.jobs(),
+  // Two lists: everything that is still to do (up to the server's maximum),
+  // and the most recent finished jobs.  Headings count from ``counts``, which
+  // covers all jobs - a single mixed list with a limit hid queued jobs behind
+  // hundreds of finished ones.
+  const active = useQuery({
+    queryKey: ["jobs", "active"],
+    queryFn: ({ signal }) => endpoints.jobs({ state: "active", limit: ACTIVE_LIMIT }, { signal }),
     refetchInterval: 8000,
+  });
+  const finishedQuery = useQuery({
+    queryKey: ["jobs", "finished"],
+    queryFn: ({ signal }) => endpoints.jobs({ state: "finished", limit: FINISHED_LIMIT }, { signal }),
+    refetchInterval: 30000,
   });
 
   const cancel = useMutation({
@@ -70,18 +89,23 @@ export default function Queue() {
   const clear = useMutation({
     mutationFn: () => endpoints.clearFinished(),
     onSuccess: (result) => {
-      push(`${result.removed} Eintraege entfernt.`, "success");
+      push(`${result.removed} Einträge entfernt.`, "success");
       queryClient.invalidateQueries({ queryKey: ["jobs"] });
     },
+    onError: (e: Error) => push(e.message, "error"),
   });
 
-  const items = data?.items ?? [];
+  const items = active.data?.items ?? [];
   const running = items.filter((j) => j.state === "running");
   const queued = items.filter((j) => j.state === "queued");
-  const finished = items.filter(
-    (j) => !["running", "queued"].includes(j.state),
-  );
-  const worker = data?.worker;
+  const finished = finishedQuery.data?.items ?? [];
+  const counts = active.data?.counts ?? finishedQuery.data?.counts ?? {};
+  const worker = active.data?.worker ?? finishedQuery.data?.worker;
+  const kind = blockedKind(worker);
+  const runningCount = counts.running ?? running.length;
+  const queuedCount = counts.queued ?? queued.length;
+  const finishedCount =
+    (counts.done ?? 0) + (counts.failed ?? 0) + (counts.rejected ?? 0) + (counts.cancelled ?? 0);
 
   // Forced jobs for files that were never analysed have no prediction; counting
   // them as "input minus 0" would promise their whole size as a saving.
@@ -92,7 +116,20 @@ export default function Queue() {
   // No compute-time total here: eta_seconds only exists for a running encode,
   // so for waiting jobs it is 0 or stale and the sum would be made up.
 
-  if (isLoading) {
+  if (active.isError && !active.data) {
+    return (
+      <Panel>
+        <ErrorState
+          error={active.error}
+          onRetry={() => active.refetch()}
+          title="Warteschlange konnte nicht geladen werden"
+        />
+      </Panel>
+    );
+  }
+
+  // Without the active list, "nothing queued" would be a claim, not a fact.
+  if (!active.data) {
     return (
       <div className="space-y-4">
         <Skeleton className="h-24" />
@@ -103,23 +140,31 @@ export default function Queue() {
 
   return (
     <div className="space-y-5">
-      {worker?.paused && (
+      {kind === "paused" && (
         <Callout tone="warn" icon={<Pause className="size-4" />}>
-          Die Warteschlange ist pausiert. Laufende Jobs werden zu Ende gefuehrt, neue starten nicht.
+          Die Warteschlange ist pausiert. Laufende Jobs werden zu Ende geführt, neue starten nicht.
         </Callout>
       )}
-      {worker && !worker.paused && !worker.schedule_ok && (
+      {kind === "schedule" && (
         <Callout tone="info" icon={<Clock className="size-4" />}>
-          {worker.blocked_reason} Jobs starten automatisch, sobald das Zeitfenster erreicht ist.
+          {worker?.blocked_reason} Jobs starten automatisch, sobald das Zeitfenster erreicht ist.
         </Callout>
       )}
-      {worker?.blocked_reason && worker.schedule_ok && !worker.paused && (
-        <Callout tone="info">{worker.blocked_reason}</Callout>
+      {kind === "disk" && (
+        <Callout tone="warn" icon={<HardDrive className="size-4" />}>
+          {worker?.blocked_reason}
+        </Callout>
       )}
+      {kind === "scan" && (
+        <Callout tone="info" icon={<ScanLine className="size-4" />}>
+          {worker?.blocked_reason}
+        </Callout>
+      )}
+      {kind === "other" && <Callout tone="info">{worker?.blocked_reason}</Callout>}
 
       {/* ---------------- running ---------------- */}
       <Panel
-        title={`Laeuft gerade (${running.length})`}
+        title={`Läuft gerade (${number(runningCount)})`}
         subtitle={
           worker ? `${worker.max_concurrent} gleichzeitige Konvertierung(en) erlaubt` : undefined
         }
@@ -130,9 +175,11 @@ export default function Queue() {
             icon={<Layers className="size-8" />}
             title="Keine aktive Konvertierung"
             description={
-              queued.length
-                ? "Der naechste Job startet gleich."
-                : "Fuege in der Bibliothek Dateien zur Warteschlange hinzu."
+              queuedCount
+                ? kind
+                  ? "Neue Jobs starten, sobald der Hinweis oben nicht mehr zutrifft."
+                  : "Der nächste Job startet gleich."
+                : "Füge in der Bibliothek Dateien zur Warteschlange hinzu."
             }
           />
         ) : (
@@ -150,10 +197,11 @@ export default function Queue() {
 
       {/* ---------------- waiting ---------------- */}
       <Panel
-        title={`Warteschlange (${queued.length})`}
+        title={`Warteschlange (${number(queuedCount)})`}
         subtitle={
           queued.length
-            ? `${bytes(queuedSaving)} erwartete Ersparnis`
+            ? `${bytes(queuedSaving)} erwartete Ersparnis` +
+              (queuedCount > queued.length ? ` (für die ersten ${number(queued.length)})` : "")
             : undefined
         }
         bodyClassName="p-0"
@@ -162,7 +210,9 @@ export default function Queue() {
           <EmptyState icon={<Clock className="size-8" />} title="Nichts in der Warteschlange" />
         ) : (
           <ul className="divide-y divide-ink-800/80">
-            {queued.map((job, index) => (
+            {queued.map((job, index) => {
+              const change = job.predicted_size > 0 ? sizeChange(job.input_size, job.predicted_size) : null;
+              return (
               <li key={job.id} className="flex items-center gap-3 px-5 py-3">
                 <span className="w-6 shrink-0 text-right font-mono text-xs text-ink-600">
                   {index + 1}
@@ -173,12 +223,11 @@ export default function Queue() {
                     {job.forced && <ForcedChip />}
                   </p>
                   <p className="mt-0.5 text-xs text-ink-500">
-                    {job.resolution} · {bytes(job.input_size)}
-                    {job.predicted_size > 0 && (
-                      <span className="text-save-400">
+                    {joinParts(job.resolution, bytes(job.input_size))}
+                    {change && (
+                      <span className={change.smaller ? "text-save-400" : "text-warn-400"}>
                         {" "}
-                        → {bytes(job.predicted_size)} (-
-                        {percent(((job.input_size - job.predicted_size) / job.input_size) * 100)})
+                        → {bytes(job.predicted_size)} ({change.text})
                       </span>
                     )}
                   </p>
@@ -187,32 +236,54 @@ export default function Queue() {
                   onClick={() => cancel.mutate(job.id)}
                   className="rounded-md p-1.5 text-ink-500 transition-colors hover:bg-danger-500/15 hover:text-danger-400"
                   title="Aus der Warteschlange nehmen"
+                  aria-label={`${job.name ?? "Job"} aus der Warteschlange nehmen`}
                 >
-                  <X className="size-4" />
+                  <X className="size-4" aria-hidden="true" />
                 </button>
               </li>
-            ))}
+              );
+            })}
           </ul>
+        )}
+        {queuedCount > queued.length && (
+          <p className="border-t border-ink-800 px-5 py-3 text-xs text-ink-500">
+            … und {number(queuedCount - queued.length)} weitere.
+          </p>
         )}
       </Panel>
 
       {/* ---------------- finished ---------------- */}
       <Panel
-        title="Abgeschlossen"
-        subtitle={`${number(data?.counts.done ?? 0)} erfolgreich · ${number(
-          (data?.counts.rejected ?? 0) + (data?.counts.failed ?? 0),
-        )} ohne Ergebnis`}
+        title={`Abgeschlossen (${number(finishedCount)})`}
+        subtitle={
+          `${number(counts.done ?? 0)} erfolgreich · ${number(
+            (counts.rejected ?? 0) + (counts.failed ?? 0),
+          )} ohne Ergebnis` +
+          (counts.cancelled ? ` · ${number(counts.cancelled)} abgebrochen` : "") +
+          (finishedCount > finished.length ? ` · die letzten ${number(finished.length)} angezeigt` : "")
+        }
         actions={
-          finished.length > 0 && (
-            <button className="btn-ghost btn-sm" onClick={() => clear.mutate()}>
-              <Trash2 className="size-3.5" />
+          finishedCount > 0 && (
+            <button
+              className="btn-ghost btn-sm"
+              onClick={() => clear.mutate()}
+              disabled={clear.isPending}
+            >
+              <Trash2 className="size-3.5" aria-hidden="true" />
               Liste leeren
             </button>
           )
         }
         bodyClassName="p-0"
       >
-        {finished.length === 0 ? (
+        {finishedQuery.isError && !finishedQuery.data ? (
+          <ErrorState compact error={finishedQuery.error} onRetry={() => finishedQuery.refetch()} />
+        ) : finishedQuery.isLoading ? (
+          <div className="space-y-2 p-4">
+            <Skeleton className="h-10" />
+            <Skeleton className="h-10" />
+          </div>
+        ) : finished.length === 0 ? (
           <EmptyState icon={<CheckCircle2 className="size-8" />} title="Noch nichts abgeschlossen" />
         ) : (
           <ul className="divide-y divide-ink-800/80">
@@ -262,23 +333,28 @@ function RunningJob({
             {job.forced && <ForcedChip />}
           </p>
           <p className="mt-0.5 truncate text-xs text-ink-500">
-            {job.resolution} · {job.plan?.encoder} · CRF {job.plan?.crf}
-            {job.plan?.film_grain ? ` · Filmkorn ${job.plan.film_grain}` : ""}
+            {joinParts(
+              job.resolution,
+              job.plan?.encoder,
+              job.plan ? `CRF ${job.plan.crf}` : null,
+              job.plan?.film_grain ? `Filmkorn ${job.plan.film_grain}` : null,
+            ) || "Plan entsteht beim Start"}
           </p>
         </div>
         <div className="flex items-center gap-2">
           <span className="font-mono text-lg font-semibold text-brand-400">
             {(progress * 100).toFixed(1)}%
           </span>
-          <button
-            onClick={onShowLog}
-            className="btn-ghost btn-sm"
-            title="Log ansehen"
-          >
-            Log
+          <button onClick={onShowLog} className="btn-ghost btn-sm" title="Protokoll ansehen">
+            Protokoll
           </button>
-          <button onClick={onCancel} className="btn-danger btn-sm" title="Abbrechen">
-            <X className="size-3.5" />
+          <button
+            onClick={onCancel}
+            className="btn-danger btn-sm"
+            title="Konvertierung abbrechen"
+            aria-label={`Konvertierung von ${job.name ?? "Job"} abbrechen`}
+          >
+            <X className="size-3.5" aria-hidden="true" />
           </button>
         </div>
       </div>
@@ -286,7 +362,13 @@ function RunningJob({
       <ProgressBar value={progress} className="mt-3 h-2.5" smooth />
 
       <div className="mt-3 grid grid-cols-2 gap-3 text-xs sm:grid-cols-4">
-        <Metric label="Tempo" value={`${(live?.speed ?? job.speed).toFixed(2)}x`} />
+        <Metric
+          label="Tempo"
+          value={`${(live?.speed ?? job.speed).toLocaleString("de-DE", {
+            minimumFractionDigits: 2,
+            maximumFractionDigits: 2,
+          })}x`}
+        />
         <Metric label="Bilder/s" value={number(Math.round(live?.fps ?? job.fps))} />
         <Metric label="Restzeit" value={humanDuration(eta)} />
         <Metric
@@ -298,8 +380,8 @@ function RunningJob({
 
       {projected > 0 && !onTrack && (
         <p className="mt-2 text-[11px] text-warn-400">
-          Das Ergebnis koennte groesser werden als das Original - Optimizarr verwirft es dann
-          automatisch und laesst die Datei unveraendert.
+          Das Ergebnis könnte größer werden als das Original – Optimizarr verwirft es dann
+          automatisch und lässt die Datei unverändert.
         </p>
       )}
     </div>
@@ -315,7 +397,7 @@ function FinishedJob({
   onRetry: () => void;
   onShowLog: () => void;
 }) {
-  const saved = job.input_size - job.output_size;
+  const change = sizeChange(job.input_size, job.output_size);
   const Icon =
     job.state === "done"
       ? CheckCircle2
@@ -342,11 +424,11 @@ function FinishedJob({
           {job.forced && <ForcedChip />}
           <StateBadge state={job.state} label={JOB_STATE_LABELS[job.state] ?? job.state} />
         </div>
-        {job.state === "done" && saved > 0 ? (
+        {job.state === "done" && change ? (
           <p className="mt-0.5 text-xs text-ink-500">
             {bytes(job.input_size)} → {bytes(job.output_size)}{" "}
-            <span className="text-save-400">
-              (-{bytes(saved)}, {percent((saved / job.input_size) * 100)})
+            <span className={change.smaller ? "text-save-400" : "text-warn-400"}>
+              ({change.text})
             </span>
             {job.vmaf != null && job.vmaf > 0 && ` · VMAF ${job.vmaf.toFixed(1)}`}
             {" · "}
@@ -362,17 +444,19 @@ function FinishedJob({
         <button
           onClick={onShowLog}
           className="rounded-md p-1.5 text-ink-500 transition-colors hover:bg-ink-700 hover:text-ink-200"
-          title="Log ansehen"
+          title="Protokoll ansehen"
+          aria-label={`Protokoll von ${job.name ?? "Job"} ansehen`}
         >
-          <Layers className="size-3.5" />
+          <FileText className="size-3.5" aria-hidden="true" />
         </button>
         {(job.state === "failed" || job.state === "cancelled") && (
           <button
             onClick={onRetry}
             className="rounded-md p-1.5 text-ink-500 transition-colors hover:bg-brand-600/20 hover:text-brand-400"
             title="Erneut versuchen"
+            aria-label={`${job.name ?? "Job"} erneut versuchen`}
           >
-            <RotateCcw className="size-3.5" />
+            <RotateCcw className="size-3.5" aria-hidden="true" />
           </button>
         )}
       </div>
@@ -384,7 +468,7 @@ function ForcedChip() {
   return (
     <span
       className="chip shrink-0 bg-warn-500/15 text-warn-400"
-      title="Trotz Ausschluss oder Skip-Urteil von Hand eingereiht - die Mindestersparnis gilt hier nicht"
+      title="Trotz Ausschluss oder „lohnt sich nicht“ von Hand eingereiht – die Mindestersparnis gilt hier nicht"
     >
       Erzwungen
     </span>
@@ -416,16 +500,18 @@ function Metric({
 }
 
 function JobLogModal({ jobId, onClose }: { jobId: number | null; onClose: () => void }) {
-  const { data: job, isLoading } = useQuery({
+  const { data: job, isLoading, isError, error, refetch } = useQuery({
     queryKey: ["jobs", "detail", jobId],
-    queryFn: () => endpoints.job(jobId!),
+    queryFn: ({ signal }) => endpoints.job(jobId!, { signal }),
     enabled: jobId !== null,
     refetchInterval: (query) => (query.state.data?.state === "running" ? 4000 : false),
   });
 
   return (
     <Modal open={jobId !== null} onClose={onClose} wide title={job?.name ?? "Job"} subtitle={job?.path}>
-      {isLoading || !job ? (
+      {isError && !job ? (
+        <ErrorState compact error={error} onRetry={() => refetch()} />
+      ) : isLoading || !job ? (
         <Spinner />
       ) : (
         <div className="space-y-4">
@@ -446,10 +532,14 @@ function JobLogModal({ jobId, onClose }: { jobId: number | null; onClose: () => 
                 Encoding-Plan
               </h4>
               <p className="text-ink-300">
-                {job.plan.encoder} · CRF {job.plan.crf} · Preset {job.plan.preset} ·{" "}
-                {job.plan.pix_fmt}
-                {job.plan.film_grain ? ` · Filmkorn ${job.plan.film_grain}` : ""}
-                {job.plan.hw_decode ? " · GPU-Decoding" : ""}
+                {joinParts(
+                  job.plan.encoder,
+                  `CRF ${job.plan.crf}`,
+                  job.plan.encoder === "libsvtav1" ? `Preset ${job.plan.preset}` : null,
+                  job.plan.pix_fmt,
+                  job.plan.film_grain ? `Filmkorn ${job.plan.film_grain}` : null,
+                  job.plan.hw_decode ? "GPU-Decoding" : null,
+                )}
               </p>
             </div>
           )}

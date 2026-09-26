@@ -25,10 +25,18 @@ import {
   YAxis,
 } from "recharts";
 import { endpoints, type Job, type MediaFile } from "../lib/api";
-import { bytes, humanDuration, number, percent, resolutionLabel } from "../lib/format";
+import {
+  bytes,
+  humanDuration,
+  joinParts,
+  number,
+  parseLocalDate,
+  percent,
+  resolutionLabel,
+} from "../lib/format";
 import { useLive, useToast, type JobProgress } from "../lib/live";
 import { useSmoothEta, useSmoothProgress } from "../lib/progress";
-import { Callout, EmptyState, Panel, ProgressBar, Skeleton, cn } from "../components/ui";
+import { Callout, EmptyState, ErrorState, Panel, ProgressBar, Skeleton, cn } from "../components/ui";
 
 const CODEC_COLORS: Record<string, string> = {
   h264: "#8b6df0",
@@ -44,20 +52,34 @@ export default function Dashboard() {
   const { jobProgress } = useLive();
   const queryClient = useQueryClient();
 
-  const { data: stats, isLoading } = useQuery({
+  // ``ui.dashboard_refresh_seconds`` sets the polling; live events refresh
+  // in between anyway.
+  const { data: settings } = useQuery({ queryKey: ["settings"], queryFn: endpoints.settings });
+  const refreshMs = Math.max(1, settings?.ui?.dashboard_refresh_seconds ?? 5) * 1000;
+
+  const {
+    data: stats,
+    isLoading,
+    isError,
+    error,
+    refetch,
+  } = useQuery({
     queryKey: ["stats"],
     queryFn: endpoints.stats,
-    refetchInterval: 20000,
+    refetchInterval: Math.max(refreshMs, 5000),
   });
   const { data: info } = useQuery({ queryKey: ["system"], queryFn: endpoints.systemInfo });
+  // Only the running jobs are listed; how many wait comes from ``counts``,
+  // which covers all jobs regardless of the list limit.
   const { data: jobs } = useQuery({
-    queryKey: ["jobs", "active"],
-    queryFn: () => endpoints.jobs("active"),
-    refetchInterval: 10000,
+    queryKey: ["jobs", "running"],
+    queryFn: ({ signal }) => endpoints.jobs({ state: "running", limit: 50 }, { signal }),
+    refetchInterval: refreshMs,
   });
 
+  // No limit: the button promises all candidates, so it takes all of them.
   const enqueueAll = useMutation({
-    mutationFn: () => endpoints.enqueue({ all_candidates: true, limit: 250 }),
+    mutationFn: () => endpoints.enqueue({ all_candidates: true }),
     onSuccess: (data) => {
       push(data.message, data.added ? "success" : "info");
       queryClient.invalidateQueries({ queryKey: ["jobs"] });
@@ -67,9 +89,17 @@ export default function Dashboard() {
   });
 
   const running = jobs?.items.filter((j) => j.state === "running") ?? [];
-  const queued = jobs?.items.filter((j) => j.state === "queued") ?? [];
+  const queuedCount = jobs?.counts.queued ?? 0;
   const hw = info?.hardware;
   const hwAv1 = hw && Object.values(hw.encoders ?? {}).some((e) => e.verified && e.name.startsWith("av1_"));
+
+  if (isError && !stats) {
+    return (
+      <Panel>
+        <ErrorState error={error} onRetry={() => refetch()} title="Übersicht konnte nicht geladen werden" />
+      </Panel>
+    );
+  }
 
   if (isLoading) {
     return (
@@ -119,7 +149,7 @@ export default function Dashboard() {
           footer={
             stats?.realised.average_vmaf ? (
               <p className="mt-3 text-[11px] text-ink-500">
-                Durchschnittliche Qualitaet: VMAF {stats.realised.average_vmaf.toFixed(1)}
+                Durchschnittliche Qualität: VMAF {stats.realised.average_vmaf.toFixed(1)}
               </p>
             ) : null
           }
@@ -157,7 +187,7 @@ export default function Dashboard() {
               <ProgressBar value={stats?.model.maturity ?? 0} tone="warn" className="h-1.5" />
               <p className="mt-1.5 text-[11px] text-ink-500">
                 {stats?.model.trained
-                  ? "Schaetzgenauigkeit der Groessenvorhersage"
+                  ? "Schätzgenauigkeit der Größenvorhersage"
                   : `Ab ${stats?.model.trust_threshold ?? 15} Jobs greift die Korrektur voll`}
               </p>
             </div>
@@ -169,12 +199,12 @@ export default function Dashboard() {
       {hw && !hw.device_present ? (
         <Callout tone="warn">
           Es ist keine Intel-GPU sichtbar ({hw.device}). In Unraid muss <code>/dev/dri</code> als
-          Device durchgereicht werden - sonst laeuft das Encoding komplett auf der CPU.
+          Device durchgereicht werden – sonst läuft das Encoding komplett auf der CPU.
         </Callout>
       ) : hw && !hwAv1 ? (
         <Callout tone="info" icon={<Cpu className="size-4" />}>
           <strong className="text-ink-100">{hw.gpu_name}</strong> kann AV1 nicht in Hardware
-          kodieren - das uebernimmt SVT-AV1 auf der CPU. Das ist langsamer, liefert aber die
+          kodieren – das übernimmt SVT-AV1 auf der CPU. Das ist langsamer, liefert aber die
           besseren Ergebnisse pro Megabyte.{" "}
           <Link to="/settings" className="text-brand-400 underline-offset-2 hover:underline">
             Encoder-Einstellungen
@@ -188,7 +218,7 @@ export default function Dashboard() {
           className="xl:col-span-2"
           title="Aktive Konvertierungen"
           subtitle={
-            queued.length ? `${queued.length} weitere in der Warteschlange` : "Live-Fortschritt"
+            queuedCount ? `${number(queuedCount)} weitere in der Warteschlange` : "Live-Fortschritt"
           }
           actions={
             <Link to="/queue" className="btn-ghost btn-sm">
@@ -200,11 +230,14 @@ export default function Dashboard() {
           {running.length === 0 ? (
             <EmptyState
               icon={<Zap className="size-8" />}
-              title="Gerade laeuft nichts"
+              title="Gerade läuft nichts"
               description={
-                stats?.potential.candidate_count
-                  ? `${number(stats.potential.candidate_count)} Dateien warten darauf, konvertiert zu werden.`
-                  : "Starte einen Scan, damit Optimizarr deine Bibliothek durchsieht."
+                queuedCount
+                  ? `${number(queuedCount)} ${queuedCount === 1 ? "Job wartet" : "Jobs warten"} in der Warteschlange.` +
+                    (jobs?.worker.blocked_reason ? ` ${jobs.worker.blocked_reason}` : "")
+                  : stats?.potential.candidate_count
+                    ? `${number(stats.potential.candidate_count)} Dateien warten darauf, konvertiert zu werden.`
+                    : "Starte einen Scan, damit Optimizarr deine Bibliothek durchsieht."
               }
               action={
                 stats?.potential.candidate_count ? (
@@ -213,7 +246,9 @@ export default function Dashboard() {
                     onClick={() => enqueueAll.mutate()}
                     disabled={enqueueAll.isPending}
                   >
-                    Alle Kandidaten einreihen
+                    {stats.potential.candidate_count === 1
+                      ? "Den Kandidaten einreihen"
+                      : `Alle ${number(stats.potential.candidate_count)} Kandidaten einreihen`}
                   </button>
                 ) : undefined
               }
@@ -226,7 +261,7 @@ export default function Dashboard() {
         </Panel>
 
         {/* ---------------- codec distribution ---------------- */}
-        <Panel title="Codecs in der Bibliothek" subtitle="nach belegtem Speicher · inklusive uebersprungener Dateien">
+        <Panel title="Codecs in der Bibliothek" subtitle="nach belegtem Speicher · inklusive übersprungener Dateien">
           {stats?.codecs.length ? (
             <div className="space-y-3">
               <ResponsiveContainer width="100%" height={170}>
@@ -285,7 +320,7 @@ export default function Dashboard() {
         <Panel
           className="xl:col-span-2"
           title="Gesparter Speicher"
-          subtitle="kumuliert ueber die letzten Konvertierungen"
+          subtitle="kumuliert über die letzten Konvertierungen"
         >
           {stats?.daily.length ? (
             <ResponsiveContainer width="100%" height={220}>
@@ -303,7 +338,7 @@ export default function Dashboard() {
                   axisLine={false}
                   tickLine={false}
                   tickFormatter={(v: string) =>
-                    new Date(v).toLocaleDateString("de-DE", { day: "2-digit", month: "2-digit" })
+                    parseLocalDate(v).toLocaleDateString("de-DE", { day: "2-digit", month: "2-digit" })
                   }
                 />
                 <YAxis
@@ -314,7 +349,7 @@ export default function Dashboard() {
                 />
                 <Tooltip
                   contentStyle={tooltipStyle}
-                  labelFormatter={(v) => new Date(String(v)).toLocaleDateString("de-DE")}
+                  labelFormatter={(v) => parseLocalDate(String(v)).toLocaleDateString("de-DE")}
                   formatter={(value) => [bytes(Number(value ?? 0)), "gespart"]}
                 />
                 <Area
@@ -330,14 +365,14 @@ export default function Dashboard() {
             <EmptyState
               icon={<CheckCircle2 className="size-8" />}
               title="Noch nichts konvertiert"
-              description="Sobald die erste Datei fertig ist, waechst hier die Kurve."
+              description="Sobald die erste Datei fertig ist, wächst hier die Kurve."
             />
           )}
         </Panel>
 
         {/* ---------------- top candidates ---------------- */}
         <Panel
-          title="Groesste Chancen"
+          title="Größte Chancen"
           subtitle="Dateien mit dem meisten Sparpotenzial"
           actions={
             <Link to="/library" className="btn-ghost btn-sm">
@@ -382,7 +417,8 @@ function ActiveJob({ job, live }: { job: Job; live?: JobProgress }) {
         <div className="min-w-0 flex-1">
           <p className="truncate text-sm font-medium text-ink-100">{job.name}</p>
           <p className="mt-0.5 truncate text-xs text-ink-500">
-            {job.resolution} · {job.plan?.encoder} · CRF {job.plan?.crf}
+            {joinParts(job.resolution, job.plan?.encoder, job.plan ? `CRF ${job.plan.crf}` : null) ||
+              "Plan entsteht beim Start"}
           </p>
         </div>
         <span className="font-mono text-sm text-brand-400">{(progress * 100).toFixed(1)} %</span>
@@ -416,7 +452,7 @@ function TopCandidateRow({ file }: { file: MediaFile }) {
           <span>{resolutionLabel(file.width, file.height)}</span>
           <span>{bytes(file.size)}</span>
           <span className="ml-auto font-medium text-save-400">
-            -{bytes(file.estimated_saving_bytes)} ({percent(file.estimated_saving_pct)})
+            -{bytes(file.estimated_saving_bytes)} (-{percent(file.estimated_saving_pct)})
           </span>
         </div>
       </Link>

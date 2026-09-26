@@ -19,15 +19,16 @@ import {
   Tv,
   X,
 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import { endpoints, type SystemInfo } from "../lib/api";
-import { bytes, humanDuration } from "../lib/format";
+import { bytes, nextScanText } from "../lib/format";
+import { useMediaQuery, useNow } from "../lib/hooks";
 import { useLive, useToast } from "../lib/live";
 import { cn, ProgressBar, Spinner } from "./ui";
 
 const NAV = [
-  { to: "/", label: "Uebersicht", icon: Gauge, end: true },
+  { to: "/", label: "Übersicht", icon: Gauge, end: true },
   { to: "/library", label: "Bibliothek", icon: ListVideo },
   { to: "/series", label: "Serien", icon: Tv },
   { to: "/movies", label: "Filme", icon: Film },
@@ -43,6 +44,19 @@ export function Layout({ children }: { children: React.ReactNode }) {
   const { connected, scan } = useLive();
   const { push } = useToast();
   const queryClient = useQueryClient();
+  const desktop = useMediaQuery("(min-width: 1024px)");
+  // Off-canvas on small screens: while closed it must not be reachable by Tab
+  // or by a screen reader either, not just be pushed out of sight.
+  const sidebarHidden = !desktop && !mobileOpen;
+
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMobileOpen(false);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [mobileOpen]);
 
   const { data: info } = useQuery({
     queryKey: ["system"],
@@ -58,17 +72,19 @@ export function Layout({ children }: { children: React.ReactNode }) {
 
   const cancelScan = useMutation({
     mutationFn: () => endpoints.cancelScan(),
-    onSuccess: () => push("Scan wird abgebrochen...", "info"),
+    onSuccess: () => push("Scan wird abgebrochen …", "info"),
+    onError: (error: Error) => push(error.message, "error"),
   });
 
   const togglePause = useMutation({
     mutationFn: (paused: boolean) => endpoints.pauseQueue(paused),
     onSuccess: (data) => {
-      push(data.paused ? "Warteschlange pausiert." : "Warteschlange laeuft.", "info");
+      push(data.paused ? "Warteschlange pausiert." : "Warteschlange läuft.", "info");
       queryClient.invalidateQueries({ queryKey: ["system"] });
       queryClient.invalidateQueries({ queryKey: ["jobs"] });
       queryClient.invalidateQueries({ queryKey: ["settings"] });
     },
+    onError: (error: Error) => push(error.message, "error"),
   });
 
   const scanning = scan?.running ?? info?.scan.running ?? false;
@@ -79,14 +95,18 @@ export function Layout({ children }: { children: React.ReactNode }) {
     <div className="flex min-h-screen">
       {/* ---------------- sidebar ---------------- */}
       <aside
+        id="sidebar"
+        aria-label="Hauptnavigation"
+        inert={sidebarHidden}
+        aria-hidden={sidebarHidden || undefined}
         className={cn(
-          "fixed inset-y-0 left-0 z-40 flex w-64 flex-col border-r border-ink-800 bg-ink-900/95 backdrop-blur-md transition-transform lg:static lg:translate-x-0",
+          "fixed inset-y-0 left-0 z-40 flex w-64 shrink-0 flex-col border-r border-ink-800 bg-ink-900/95 backdrop-blur-md transition-transform lg:sticky lg:top-0 lg:h-screen lg:translate-x-0",
           mobileOpen ? "translate-x-0" : "-translate-x-full",
         )}
       >
         <div className="flex items-center gap-3 border-b border-ink-800 px-5 py-4">
           <div className="grid size-9 place-items-center rounded-xl bg-gradient-to-br from-brand-500 to-brand-700 shadow-lg shadow-brand-700/30">
-            <Sparkles className="size-5 text-white" />
+            <Sparkles className="size-5 text-white" aria-hidden="true" />
           </div>
           <div className="min-w-0">
             <p className="font-semibold tracking-tight text-ink-100">Optimizarr</p>
@@ -97,9 +117,9 @@ export function Layout({ children }: { children: React.ReactNode }) {
           <button
             className="ml-auto rounded-lg p-1.5 text-ink-400 hover:bg-ink-800 lg:hidden"
             onClick={() => setMobileOpen(false)}
-            aria-label="Menue schliessen"
+            aria-label="Menü schließen"
           >
-            <X className="size-4" />
+            <X className="size-4" aria-hidden="true" />
           </button>
         </div>
 
@@ -119,10 +139,12 @@ export function Layout({ children }: { children: React.ReactNode }) {
                 )
               }
             >
-              <Icon className="size-4 shrink-0" />
+              <Icon className="size-4 shrink-0" aria-hidden="true" />
               <span className="truncate">{label}</span>
               {to === "/queue" && activeJobs > 0 && (
-                <span className="ml-auto rounded-full bg-brand-600/25 px-1.5 py-0.5 text-[10px] font-semibold text-brand-400">
+                <span
+                  aria-label={`${activeJobs} laufend`}
+                  className="ml-auto rounded-full bg-brand-600/25 px-1.5 py-0.5 text-[10px] font-semibold text-brand-400">
                   {activeJobs}
                 </span>
               )}
@@ -147,9 +169,11 @@ export function Layout({ children }: { children: React.ReactNode }) {
             <button
               className="rounded-lg p-2 text-ink-300 hover:bg-ink-800 lg:hidden"
               onClick={() => setMobileOpen(true)}
-              aria-label="Menue oeffnen"
+              aria-label="Menü öffnen"
+              aria-expanded={mobileOpen}
+              aria-controls="sidebar"
             >
-              <Menu className="size-5" />
+              <Menu className="size-5" aria-hidden="true" />
             </button>
             <h1 className="text-lg font-semibold tracking-tight text-ink-100">
               {NAV.find((n) => (n.end ? location.pathname === n.to : location.pathname.startsWith(n.to)))
@@ -162,7 +186,11 @@ export function Layout({ children }: { children: React.ReactNode }) {
                 onClick={() => togglePause.mutate(!paused)}
                 disabled={togglePause.isPending}
               >
-                {paused ? <Play className="size-3.5" /> : <Pause className="size-3.5" />}
+                {paused ? (
+                  <Play className="size-3.5" aria-hidden="true" />
+                ) : (
+                  <Pause className="size-3.5" aria-hidden="true" />
+                )}
                 {paused ? "Fortsetzen" : "Pausieren"}
               </button>
               {scanning ? (
@@ -170,7 +198,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
                   className="btn-ghost btn-sm border-warn-500/40 text-warn-400"
                   onClick={() => cancelScan.mutate()}
                 >
-                  <X className="size-3.5" />
+                  <X className="size-3.5" aria-hidden="true" />
                   Scan abbrechen
                 </button>
               ) : (
@@ -179,7 +207,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
                   onClick={() => startScan.mutate()}
                   disabled={startScan.isPending}
                 >
-                  {startScan.isPending ? <Spinner className="size-3.5" /> : <ScanLine className="size-3.5" />}
+                  {startScan.isPending ? <Spinner className="size-3.5" /> : <ScanLine className="size-3.5" aria-hidden="true" />}
                   Bibliothek scannen
                 </button>
               )}
@@ -200,14 +228,14 @@ function ScanBanner({ scan }: { scan: NonNullable<ReturnType<typeof useLive>["sc
     walk: "Dateien werden gesucht",
     probe: "Metadaten werden gelesen",
     analyze: "Dateien werden analysiert",
-    idle: "Scan laeuft",
+    idle: "Scan läuft",
   };
   return (
     <div className="border-t border-ink-800/70 bg-ink-900/60 px-4 py-2.5 sm:px-6">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
         <span className="flex items-center gap-2 font-medium text-brand-400">
           <Spinner className="size-3.5" />
-          {phaseLabel[scan.phase] ?? "Scan laeuft"}
+          {phaseLabel[scan.phase] ?? "Scan läuft"}
         </span>
         {scan.phase === "walk" && typeof scan.seen === "number" && scan.seen > 0 ? (
           <span className="text-ink-400">
@@ -236,6 +264,7 @@ function ScanBanner({ scan }: { scan: NonNullable<ReturnType<typeof useLive>["sc
 }
 
 function SidebarStatus({ info, connected }: { info: SystemInfo | undefined; connected: boolean }) {
+  const now = useNow(30000);
   const hw = info?.hardware;
   const hwAv1 =
     hw && Object.values(hw.encoders ?? {}).some((e) => e.verified && e.name.startsWith("av1_"));
@@ -262,7 +291,7 @@ function SidebarStatus({ info, connected }: { info: SystemInfo | undefined; conn
               </span>
             </>
           ) : (
-            "Hardware wird geprueft..."
+            "Hardware wird geprüft …"
           )}
         </span>
       </div>
@@ -277,10 +306,7 @@ function SidebarStatus({ info, connected }: { info: SystemInfo | undefined; conn
       {info?.next_scan && (
         <div className="flex items-center gap-2 text-ink-500">
           <ScanLine className="size-3.5 shrink-0" />
-          <span>
-            Naechster Scan{" "}
-            {humanDuration((new Date(info.next_scan).getTime() - Date.now()) / 1000)}
-          </span>
+          <span>{nextScanText(info.next_scan, now)}</span>
         </div>
       )}
     </div>
