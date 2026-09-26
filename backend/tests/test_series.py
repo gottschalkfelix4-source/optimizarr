@@ -224,6 +224,30 @@ def test_forcing_a_season_queues_excluded_files_but_leaves_av1_alone(client, lib
     assert planner.EncodePlan.from_dict(_job_for(ignored).plan).encoder == "libsvtav1"
 
 
+def test_files_without_a_season_can_be_queued_on_their_own(client, library):
+    loose = _add(library, "Dark/Dark - Making of.mkv")
+    in_season = _add(library, "Dark/Season 01/Dark - S01E01.mkv")
+
+    r = client.post("/api/series/enqueue",
+                    json={"key": f"{library}:Dark", "season": series.NO_SEASON}).json()
+    assert r["added"] == 1
+    assert _file(loose).state == "queued"
+    assert _file(in_season).state == "candidate"
+
+
+def test_forcing_a_series_leaves_missing_files_out(client, library):
+    missing = _add(library, "Dark/Season 01/Dark - S01E01.mkv", codec="hevc", state="missing")
+    present = _add(library, "Dark/Season 01/Dark - S01E02.mkv", codec="hevc",
+                   state="skipped", plan=False)
+
+    r = client.post("/api/series/enqueue",
+                    json={"key": f"{library}:Dark", "force": True}).json()
+    assert r["added"] == 1
+    assert r["skipped"] == []
+    assert _file(present).state == "queued"
+    assert _file(missing).state == "missing"
+
+
 def test_cancelling_a_forced_job_puts_the_file_back(client, library):
     excluded = _add(library, "Dark/Season 01/Dark - S01E01.mkv", codec="hevc",
                     state="skipped", plan=False)

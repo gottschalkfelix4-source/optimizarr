@@ -109,7 +109,7 @@ def series_detail(key: str, session: Session = Depends(get_session)) -> dict[str
 
 class SeriesEnqueue(BaseModel):
     key: str
-    season: int | None = None       # None: every season
+    season: int | None = None       # None: every season, series.NO_SEASON (-1): files without one
     force: bool = False
 
 
@@ -124,11 +124,7 @@ def enqueue_series(
     goes in - codec exclusions, ignore flags and skip verdicts notwithstanding.
     """
     entry = _find(session, payload.key)
-    wanted = series.FORCEABLE if payload.force else ("pending",)
-    file_ids = [
-        e.file_id for e in entry.episodes
-        if e.bucket in wanted and (payload.season is None or e.season == payload.season)
-    ]
+    file_ids = series.pick(entry.episodes, payload.force, payload.season)
     if not file_ids:
         return {"added": 0, "skipped": [], "message": "Nichts einzureihen."}
     added, skipped = worker.enqueue_files(file_ids, force=payload.force)

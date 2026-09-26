@@ -48,6 +48,7 @@ def isolated_app_state(tmp: Path) -> Iterator[None]:
     from sqlalchemy.pool import StaticPool
 
     from app import config, db, main
+    from app.core import scanner
     from app.models import Base
 
     engine = create_engine(
@@ -55,6 +56,11 @@ def isolated_app_state(tmp: Path) -> Iterator[None]:
     )
     Base.metadata.create_all(engine)
     mp = pytest.MonkeyPatch()
+    # A scan the app starts in the background (e.g. the re-analysis a codec
+    # exclusion change requests) dies with the TestClient's event loop and
+    # would otherwise leave "a scan is running" behind for the next module.
+    mp.setattr(scanner, "state", scanner.ScanState())
+    mp.setattr(scanner, "_pending_analysis", set())
     try:
         mp.setattr(db, "_engine", engine)
         mp.setattr(db, "_SessionLocal", None)
