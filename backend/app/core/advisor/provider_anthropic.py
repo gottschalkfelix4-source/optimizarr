@@ -19,6 +19,32 @@ except ImportError:  # pragma: no cover - optional dependency
     SDK_AVAILABLE = False
 
 
+#: Models older than the 4.5 generation, where ``effort`` is rejected and
+#: thinking only exists as a fixed ``budget_tokens`` budget.
+_LEGACY_MARKERS = (
+    "claude-3", "sonnet-4-5", "sonnet-4-0", "sonnet-4-2025", "opus-4-1", "opus-4-0",
+    "opus-4-2025",
+)
+
+
+def model_features(model: str) -> tuple[bool, bool]:
+    """(accepts ``output_config.effort``, accepts adaptive thinking).
+
+    Claude Haiku 4.5 supports neither - a request carrying either one is
+    rejected with a 400, so the advisor never answered with Haiku selected.
+    Opus 4.5 knows effort but not adaptive thinking.  Every current model
+    (Opus 5.5, Opus 5, Sonnet 5, Fable 5.1) and anything unknown - presumably
+    newer - gets both.  Thinking is simply left out where it is not adaptive:
+    the advisor's question is simple, a thinking budget would only cost.
+    """
+    name = (model or "").strip().lower()
+    if "haiku" in name or any(marker in name for marker in _LEGACY_MARKERS):
+        return False, False
+    if "opus-4-5" in name:
+        return True, False
+    return True, True
+
+
 class AnthropicProvider(AdviceProvider):
     name = "anthropic"
     label = "Claude (Anthropic API)"
@@ -63,22 +89,26 @@ class AnthropicProvider(AdviceProvider):
 
     async def complete(self, system: str, user: str, timeout: float) -> RawResponse:
         client = self._client_or_raise()
+        effort, adaptive = model_features(self.settings.model)
+        output_config: dict[str, Any] = {
+            "format": {"type": "json_schema", "schema": ADVICE_SCHEMA},
+        }
+        if effort:
+            output_config["effort"] = "low"
+        extra: dict[str, Any] = {}
+        if adaptive:
+            extra["thinking"] = {"type": "adaptive"}
+        # No prompt caching: the system prompt is roughly 400 tokens, below the
+        # minimum cacheable prefix of every current model (512 on Opus 5 and
+        # Fable, 1024 on Sonnet 5, 4096 on Haiku 4.5).  A cache marker on it
+        # would be silently ignored, so there is none to suggest otherwise.
         response = await client.messages.create(
             model=self.settings.model,
             max_tokens=4000,
-            system=[{
-                "type": "text",
-                "text": system,
-                # The prompt is identical for every file in a scan, so caching it
-                # turns most of the input tokens into cache reads.
-                "cache_control": {"type": "ephemeral"},
-            }],
+            system=system,
             messages=[{"role": "user", "content": user}],
-            output_config={
-                "format": {"type": "json_schema", "schema": ADVICE_SCHEMA},
-                "effort": "low",
-            },
-            thinking={"type": "adaptive"},
+            output_config=output_config,
+            **extra,
         )
 
         raw = RawResponse(model=getattr(response, "model", self.settings.model))
@@ -103,11 +133,12 @@ class AnthropicProvider(AdviceProvider):
             return False, reason
         try:
             client = self._client_or_raise()
+            effort, _ = model_features(self.settings.model)
             response = await client.messages.create(
                 model=self.settings.model,
                 max_tokens=64,
                 messages=[{"role": "user", "content": "Antworte nur mit: OK"}],
-                output_config={"effort": "low"},
+                **({"output_config": {"effort": "low"}} if effort else {}),
             )
         except Exception as exc:
             return False, friendly_error(exc)

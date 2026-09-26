@@ -312,3 +312,34 @@ def test_forced_job_skips_the_saving_threshold_but_not_the_size_gate(
             stored = s.get(Job, job_id).plan
         assert stored["encoder"] == used[0].encoder
         assert planner.is_forced(stored)
+
+
+# --------------------------------------------------------------------------- #
+# Picking files for a bulk run
+# --------------------------------------------------------------------------- #
+
+def _episodes(library):
+    from app.api.routes_series import load_groups
+
+    with db.session_scope() as s:
+        (entry,) = [g for g in load_groups(s) if g.name == "Dark"]
+        return entry.episodes
+
+
+def test_forced_pick_leaves_missing_files_out_like_the_frontend(library):
+    skipped = _add(library, "Dark/Season 01/Dark - S01E01.mkv", state="skipped")
+    gone = _add(library, "Dark/Season 01/Dark - S01E02.mkv", state="missing")
+    probed = _add(library, "Dark/Season 01/Dark - S01E03.mkv", state="probed")
+    picked = series.pick(_episodes(library), force=True)
+    assert sorted(picked) == sorted([skipped, probed])
+    assert gone not in picked
+
+
+def test_files_without_a_season_can_be_picked_on_their_own(library):
+    loose = _add(library, "Dark/Extras/Dark - Making of.mkv", state="skipped")
+    first = _add(library, "Dark/Season 01/Dark - S01E01.mkv", state="skipped")
+    episodes = _episodes(library)
+    assert series.pick(episodes, force=True, season=series.NO_SEASON) == [loose]
+    assert series.pick(episodes, force=True, season=1) == [first]
+    assert sorted(series.pick(episodes, force=True)) == sorted([loose, first])
+    assert series.pick(episodes, force=False) == []

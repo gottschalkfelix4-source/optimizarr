@@ -31,6 +31,25 @@ from app.core.advisor.provider_codex import (  # noqa: E402
 from app.core.advisor.provider_openai import OpenAICompatibleProvider  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def isolated_db(monkeypatch):
+    """Own in-memory database - stored ChatGPT credentials from elsewhere must
+    not decide whether the provider counts as configured."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import StaticPool
+
+    from app import config, db
+    from app.models import Base
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(db, "_engine", engine)
+    monkeypatch.setattr(db, "_SessionLocal", None)
+    monkeypatch.setattr(config, "_cache", None)
+    yield
+    engine.dispose()
+
+
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
@@ -422,3 +441,167 @@ async def test_sse_ignores_comments_and_unknown_events():
 
     text, _, _ = await _read_sse(FakeStream())
     assert extract_json(text) == GOOD
+
+
+# --------------------------------------------------------------------------- #
+# Token refresh: one at a time, and never old tokens over new ones
+# --------------------------------------------------------------------------- #
+
+def _expired(refresh="r-old", access="a-old") -> TokenSet:
+    import datetime as dt
+
+    return TokenSet(access_token=access, refresh_token=refresh, account_id="acc",
+                    expires_at=dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1))
+
+
+def _fresh(refresh="r-new", access="a-new") -> TokenSet:
+    import datetime as dt
+
+    return TokenSet(access_token=access, refresh_token=refresh, account_id="acc",
+                    expires_at=dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1))
+
+
+def _stored():
+    from app import db
+    from app.models import OAuthCredential
+
+    with db.session_scope() as s:
+        return s.get(OAuthCredential, "openai_codex")
+
+
+@pytest.mark.anyio
+async def test_two_providers_refresh_only_once(monkeypatch):
+    import asyncio
+
+    from app.core.advisor import provider_codex
+
+    provider_codex.store_tokens(_expired())
+    calls = []
+
+    async def refresh(previous):
+        calls.append(previous.refresh_token)
+        await asyncio.sleep(0.02)
+        return _fresh()
+
+    monkeypatch.setattr(codex_oauth, "refresh_tokens", refresh)
+    # The scan's provider and the settings screen's own instance, at once.
+    a = CodexProvider(AdvisorSettings(provider="openai_codex"))
+    b = CodexProvider(AdvisorSettings(provider="openai_codex"))
+    first, second = await asyncio.gather(a._valid_tokens(), b._valid_tokens())
+    assert calls == ["r-old"]
+    assert first.access_token == second.access_token == "a-new"
+
+
+@pytest.mark.anyio
+async def test_a_failed_refresh_never_overwrites_a_new_sign_in(monkeypatch):
+    from app.core.advisor import provider_codex
+
+    provider_codex.store_tokens(_expired())
+
+    async def refresh(previous):
+        # Meanwhile the user signs in again in another tab.
+        provider_codex.store_tokens(_fresh(refresh="r-login", access="a-login"))
+        raise codex_oauth.OAuthError("invalid_grant")
+
+    monkeypatch.setattr(codex_oauth, "refresh_tokens", refresh)
+    with pytest.raises(AdvisorUnavailable):
+        await CodexProvider(AdvisorSettings())._valid_tokens()
+    row = _stored()
+    assert (row.access_token, row.refresh_token) == ("a-login", "r-login")
+    assert "invalid_grant" in row.last_error
+
+
+@pytest.mark.anyio
+async def test_a_late_refresh_result_does_not_replace_a_new_sign_in(monkeypatch):
+    from app.core.advisor import provider_codex
+
+    provider_codex.store_tokens(_expired())
+
+    async def refresh(previous):
+        provider_codex.store_tokens(_fresh(refresh="r-login", access="a-login"))
+        return _fresh()
+
+    monkeypatch.setattr(codex_oauth, "refresh_tokens", refresh)
+    tokens = await CodexProvider(AdvisorSettings())._valid_tokens()
+    assert tokens.access_token == "a-login"
+    assert _stored().refresh_token == "r-login"
+
+
+def test_last_refresh_carries_its_timezone():
+    from app.core.advisor import provider_codex
+
+    provider_codex.store_tokens(_fresh())
+    status = provider_codex.credential_status()
+    assert status["last_refresh"].endswith("+00:00")
+
+
+# --------------------------------------------------------------------------- #
+# Sign-in completion: the state has to match exactly
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture()
+def api(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    monkeypatch.setattr(codex_oauth, "exchange_code", AsyncMock(return_value=_fresh()))
+    return TestClient(app)
+
+
+HEADERS = {"X-Optimizarr": "1"}
+
+
+def _start(api) -> str:
+    return api.post("/api/advisor/codex/start", headers=HEADERS).json()["state"]
+
+
+def _redirect(state: str) -> str:
+    return f"http://localhost:1455/auth/callback?code=abcdefghijklmnop&state={state}"
+
+
+def test_completion_accepts_the_suffixed_state(api):
+    state = _start(api)
+    suffix = codex_oauth.STATE_SUFFIXES[0]
+    r = api.post("/api/advisor/codex/complete", headers=HEADERS,
+                 json={"pasted": _redirect(state + suffix), "state": state})
+    assert r.status_code == 200, r.text
+
+
+def test_an_unknown_state_does_not_fall_back_to_the_newest_flow(api):
+    _start(api)
+    r = api.post("/api/advisor/codex/complete", headers=HEADERS,
+                 json={"pasted": _redirect("somebody-elses-flow")})
+    assert r.status_code == 409
+    codex_oauth.exchange_code.assert_not_awaited()
+
+
+def test_a_state_from_another_flow_is_rejected(api):
+    first = _start(api)
+    second = _start(api)
+    r = api.post("/api/advisor/codex/complete", headers=HEADERS,
+                 json={"pasted": _redirect(first), "state": second})
+    assert r.status_code == 400
+
+
+def test_an_expired_flow_is_rejected(api):
+    import datetime as dt
+
+    from app import db
+    from app.models import OAuthFlow
+
+    state = _start(api)
+    with db.session_scope() as s:
+        s.get(OAuthFlow, state).created_at = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) - dt.timedelta(minutes=16)
+    r = api.post("/api/advisor/codex/complete", headers=HEADERS,
+                 json={"pasted": _redirect(state), "state": state})
+    assert r.status_code == 409
+
+
+def test_a_bare_code_still_uses_the_pending_flow(api):
+    _start(api)
+    r = api.post("/api/advisor/codex/complete", headers=HEADERS,
+                 json={"pasted": "abcdefghijklmnopqrstuvwxyz"})
+    assert r.status_code == 200, r.text

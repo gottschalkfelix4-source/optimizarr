@@ -6,9 +6,11 @@ import datetime as dt
 import fnmatch
 import logging
 import os
-from dataclasses import dataclass
+import threading
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from sqlalchemy import select, update
 
@@ -20,6 +22,9 @@ from .advisor import get_advisor
 from .events import bus
 
 log = logging.getLogger(__name__)
+
+BUSY_MESSAGE = "Es laeuft bereits ein Scan."
+CANCELLED_MESSAGE = "Scan abgebrochen"
 
 
 @dataclass
@@ -53,6 +58,12 @@ state = ScanState()
 # Disk walk
 # --------------------------------------------------------------------------- #
 
+#: Our own working folders and files inside a library.  They start with a dot
+#: and would be skipped as hidden anyway; naming them keeps that from being an
+#: accident of the naming scheme.
+OWN_PREFIXES = (".optimizarr-trash", ".optimizarr-staging-")
+
+
 def _matches_exclude(path: str, patterns: list[str]) -> bool:
     normalised = path.replace("\\", "/").lower()
     for pattern in patterns:
@@ -67,10 +78,44 @@ def _matches_exclude(path: str, patterns: list[str]) -> bool:
     return False
 
 
+def _storable(path: str) -> bool:
+    """Can this path go into the database?
+
+    A name that is not valid UTF-8 reaches Python with surrogate escapes, and
+    SQLite refuses to store it - which used to fail the whole scan.
+    """
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+@dataclass
+class WalkReport:
+    """What the walk could and could not see - decides what counts as missing."""
+
+    #: Library ids whose root was reachable, with the number of files found.
+    found: dict[int, int] = field(default_factory=dict)
+    #: Directories that could not be listed; nothing below them is "missing".
+    unreadable: list[str] = field(default_factory=list)
+    #: Names skipped because they cannot be stored (not UTF-8).
+    unstorable: int = 0
+
+
+def _own_dirs(settings: AppSettings) -> set[str]:
+    """Folders Optimizarr writes into - never media, even inside a library."""
+    dirs = {os.path.realpath(str(TRANSCODE_DIR))}
+    if settings.output.trash_dir.strip():
+        dirs.add(os.path.realpath(settings.output.trash_dir.strip()))
+    return dirs
+
+
 def walk_paths(
-    roots: list[tuple[int, str]], settings: AppSettings
+    roots: list[tuple[int, str]], settings: AppSettings, report: WalkReport | None = None,
 ) -> Iterator[tuple[int, str, int, float]]:
     """Yield (library_id, path, size, mtime) for every eligible video file."""
+    report = report if report is not None else WalkReport()
     extensions = {f".{e.lower().lstrip('.')}" for e in settings.library.extensions}
     excludes = settings.library.exclude_patterns
     # The codec is unknown until probing, so small files must reach that stage
@@ -80,13 +125,21 @@ def walk_paths(
         else settings.library.min_file_size_mb * 1024 * 1024
     )
     follow = settings.library.follow_symlinks
+    own_dirs = _own_dirs(settings)
     seen_dirs: set[tuple[int, int]] = set()
+
+    def on_error(exc: OSError) -> None:
+        log.warning("Ordner nicht lesbar: %s (%s)", exc.filename, exc.strerror)
+        if exc.filename:
+            report.unreadable.append(str(exc.filename))
 
     for lib_id, root in roots:
         if not os.path.isdir(root):
             log.warning("Library path missing: %s", root)
             continue
-        for dirpath, dirnames, filenames in os.walk(root, followlinks=follow):
+        unreadable_before = len(report.unreadable)
+        count = 0
+        for dirpath, dirnames, filenames in os.walk(root, onerror=on_error, followlinks=follow):
             # Guard against symlink loops when following is enabled.
             if follow:
                 try:
@@ -99,10 +152,23 @@ def walk_paths(
                 except OSError:
                     continue
 
-            dirnames[:] = [
-                d for d in dirnames
-                if not d.startswith(".") and not _matches_exclude(os.path.join(dirpath, d), excludes)
-            ]
+            kept = []
+            for d in dirnames:
+                full_dir = os.path.join(dirpath, d)
+                # Hidden folders - this includes our own .optimizarr-trash.
+                if d.startswith(".") or d.startswith(OWN_PREFIXES):
+                    continue
+                if not _storable(full_dir):
+                    report.unstorable += 1
+                    log.warning(
+                        "Ordner mit ungueltigem Namen (kein UTF-8) uebersprungen: %r", full_dir
+                    )
+                    continue
+                if os.path.realpath(full_dir) in own_dirs or _matches_exclude(full_dir, excludes):
+                    continue
+                kept.append(d)
+            dirnames[:] = kept
+
             for name in filenames:
                 # Hidden files are never media: our own .optimizarr-staging-*
                 # leftovers, macOS "._" resource forks.
@@ -112,6 +178,10 @@ def walk_paths(
                 if Path(name).suffix.lower() not in extensions:
                     continue
                 full = os.path.join(dirpath, name)
+                if not _storable(full):
+                    report.unstorable += 1
+                    log.warning("Datei mit ungueltigem Namen (kein UTF-8) uebersprungen: %r", full)
+                    continue
                 if _matches_exclude(full, excludes):
                     continue
                 try:
@@ -120,15 +190,118 @@ def walk_paths(
                     continue
                 if st.st_size < min_size:
                     continue
+                count += 1
                 yield lib_id, full, st.st_size, st.st_mtime
+
+        # The root itself failing to list means it was not really reachable.
+        root_norm = root.rstrip("/")
+        if not any(p.rstrip("/") == root_norm for p in report.unreadable[unreadable_before:]):
+            report.found[lib_id] = report.found.get(lib_id, 0) + count
 
 
 # --------------------------------------------------------------------------- #
 # Database sync
 # --------------------------------------------------------------------------- #
 
+#: A write transaction is never held longer than about this while syncing -
+#: the encoder and the API need the database too (SQLite has a single writer).
+COMMIT_INTERVAL = 1.0
+
+#: Rows gone from disk for longer than this are dropped from the database.
+MISSING_RETENTION_DAYS = 30
+
+#: Written after the first full scan that re-probed the library for Dolby
+#: Vision.  Probes before that did not recognise DV (see ffmpeg._detect_hdr),
+#: so a DV file could sit in the candidate list as plain HDR10 or even SDR.
+#: The re-probe is metadata only: a file that turns out not to be DV keeps its
+#: state and verdict - no trial encode is spent on it again.
+DV_REPROBE_MARKER = "dolby-vision-reprobe.done"
+_DV_CODECS = ("hevc", "av1", "h264")
+
+
+def _dv_marker() -> Path:
+    from .. import db
+
+    return db.CONFIG_DIR / DV_REPROBE_MARKER
+
+
+def _dv_reprobe_pending() -> bool:
+    try:
+        return not _dv_marker().exists()
+    except OSError:
+        return False
+
+
+def _mark_dv_reprobe_done() -> None:
+    try:
+        path = _dv_marker()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(utcnow().isoformat() + "\n")
+    except OSError as exc:
+        log.warning("could not write %s: %s", DV_REPROBE_MARKER, exc)
+
+
+def _dv_reprobe_ids() -> list[int]:
+    """Unfinished files probed before DV detection worked."""
+    from . import codecs
+
+    with session_scope() as s:
+        rows = s.execute(
+            select(MediaFile.id, MediaFile.video_codec, MediaFile.hdr_format).where(
+                MediaFile.state.in_([
+                    FileState.PROBED.value, FileState.CANDIDATE.value, FileState.SKIPPED.value,
+                ]),
+                MediaFile.ignored.is_(False),
+            )
+        ).all()
+    return [
+        file_id for file_id, codec, hdr in rows
+        if codecs.normalise(codec) in _DV_CODECS and not ffmpeg.is_dolby_vision(hdr)
+    ]
+
+
+def _restored_state(row: MediaFile) -> str:
+    """Where a file that went missing and came back unchanged belongs.
+
+    Size and mtime match, so whatever was known about it still holds - turning
+    a converted file into "new" would cost a probe and lose its "done".
+    """
+    from . import codecs
+
+    if row.ignored:
+        return FileState.IGNORED.value
+    if row.converted_at is not None and codecs.normalise(row.video_codec) == "av1":
+        return FileState.DONE.value
+    if row.analyzed_at is not None and row.decision_reason:
+        if row.plan and analyzer.reason_means_convert(row.decision_reason):
+            return FileState.CANDIDATE.value
+        return FileState.SKIPPED.value
+    if row.video_codec:
+        return FileState.PROBED.value
+    return FileState.NEW.value
+
+
+#: States an ignored file may be in without a job owning it.
+_IGNORABLE = (
+    FileState.NEW.value, FileState.PROBED.value, FileState.ANALYZING.value,
+    FileState.CANDIDATE.value, FileState.SKIPPED.value, FileState.FAILED.value,
+    FileState.MISSING.value,
+)
+
+
+def _is_below(path: str, folder: str) -> bool:
+    folder = folder.rstrip("/")
+    return path == folder or path.startswith(folder + "/")
+
+
 def _sync_disk_to_db(settings: AppSettings, run_id: int) -> tuple[int, int, list[int]]:
-    """Upsert everything on disk.  Returns (seen, new, ids_needing_probe)."""
+    """Upsert everything on disk.  Returns (seen, new, ids_needing_probe).
+
+    The disk is walked first, without touching the database: on a slow or
+    sleeping share that takes minutes, and a write transaction held open for
+    that long locked out the encoder and the API.  Applying the result is fast
+    and commits at least every ``COMMIT_INTERVAL`` seconds.
+    """
     with session_scope() as s:
         roots = [
             (lp.id, lp.path)
@@ -136,6 +309,25 @@ def _sync_disk_to_db(settings: AppSettings, run_id: int) -> tuple[int, int, list
             .scalars()
             .all()
         ]
+
+    # ---- walk, no database -------------------------------------------------
+    report = WalkReport()
+    entries: list[tuple[int, str, int, float]] = []
+    for entry in walk_paths(roots, settings, report):
+        entries.append(entry)
+        if len(entries) % 500 == 0:
+            bus.publish("scan.progress", {
+                "phase": "walk", "seen": len(entries), "new": 0, "current": entry[1],
+            })
+    if report.unstorable:
+        _log_history(
+            "warning", "scan",
+            f"{report.unstorable} Datei- oder Ordnernamen sind kein gueltiges UTF-8 und "
+            "wurden uebersprungen.",
+        )
+
+    # ---- apply ---------------------------------------------------------------
+    with session_scope() as s:
         existing: dict[str, MediaFile] = {
             mf.path: mf for mf in s.execute(select(MediaFile)).scalars().all()
         }
@@ -143,9 +335,16 @@ def _sync_disk_to_db(settings: AppSettings, run_id: int) -> tuple[int, int, list
         seen_paths: set[str] = set()
         new_count = 0
         needs_probe: list[int] = []
-        batch = 0
+        queued_probe: set[int] = set()
 
-        for lib_id, path, size, mtime in walk_paths(roots, settings):
+        def want_probe(file_id: int) -> None:
+            if file_id not in queued_probe:
+                queued_probe.add(file_id)
+                needs_probe.append(file_id)
+
+        committed_at = time.monotonic()
+
+        for index, (lib_id, path, size, mtime) in enumerate(entries, 1):
             seen_paths.add(path)
             row = existing.get(path)
             if row is None:
@@ -164,71 +363,181 @@ def _sync_disk_to_db(settings: AppSettings, run_id: int) -> tuple[int, int, list
                 s.add(row)
                 s.flush()
                 new_count += 1
-                needs_probe.append(row.id)
+                want_probe(row.id)
             else:
-                def is_changed() -> bool:
-                    return (
-                        abs(row.mtime - mtime) > 1.0
-                        or row.size != size
-                        or row.state in (FileState.NEW.value, FileState.MISSING.value)
-                    )
+                _sync_existing(s, row, lib_id, size, mtime, settings, want_probe)
 
-                changed = is_changed()
-                if changed:
-                    # Re-read before acting on it: a job may have replaced the
-                    # file since the snapshot, and the stale row would reset a
-                    # freshly converted file from "done" to "new".
-                    s.refresh(row)
-                    changed = is_changed()
-                row.last_seen = utcnow()
-                row.library_id = lib_id
-                if changed and row.state != FileState.ENCODING.value:
-                    row.size = size
-                    row.mtime = mtime
-                    row.state = FileState.NEW.value
-                    row.error = ""
-                    needs_probe.append(row.id)
-                elif row.state == FileState.PROBED.value:
-                    # Metadata read but never analysed - unfinished work, so it
-                    # is picked up even when only changed files are rescanned.
-                    # This is also how a lifted codec exclusion comes back.
-                    needs_probe.append(row.id)
-                elif not settings.library.rescan_changed_only and row.state in (
-                    FileState.SKIPPED.value, FileState.CANDIDATE.value
-                ):
-                    needs_probe.append(row.id)
-                elif _analysis_is_stale(row, settings):
-                    needs_probe.append(row.id)
-
-            batch += 1
-            if batch % 500 == 0:
-                s.flush()
+            if index % 500 == 0 or time.monotonic() - committed_at >= COMMIT_INTERVAL:
                 run = s.get(ScanRun, run_id)
                 if run:
                     run.files_seen = len(seen_paths)
                     run.files_new = new_count
                     run.current_path = path
                 s.commit()
+                committed_at = time.monotonic()
                 bus.publish("scan.progress", {
                     "phase": "walk", "seen": len(seen_paths), "new": new_count, "current": path,
                 })
 
-        # Anything in the DB we did not see is gone from disk.
-        for path, row in existing.items():
-            if path in seen_paths:
-                continue
-            s.refresh(row)  # may have been renamed by a finished encode
-            if row.path in seen_paths:
-                continue
-            if row.state not in (FileState.MISSING.value, FileState.ENCODING.value):
-                row.state = FileState.MISSING.value
+        _mark_missing(s, existing, seen_paths, roots, report)
+        s.commit()
+        purged = _purge_missing(s)
 
         run = s.get(ScanRun, run_id)
         if run:
             run.files_seen = len(seen_paths)
             run.files_new = new_count
             run.total = len(needs_probe)
-        return len(seen_paths), new_count, needs_probe
+    if purged:
+        _log_history(
+            "info", "scan",
+            f"{purged} Eintraege entfernt, deren Dateien seit ueber "
+            f"{MISSING_RETENTION_DAYS} Tagen fehlen.",
+        )
+    return len(seen_paths), new_count, needs_probe
+
+
+def _sync_existing(
+    s: Any, row: MediaFile, lib_id: int, size: int, mtime: float,
+    settings: AppSettings, want_probe: Callable[[int], None],
+) -> None:
+    """Bring one known row in line with what the walk found."""
+
+    def is_changed() -> bool:
+        return abs(row.mtime - mtime) > 1.0 or row.size != size
+
+    if is_changed() or row.state in (FileState.NEW.value, FileState.MISSING.value):
+        # Re-read before acting on it: a job may have replaced the file since
+        # the snapshot, and the stale row would reset a freshly converted file
+        # from "done" to "new".
+        s.refresh(row)
+    row.last_seen = utcnow()
+    row.library_id = lib_id
+
+    if row.state == FileState.ENCODING.value:
+        return
+
+    if row.ignored:
+        # Ignored stays ignored, changed or not.  Setting it to "new" left it
+        # stuck there for good: the probe skips ignored files.
+        row.size = size
+        row.mtime = mtime
+        if row.state in _IGNORABLE:
+            row.state = FileState.IGNORED.value
+        return
+
+    if row.state == FileState.MISSING.value and not is_changed():
+        # Back, and untouched: whatever we knew about it still holds.
+        row.state = _restored_state(row)
+        row.error = ""
+        if row.state in (FileState.NEW.value, FileState.PROBED.value):
+            want_probe(row.id)
+        return
+
+    if is_changed() or row.state in (FileState.NEW.value, FileState.MISSING.value):
+        row.size = size
+        row.mtime = mtime
+        if row.state == FileState.QUEUED.value:
+            # A job owns the file; it probes the file again when it starts.
+            return
+        row.state = FileState.NEW.value
+        row.error = ""
+        want_probe(row.id)
+    elif row.state == FileState.PROBED.value:
+        # Metadata read but never analysed - unfinished work, so it is picked
+        # up even when only changed files are rescanned.  This is also how a
+        # lifted codec exclusion comes back.
+        want_probe(row.id)
+    elif not settings.library.rescan_changed_only and row.state in (
+        FileState.SKIPPED.value, FileState.CANDIDATE.value
+    ):
+        want_probe(row.id)
+    elif _analysis_is_stale(row, settings):
+        want_probe(row.id)
+
+
+def _mark_missing(
+    s: Any, existing: dict[str, MediaFile], seen: set[str],
+    roots: list[tuple[int, str]], report: WalkReport,
+) -> None:
+    """Mark rows as missing - but only where the walk could actually look.
+
+    A disabled library, an unmounted share or an unreadable folder says nothing
+    about the files in it.  A reachable root that is completely empty while the
+    database knows files there is almost always a share that did not mount (the
+    mount point exists, empty), so that is not trusted either.
+    """
+    root_of = dict(roots)
+    known: dict[int, int] = {}
+    for row in existing.values():
+        if row.library_id is not None and row.state != FileState.MISSING.value:
+            known[row.library_id] = known.get(row.library_id, 0) + 1
+    trusted: dict[int, str] = {}
+    for lib_id, count in report.found.items():
+        if count == 0 and known.get(lib_id):
+            log.warning(
+                "Bibliothek %s ist leer, obwohl %d Dateien bekannt sind - nicht "
+                "eingehaengt? Es wird nichts als fehlend markiert.",
+                root_of.get(lib_id), known[lib_id],
+            )
+            continue
+        trusted[lib_id] = root_of.get(lib_id, "")
+
+    for path, row in existing.items():
+        if path in seen:
+            continue
+        s.refresh(row)  # may have been renamed by a finished encode
+        if row.path in seen:
+            continue
+        if row.state in (FileState.MISSING.value, FileState.ENCODING.value):
+            continue
+        if row.library_id is not None:
+            if row.library_id not in trusted:
+                continue
+        elif not any(_is_below(row.path, root) for root in trusted.values() if root):
+            continue
+        if any(_is_below(row.path, folder) for folder in report.unreadable):
+            continue
+        row.state = FileState.MISSING.value
+
+
+def _purge_missing(s: Any) -> int:
+    """Drop rows that have been missing for longer than the retention period.
+
+    Rows with a queued or running job stay - the job references them.  History
+    entries and learning samples survive with their reference cleared; the
+    file's finished jobs go with it (the foreign key cascades).
+    """
+    from sqlalchemy import delete as sa_delete
+
+    from ..models import Job, JobState, LearningSample
+
+    cutoff = (utcnow() - dt.timedelta(days=MISSING_RETENTION_DAYS)).replace(tzinfo=None)
+    stale = set(s.execute(
+        select(MediaFile.id).where(
+            MediaFile.state == FileState.MISSING.value, MediaFile.last_seen < cutoff,
+        )
+    ).scalars())
+    if not stale:
+        return 0
+    busy = set(s.execute(
+        select(Job.file_id).where(
+            Job.file_id.in_(stale),
+            Job.state.in_([JobState.QUEUED.value, JobState.RUNNING.value]),
+        )
+    ).scalars())
+    ids = sorted(stale - busy)
+    if not ids:
+        return 0
+    job_ids = list(s.execute(select(Job.id).where(Job.file_id.in_(ids))).scalars())
+    s.execute(update(HistoryEntry).where(HistoryEntry.file_id.in_(ids)).values(file_id=None))
+    if job_ids:
+        s.execute(
+            update(LearningSample).where(LearningSample.job_id.in_(job_ids)).values(job_id=None)
+        )
+        s.execute(sa_delete(Job).where(Job.id.in_(job_ids)))
+    s.execute(sa_delete(MediaFile).where(MediaFile.id.in_(ids)))
+    return len(ids)
 
 
 def _analysis_is_stale(row: MediaFile, settings: AppSettings) -> bool:
@@ -318,11 +627,16 @@ def _log_history(level: str, category: str, message: str, file_id: int | None = 
 
 async def run_scan(trigger: str = "manual", analyze_only_ids: list[int] | None = None,
                    depth: str | None = None) -> dict[str, Any]:
-    """Full scan: walk -> probe -> analyse.  One at a time."""
-    if state.running:
-        return {"ok": False, "error": "Es laeuft bereits ein Scan."}
+    """Full scan: walk -> probe -> analyse.  One at a time.
 
-    settings = load_settings(force=True)
+    Everything after the scan lock is taken sits inside ``try/finally``: an
+    exception anywhere - settings, hardware detection, the advisor - must not
+    leave ``state.running`` set, or no scan and no queued encode would ever
+    start again until a restart.
+    """
+    if state.running:
+        return {"ok": False, "error": BUSY_MESSAGE}
+
     cancel = asyncio.Event()
     state.running = True
     state.cancel = cancel
@@ -331,28 +645,32 @@ async def run_scan(trigger: str = "manual", analyze_only_ids: list[int] | None =
     state.total = 0
     state.current = ""
     state.started_at = dt.datetime.now(dt.timezone.utc)
+    state.run_id = None
 
-    with session_scope() as s:
-        run = ScanRun(trigger=trigger, state="running")
-        s.add(run)
-        s.flush()
-        run_id = run.id
-    state.run_id = run_id
-    bus.publish("scan.started", {"run_id": run_id, "trigger": trigger})
-
-    hw = hwaccel.cached()
-    if hw is None:
-        hw = await hwaccel.detect(
-            settings.hardware.render_device, settings.hardware.qsv_low_power
-        )
-    advisor = get_advisor(settings.advisor)
-    advisor.reset_budget()
-
+    run_id: int | None = None
     probed = analyzed = candidates = 0
     error_message = ""
 
     try:
+        settings = load_settings(force=True)
+        with session_scope() as s:
+            run = ScanRun(trigger=trigger, state="running")
+            s.add(run)
+            s.flush()
+            run_id = run.id
+        state.run_id = run_id
+        bus.publish("scan.started", {"run_id": run_id, "trigger": trigger})
+
+        hw = hwaccel.cached()
+        if hw is None:
+            hw = await hwaccel.detect(
+                settings.hardware.render_device, settings.hardware.qsv_low_power
+            )
+        advisor = get_advisor(settings.advisor)
+        advisor.reset_budget()
+
         # ---------------- phase 1: walk ----------------
+        dv_reprobe = analyze_only_ids is None and _dv_reprobe_pending()
         if analyze_only_ids is None:
             seen, new_count, todo = await asyncio.to_thread(_sync_disk_to_db, settings, run_id)
             _log_history("info", "scan",
@@ -360,6 +678,14 @@ async def run_scan(trigger: str = "manual", analyze_only_ids: list[int] | None =
         else:
             todo = list(analyze_only_ids)
             seen = new_count = 0
+
+        # Once: re-probe what was probed before DV detection worked.  Only a
+        # file that turns out to be DV is stored and re-analysed (a precheck
+        # skip, no trial encode); every other one keeps its state and verdict.
+        dv_only: set[int] = set()
+        if dv_reprobe:
+            dv_only = set(await asyncio.to_thread(_dv_reprobe_ids)) - set(todo)
+            todo = list(todo) + sorted(dv_only)
 
         if cancel.is_set():
             raise asyncio.CancelledError
@@ -377,6 +703,8 @@ async def run_scan(trigger: str = "manual", analyze_only_ids: list[int] | None =
             if cancel.is_set():
                 return
             async with probe_sem:
+                if cancel.is_set():
+                    return
                 with session_scope() as s:
                     row = s.get(MediaFile, file_id)
                     path = row.path if row else None
@@ -384,12 +712,16 @@ async def run_scan(trigger: str = "manual", analyze_only_ids: list[int] | None =
                 if not path or ignored:
                     return
                 state.current = path
+                info: ffmpeg.MediaInfo | None = None
                 try:
                     info = await ffmpeg.probe(path)
                 except ffmpeg.FFmpegError as exc:
-                    await asyncio.to_thread(_mark_error, file_id, str(exc))
+                    if file_id not in dv_only:   # a DV check alone never fails a file
+                        await asyncio.to_thread(_mark_error, file_id, str(exc))
                     log.warning("probe failed for %s: %s", path, exc)
-                else:
+                if info is not None and (
+                    file_id not in dv_only or ffmpeg.is_dolby_vision(info.hdr_format)
+                ):
                     await asyncio.to_thread(_store_probe, file_id, info)
                     probe_ok.append((file_id, info))
                 probed += 1
@@ -420,6 +752,8 @@ async def run_scan(trigger: str = "manual", analyze_only_ids: list[int] | None =
             if cancel.is_set():
                 return
             async with analyze_sem:
+                if cancel.is_set():
+                    return
                 state.current = info.path
                 try:
                     result = await analyzer.analyze(
@@ -427,8 +761,14 @@ async def run_scan(trigger: str = "manual", analyze_only_ids: list[int] | None =
                         workroot=workroot, cancel_event=cancel,
                     )
                 except Exception as exc:  # one bad file must not kill the scan
+                    if cancel.is_set():
+                        return
                     log.exception("analysis failed for %s", info.path)
                     await asyncio.to_thread(_mark_error, file_id, f"Analyse fehlgeschlagen: {exc}")
+                    return
+                if cancel.is_set():
+                    # An analysis cut short (trial encodes terminated, advisor
+                    # skipped) is not a verdict - the file keeps its old one.
                     return
                 await asyncio.to_thread(_store_analysis, file_id, result)
                 analyzed += 1
@@ -447,33 +787,42 @@ async def run_scan(trigger: str = "manual", analyze_only_ids: list[int] | None =
                 })
 
         await _gather_limited([analyze_one(fid, info) for fid, info in probe_ok], cancel)
+        if cancel.is_set():
+            raise asyncio.CancelledError
+
+        if dv_reprobe:
+            await asyncio.to_thread(_mark_dv_reprobe_done)
 
         # ---------------- phase 4: auto-queue ----------------
-        if settings.queue.auto_queue_candidates and not cancel.is_set():
+        if settings.queue.auto_queue_candidates:
             queued = await asyncio.to_thread(_auto_queue, settings)
             if queued:
                 _log_history("info", "queue", f"{queued} Dateien automatisch eingereiht.")
 
     except asyncio.CancelledError:
-        error_message = "Scan abgebrochen"
-        _log_history("warning", "scan", "Scan wurde abgebrochen.")
-    except Exception as exc:  # pragma: no cover - defensive
-        error_message = str(exc)
+        error_message = CANCELLED_MESSAGE
+        _safe_history("warning", "scan", "Scan wurde abgebrochen.")
+    except Exception as exc:
+        error_message = str(exc) or type(exc).__name__
         log.exception("scan failed")
-        _log_history("error", "scan", f"Scan fehlgeschlagen: {exc}")
+        _safe_history("error", "scan", f"Scan fehlgeschlagen: {error_message}")
     finally:
-        with session_scope() as s:
-            run = s.get(ScanRun, run_id)
-            if run:
-                run.state = "cancelled" if error_message == "Scan abgebrochen" else (
-                    "failed" if error_message else "done"
-                )
-                run.files_probed = probed
-                run.files_analyzed = analyzed
-                run.candidates = candidates
-                run.error = error_message
-                run.finished_at = utcnow()
-                run.current_path = ""
+        try:
+            if run_id is not None:
+                with session_scope() as s:
+                    run = s.get(ScanRun, run_id)
+                    if run:
+                        run.state = "cancelled" if error_message == CANCELLED_MESSAGE else (
+                            "failed" if error_message else "done"
+                        )
+                        run.files_probed = probed
+                        run.files_analyzed = analyzed
+                        run.candidates = candidates
+                        run.error = error_message
+                        run.finished_at = utcnow()
+                        run.current_path = ""
+        except Exception:  # the lock below must be released no matter what
+            log.exception("could not finalise scan run %s", run_id)
         state.running = False
         state.phase = "idle"
         state.current = ""
@@ -482,6 +831,9 @@ async def run_scan(trigger: str = "manual", analyze_only_ids: list[int] | None =
             "run_id": run_id, "probed": probed, "analyzed": analyzed,
             "candidates": candidates, "error": error_message,
         })
+        if _has_pending_analysis():
+            # Re-evaluations requested while this scan ran.
+            asyncio.get_running_loop().call_soon(_start_pending_analysis)
 
     if not error_message:
         _log_history(
@@ -494,18 +846,46 @@ async def run_scan(trigger: str = "manual", analyze_only_ids: list[int] | None =
     }
 
 
+def _safe_history(level: str, category: str, message: str) -> None:
+    try:
+        _log_history(level, category, message)
+    except Exception:  # pragma: no cover - the database may be what failed
+        log.exception("could not write history entry")
+
+
+#: How long work that watches the cancel event itself (trial encodes terminate
+#: their ffmpeg, the analyzer skips the advisor) gets to wind down before it is
+#: cancelled outright - so no ffmpeg process is left behind.
+CANCEL_GRACE = 15.0
+
+
 async def _gather_limited(coros: list[Any], cancel: asyncio.Event) -> None:
-    """Run coroutines concurrently, stopping early on cancel."""
+    """Run coroutines concurrently, stopping early on cancel.
+
+    Returns as soon as all of them finished or ``cancel`` fired; in the latter
+    case whatever is still running gets ``CANCEL_GRACE`` seconds and is then
+    cancelled.
+    """
     if not coros:
         return
     tasks = [asyncio.create_task(c) for c in coros]
+    gathered = asyncio.gather(*tasks, return_exceptions=True)
+    stopper = asyncio.create_task(cancel.wait())
     try:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    finally:
-        if cancel.is_set():
+        await asyncio.wait({gathered, stopper}, return_when=asyncio.FIRST_COMPLETED)
+        if cancel.is_set() and not gathered.done():
+            await asyncio.wait({gathered}, timeout=CANCEL_GRACE)
             for t in tasks:
                 if not t.done():
                     t.cancel()
+        await gathered
+    except asyncio.CancelledError:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        raise
+    finally:
+        stopper.cancel()
 
 
 def _auto_queue(settings: AppSettings) -> int:
@@ -554,13 +934,80 @@ def cancel_scan() -> bool:
     return False
 
 
+# --------------------------------------------------------------------------- #
+# Re-evaluation after a settings change
+# --------------------------------------------------------------------------- #
+
+#: Trigger name of the analysis run a settings change starts.
+SETTINGS_TRIGGER = "settings"
+
+_pending_analysis: set[int] = set()
+_pending_lock = threading.Lock()
+_background: set[asyncio.Task[Any]] = set()
+
+
+def _has_pending_analysis() -> bool:
+    with _pending_lock:
+        return bool(_pending_analysis)
+
+
+def request_analysis(file_ids: list[int]) -> bool:
+    """Analyse these files soon, without waiting for the next scheduled scan.
+
+    Safe to call from any thread: the settings endpoint runs in FastAPI's
+    threadpool, while the scan has to run on the event loop.  When a scan is
+    already running the files are taken up right after it.  Returns False when
+    there is no event loop to run on - the files then stay in ``probed`` and
+    the next scan picks them up.
+    """
+    ids = {int(i) for i in file_ids}
+    if not ids:
+        return False
+    with _pending_lock:
+        _pending_analysis.update(ids)
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if running is not None:
+        running.call_soon(_start_pending_analysis)
+        return True
+    loop = bus._loop
+    if loop is None or loop.is_closed() or not loop.is_running():
+        return False
+    loop.call_soon_threadsafe(_start_pending_analysis)
+    return True
+
+
+def _start_pending_analysis() -> None:
+    """On the event loop: start the analysis run for everything requested."""
+    if state.running:
+        return  # run_scan comes back here when it finishes
+    with _pending_lock:
+        ids = sorted(_pending_analysis)
+        _pending_analysis.clear()
+    if not ids:
+        return
+    task = asyncio.ensure_future(_run_pending(ids))
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+
+
+async def _run_pending(ids: list[int]) -> None:
+    result = await run_scan(trigger=SETTINGS_TRIGGER, analyze_only_ids=ids)
+    if not result.get("ok") and result.get("error") == BUSY_MESSAGE:
+        # Another scan got the lock first; it hands back to us when done.
+        with _pending_lock:
+            _pending_analysis.update(ids)
+
+
 def apply_h264_conversion_change(before: bool, after: bool) -> int:
     """Re-evaluate stored decisions once when the migration mode changes."""
     from . import codecs
 
     if before == after:
         return 0
-    count = 0
+    ids: list[int] = []
     with session_scope() as s:
         rows = s.execute(select(MediaFile).where(
             MediaFile.state.in_([FileState.CANDIDATE.value, FileState.SKIPPED.value]),
@@ -571,15 +1018,16 @@ def apply_h264_conversion_change(before: bool, after: bool) -> int:
                 continue
             row.state = FileState.PROBED.value
             row.analyzed_at = None
-            row.decision_reason = "H.264-Modus geaendert - Neubewertung beim naechsten Scan."
+            row.decision_reason = "H.264-Modus geaendert - wird neu bewertet."
             row.plan = None
             row.estimated_size = 0
             row.estimated_saving_bytes = 0
             row.estimated_saving_pct = 0.0
-            count += 1
-    if count:
-        bus.publish("library.changed", {"h264_reanalysis": count})
-    return count
+            ids.append(row.id)
+    if ids:
+        bus.publish("library.changed", {"h264_reanalysis": len(ids)})
+        request_analysis(ids)
+    return len(ids)
 
 
 # --------------------------------------------------------------------------- #
@@ -600,10 +1048,11 @@ def apply_codec_exclusions(before: list[str], after: list[str]) -> dict[str, Any
     that are queued or already encoding are left alone - somebody put them
     there on purpose - but they are counted, so the UI can say so.
 
-    *No longer excluded* files go back to ``probed`` and get re-analysed on the
-    next scan.  Only files skipped *by this setting* are touched: one that was
-    skipped for being tiny or already lean stays skipped, and no trial encode
-    is spent re-discovering that.
+    *No longer excluded* files go back to ``probed`` and an analysis run for
+    exactly those files starts right away (see ``request_analysis``) instead of
+    waiting for the next scheduled scan.  Only files skipped *by this setting*
+    are touched: one that was skipped for being tiny or already lean stays
+    skipped, and no trial encode is spent re-discovering that.
     """
     from . import codecs
 
@@ -621,6 +1070,7 @@ def apply_codec_exclusions(before: list[str], after: list[str]) -> dict[str, Any
     if not added and not removed:
         return result
 
+    restored_ids: list[int] = []
     with session_scope() as s:
         if added:
             rows = s.execute(
@@ -656,14 +1106,17 @@ def apply_codec_exclusions(before: list[str], after: list[str]) -> dict[str, Any
                 row.state = FileState.PROBED.value
                 row.decision_reason = ""
                 row.analyzed_at = None
-                result["restored"] += 1
+                restored_ids.append(row.id)
+            result["restored"] = len(restored_ids)
 
     if result["excluded"] or result["restored"]:
         bits = []
         if result["excluded"]:
             bits.append(f"{result['excluded']} Dateien aus der Kandidatenliste entfernt")
         if result["restored"]:
-            bits.append(f"{result['restored']} Dateien zur Neubewertung vorgemerkt")
+            bits.append(f"{result['restored']} Dateien werden neu bewertet")
         _log_history("info", "settings", "Codec-Ausschluss geaendert: " + ", ".join(bits))
         bus.publish("library.changed", {"codec_exclusions": result})
+    if restored_ids:
+        result["analysis_started"] = request_analysis(restored_ids)
     return result

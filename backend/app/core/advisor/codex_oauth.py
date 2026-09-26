@@ -171,7 +171,11 @@ def state_matches(returned: str | None, expected: str) -> bool:
 
 
 def strip_state_suffix(returned: str) -> str:
-    """The bare state, with any server-added suffix removed."""
+    """The bare state, with any server-added suffix removed.
+
+    This is what the sign-in completion looks the stored flow up by - it then
+    requires an exact match (see ``routes_advisor.codex_complete``).
+    """
     for suffix in STATE_SUFFIXES:
         if returned.endswith(suffix):
             return returned[: -len(suffix)]

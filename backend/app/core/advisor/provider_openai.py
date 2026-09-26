@@ -86,6 +86,14 @@ STRUCTURED_LABELS = {
     "prompt": "Prompt-Anweisung",
 }
 
+#: How the connection test names the mode that worked - keyed by ladder entry.
+CHECK_MODE_LABELS = {
+    "json_schema_strict": "mit erzwungenem JSON-Schema",
+    "json_schema_loose": "mit JSON-Schema ohne Garantie",
+    "json_object": "im JSON-Modus",
+    "prompt": "ueber Prompt-Anweisung",
+}
+
 #: What the settings dropdown offers, mapped onto ladder entries.
 STRUCTURED_ALIASES = {
     "json_schema": "json_schema_strict",
@@ -471,23 +479,18 @@ class OpenAICompatibleProvider(AdviceProvider):
         except Exception as exc:
             return False, f"{type(exc).__name__}: {str(exc)[:200]}"
 
-        mode = {
-            "json_schema": "mit erzwungenem JSON-Schema",
-            "json_object": "im JSON-Modus",
-            "prompt": "ueber Prompt-Anweisung",
-        }.get(self._caps.structured, self._caps.structured)
+        mode = CHECK_MODE_LABELS.get(self._caps.structured, self._caps.structured)
 
         detail = f"Verbindung erfolgreich ({raw.model or self.settings.openai_model}, {mode})"
         if notes:
             detail += ". " + "; ".join(notes)
-        if self._caps.token_field != "max_tokens" or not self._caps.send_temperature:
-            detail += " [angepasst: " + ", ".join(
-                filter(None, [
-                    self._caps.token_field if self._caps.token_field != "max_tokens" else "",
-                    "ohne temperature" if not self._caps.send_temperature else "",
-                    "ohne system-Rolle" if not self._caps.send_system_role else "",
-                ])
-            ) + "]"
+        adjusted = [
+            self._caps.token_field if self._caps.token_field != "max_tokens" else "",
+            "ohne temperature" if not self._caps.send_temperature else "",
+            "ohne system-Rolle" if not self._caps.send_system_role else "",
+        ]
+        if any(adjusted):
+            detail += " [angepasst: " + ", ".join(filter(None, adjusted)) + "]"
         return True, detail
 
     def capabilities(self) -> dict[str, Any]:

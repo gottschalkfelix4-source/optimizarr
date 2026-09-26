@@ -18,6 +18,7 @@ import json
 import logging
 import platform
 import uuid
+import weakref
 from typing import Any
 
 from ...config import AdvisorSettings
@@ -145,6 +146,54 @@ def store_tokens(tokens: TokenSet, error: str = "") -> None:
             row.last_refresh = utcnow()
 
 
+def store_refreshed(tokens: TokenSet, used_refresh_token: str) -> bool:
+    """Save refreshed tokens - unless the stored credentials changed meanwhile.
+
+    A new sign-in, an import or a logout while the refresh request was in
+    flight must win: writing the refresh result over them would resurrect old
+    (possibly already rotated, i.e. dead) tokens.  Returns whether it wrote.
+    """
+    with session_scope() as s:
+        row = s.get(OAuthCredential, PROVIDER_KEY)
+        if row is None or row.refresh_token != used_refresh_token:
+            return False
+        row.access_token = tokens.access_token
+        row.refresh_token = tokens.refresh_token
+        row.id_token = tokens.id_token
+        row.account_id = tokens.account_id
+        row.account_label = tokens.account_label
+        row.plan_type = tokens.plan_type
+        row.expires_at = tokens.expires_at
+        row.last_error = ""
+        row.last_refresh = utcnow()
+        return True
+
+
+def store_refresh_error(message: str) -> None:
+    """Record a failed refresh without touching the tokens themselves."""
+    with session_scope() as s:
+        row = s.get(OAuthCredential, PROVIDER_KEY)
+        if row is not None:
+            row.last_error = message[:2000]
+
+
+#: One refresh at a time per event loop, across every provider instance - the
+#: settings screen's test, the model list and the scan each build their own
+#: CodexProvider, and two concurrent refreshes with the same (rotating) refresh
+#: token leave one of them holding a token the server already revoked.
+_refresh_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _refresh_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _refresh_locks.get(loop)
+    if lock is None:
+        lock = _refresh_locks[loop] = asyncio.Lock()
+    return lock
+
+
 def clear_tokens() -> None:
     with session_scope() as s:
         row = s.get(OAuthCredential, PROVIDER_KEY)
@@ -159,6 +208,16 @@ def credential_status() -> dict[str, Any]:
     except Exception:
         log.debug("could not read credential status", exc_info=True)
         return {"signed_in": False}
+
+
+def _iso_utc(value: dt.datetime | None) -> str | None:
+    """ISO timestamp with offset.  SQLite hands datetimes back without their
+    timezone; without "+00:00" the browser reads them as local time."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=dt.timezone.utc)
+    return value.isoformat()
 
 
 def _credential_status() -> dict[str, Any]:
@@ -177,7 +236,7 @@ def _credential_status() -> dict[str, Any]:
             "expires_at": expires.isoformat() if expires else None,
             "expired": bool(expires and dt.datetime.now(dt.timezone.utc) >= expires),
             "can_refresh": bool(row.refresh_token),
-            "last_refresh": row.last_refresh.isoformat() if row.last_refresh else None,
+            "last_refresh": _iso_utc(row.last_refresh),
             "last_error": row.last_error,
         }
 
@@ -193,7 +252,6 @@ class CodexProvider(AdviceProvider):
     def __init__(self, settings: AdvisorSettings):
         self.settings = settings
         self._client: Any = None
-        self._refresh_lock = asyncio.Lock()
         self._session_id = str(uuid.uuid4())
         #: None = not tried yet, False = backend rejected it, True = accepted.
         self._schema_supported: bool | None = None
@@ -245,8 +303,9 @@ class CodexProvider(AdviceProvider):
         if not tokens.is_expired and tokens.access_token:
             return tokens
 
-        async with self._refresh_lock:
-            # Another task may have refreshed while we waited for the lock.
+        async with _refresh_lock():
+            # Re-read inside the lock: another task (or provider instance) may
+            # have refreshed, or the user signed in again, while we waited.
             tokens = load_tokens()
             if tokens is None:
                 raise AdvisorUnavailable("Nicht mit ChatGPT angemeldet.")
@@ -259,11 +318,18 @@ class CodexProvider(AdviceProvider):
             try:
                 refreshed = await codex_oauth.refresh_tokens(tokens)
             except OAuthError as exc:
-                await asyncio.to_thread(store_tokens, tokens, str(exc))
+                # Only the error is recorded - never the tokens we started
+                # from, which may be older than what is stored by now.
+                await asyncio.to_thread(store_refresh_error, str(exc))
                 raise AdvisorUnavailable(
                     f"Anmeldung konnte nicht erneuert werden: {exc}"
                 ) from exc
-            await asyncio.to_thread(store_tokens, refreshed)
+            if not await asyncio.to_thread(store_refreshed, refreshed, tokens.refresh_token):
+                # Signed in anew (or out) meanwhile - that is what counts.
+                current = load_tokens()
+                if current is None:
+                    raise AdvisorUnavailable("Nicht mit ChatGPT angemeldet.")
+                return current
             log.info("refreshed ChatGPT credentials")
             return refreshed
 

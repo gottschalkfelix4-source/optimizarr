@@ -98,6 +98,55 @@ def _min_useful_bitrate(height: int, crf: float) -> float:
     return predictor.base_bpp(height) * predictor.crf_factor(crf) * 0.85
 
 
+_HDR10_TRANSFERS = ("smpte2084", "smpte st 2084")
+
+
+def dolby_vision_block(
+    hdr_format: str | None, color_transfer: str | None, settings: AppSettings,
+    force: bool = False,
+) -> str:
+    """Why a Dolby Vision file must not be converted - "" when it may be.
+
+    Profile 5 has no backwards-compatible base layer: the picture is stored in
+    IPT colour and only a DV decoder can show it, so any AV1 encode comes out
+    green and purple.  The same holds for DV of unknown profile unless the
+    stream is tagged PQ (an HDR10 base layer).  Those are refused always, even
+    when forced.  Profiles with a base layer (7, 8, ...) can be encoded as
+    plain HDR10 - losing the DV layer - but only when the user opted in with
+    ``analysis.dolby_vision = "hdr10_fallback"`` or forces the file.
+    """
+    profile = ffmpeg.dolby_vision_profile(hdr_format)
+    if profile is None:
+        return ""
+    transfer = (color_transfer or "").lower()
+    if profile == 5 or (profile == 0 and transfer not in _HDR10_TRANSFERS):
+        label = "Profil 5" if profile == 5 else "unbekanntes Profil"
+        return (
+            f"Dolby Vision ({label}) ohne HDR10-Basis - eine Umwandlung ergaebe "
+            "falsche Farben (gruen/violett). Die Datei wird nie konvertiert."
+        )
+    if force or settings.analysis.dolby_vision == "hdr10_fallback":
+        return ""
+    label = f"Profil {profile}" if profile else "HDR10-Basis"
+    return (
+        f"Dolby Vision ({label}) wird uebersprungen. Unter Einstellungen -> Analyse "
+        "kann die Umwandlung als HDR10 erlaubt werden (die Dolby-Vision-Ebene geht "
+        "dabei verloren)."
+    )
+
+
+def dolby_vision_note(hdr_format: str | None) -> str:
+    """The reason line for a DV file that is converted as HDR10."""
+    profile = ffmpeg.dolby_vision_profile(hdr_format)
+    if profile is None:
+        return ""
+    label = f"Profil {profile}" if profile else "HDR10-Basis"
+    return (
+        f"Dolby Vision ({label}) wird als HDR10 kodiert - die Dolby-Vision-Ebene "
+        "geht verloren, das HDR10-Bild bleibt erhalten."
+    )
+
+
 def precheck(info: ffmpeg.MediaInfo, settings: AppSettings) -> tuple[bool, str]:
     """Fast rejections that need no encoding at all.  Returns (skip, reason)."""
     codec = codecs.normalise(info.video_codec)
@@ -108,6 +157,10 @@ def precheck(info: ffmpeg.MediaInfo, settings: AppSettings) -> tuple[bool, str]:
         if codec == "av1":
             return True, "Bereits AV1 - eine Neukodierung wuerde nur Qualitaet kosten."
         return True, f"{codecs.label(codec)} {codecs.EXCLUSION_REASON}"
+    dv_reason = dolby_vision_block(info.hdr_format, info.color_transfer, settings)
+    if dv_reason:
+        # Before the H.264 migration shortcut: a broken picture is never worth it.
+        return True, dv_reason
     migrate = settings.analysis.requires_h264_conversion(codec)
     if not migrate and info.duration and info.duration < settings.library.min_duration_seconds:
         return True, (
@@ -145,11 +198,16 @@ def precheck(info: ffmpeg.MediaInfo, settings: AppSettings) -> tuple[bool, str]:
 # --------------------------------------------------------------------------- #
 
 async def _encode_segment(
-    plan: EncodePlan, info: ffmpeg.MediaInfo, segment: str, dest: str, timeout: float
+    plan: EncodePlan, info: ffmpeg.MediaInfo, segment: str, dest: str, timeout: float,
+    cancel_event: asyncio.Event | None = None,
 ) -> tuple[int, float]:
-    """Encode one extracted segment, return (bytes, duration)."""
+    """Encode one extracted segment, return (bytes, duration).
+
+    ``cancel_event`` terminates the ffmpeg process when a scan is cancelled -
+    cancelling the task alone would leave it running.
+    """
     args = planner.build_ffmpeg_args(plan, info, segment, dest, quiet_streams=True)
-    code, err = await ffmpeg.run_with_progress(args, timeout=timeout)
+    code, err = await ffmpeg.run_with_progress(args, timeout=timeout, cancel_event=cancel_event)
     if code != 0:
         raise ffmpeg.FFmpegError(f"Testencode fehlgeschlagen: {err.strip()[-300:]}", code, err)
     size = os.path.getsize(dest) if os.path.exists(dest) else 0
@@ -201,7 +259,7 @@ async def run_samples(
 
         try:
             size, seg_duration = await _encode_segment(
-                plan, info, str(raw), str(enc), timeout=900
+                plan, info, str(raw), str(enc), timeout=900, cancel_event=cancel_event,
             )
         except ffmpeg.FFmpegError as exc:
             result.error = str(exc)
@@ -284,7 +342,9 @@ async def search_crf_for_quality(
         trial_plan = EncodePlan(**{**plan.to_dict(), "crf": crf})
         out = workdir / f"quality_try{step}.mkv"
         try:
-            await _encode_segment(trial_plan, info, str(seg), str(out), timeout=900)
+            await _encode_segment(
+                trial_plan, info, str(seg), str(out), timeout=900, cancel_event=cancel_event,
+            )
         except ffmpeg.FFmpegError as exc:
             notes.append(f"Qualitaetssuche abgebrochen: {exc}")
             break
@@ -377,6 +437,10 @@ async def analyze(
     # --- 2. initial plan -----------------------------------------------------
     plan = planner.build_plan(info, settings, hw)
     result.reasons.extend(plan.notes)
+    dv_note = dolby_vision_note(info.hdr_format)
+    if dv_note:
+        # precheck let it through, so the HDR10 fallback is allowed here.
+        result.reasons.append(dv_note)
 
     is_animation = quality.looks_like_animation(info.path)
     audio_bitrate = planner.estimate_audio_bitrate(plan, info)
@@ -472,7 +536,8 @@ async def analyze(
             source_size=info.size,
         )
 
-        if advisor is not None and advisor.should_ask(interim.confidence):
+        cancelled = cancel_event is not None and cancel_event.is_set()
+        if not cancelled and advisor is not None and advisor.should_ask(interim.confidence):
             context = _advisor_context(info, plan, interim, sample, grain_level, settings)
             advice = await advisor.advise(context, filename=Path(info.path).name)
             if advice.ok:
@@ -502,11 +567,14 @@ async def analyze(
             shutil.rmtree(workdir, ignore_errors=True)
 
     # --- 6. final prediction with the settings we actually landed on ---------
+    final_input = make_input(plan.crf, grain_level)
+    final_sample = _rescale_sample(sample, plan, settings) if sample and sample.ok else None
+    final_spread = sample.spread if sample and sample.ok else None
     final = predictor.predict(
-        make_input(plan.crf, grain_level),
+        final_input,
         encoder=plan.encoder,
-        sample_bitrate=_rescale_sample(sample, plan, settings) if sample and sample.ok else None,
-        sample_spread=sample.spread if sample and sample.ok else None,
+        sample_bitrate=final_sample,
+        sample_spread=final_spread,
         use_model=settings.analysis.use_learning_model,
         source_size=info.size,
     )
@@ -516,6 +584,21 @@ async def analyze(
     plan.estimated_saving_bytes = final.saving_bytes
     plan.estimated_saving_pct = final.saving_pct
     plan.predicted_video_bitrate = int(final.video_bitrate)
+    # What the learning model trains on after the encode: the prediction
+    # *before* its own correction, and exactly the features that correction was
+    # computed from - measured grain (0..1), the real has_sample.
+    base = predictor.predict(
+        final_input,
+        encoder=plan.encoder,
+        sample_bitrate=final_sample,
+        sample_spread=final_spread,
+        use_model=False,
+        source_size=info.size,
+    )
+    plan.base_video_bitrate = int(base.video_bitrate)
+    plan.prediction_features = predictor.build_features(
+        final_input, plan.encoder, has_sample=bool(final_sample),
+    )
 
     result.plan = plan
     result.prediction = final
@@ -553,6 +636,17 @@ def _estimate_eta(info: ffmpeg.MediaInfo, sample: SampleResult | None, plan: Enc
     return int(info.duration / max(base, 0.05))
 
 
+#: How a "convert" verdict begins - the scanner reads a stored verdict back
+#: when a file that went missing returns unchanged.
+_CONVERT_PREFIX = "Spart voraussichtlich"
+_MIGRATE_PREFIX = "H.264 vollstaendig nach AV1 konvertieren:"
+
+
+def reason_means_convert(reason: str | None) -> bool:
+    """Was this stored decision reason a "convert" verdict?"""
+    return bool(reason) and str(reason).startswith((_CONVERT_PREFIX, _MIGRATE_PREFIX))
+
+
 def _decide(
     result: AnalysisResult,
     info: ffmpeg.MediaInfo,
@@ -564,7 +658,7 @@ def _decide(
     if cfg.requires_h264_conversion(info.video_codec):
         result.decision = "convert"
         result.reason = (
-            "H.264 vollstaendig nach AV1 konvertieren: "
+            f"{_MIGRATE_PREFIX} "
             f"{_fmt(info.size)} -> voraussichtlich {_fmt(result.estimated_size)}. "
             "Die Umstellung erfolgt unabhaengig von der Ersparnis; groessere Ergebnisse sind erlaubt."
         )
@@ -612,7 +706,7 @@ def _decide(
     else:
         result.decision = "convert"
         result.reason = (
-            f"Spart voraussichtlich {_fmt(saving_bytes)} ({saving_pct:.0f}%): "
+            f"{_CONVERT_PREFIX} {_fmt(saving_bytes)} ({saving_pct:.0f}%): "
             f"{_fmt(info.size)} -> {_fmt(result.estimated_size)}."
         )
     if result.reason not in result.reasons:

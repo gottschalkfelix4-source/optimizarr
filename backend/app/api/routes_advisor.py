@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import delete
 
-from ..config import AdvisorSettings, load_settings
+from ..config import SECRET_MASK, AdvisorSettings, load_settings
 from ..core.advisor import get_advisor, provider_catalogue
 from ..core.advisor import codex_oauth
 from ..core.advisor.codex_oauth import OAuthError
@@ -30,11 +30,12 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 #: A sign-in the user never finished is worthless after this long.
-FLOW_TTL = dt.timedelta(minutes=30)
+FLOW_TTL = dt.timedelta(minutes=15)
 
 
 def _prune_flows() -> None:
-    cutoff = utcnow() - FLOW_TTL
+    # created_at is stored without a timezone (UTC); compare like with like.
+    cutoff = (utcnow() - FLOW_TTL).replace(tzinfo=None)
     try:
         with session_scope() as s:
             s.execute(delete(OAuthFlow).where(OAuthFlow.created_at < cutoff))
@@ -80,6 +81,29 @@ class TestRequest(BaseModel):
     codex_model: str | None = None
 
 
+def _given(value: str | None) -> str:
+    """A secret the caller actually supplied - empty and the mask mean "none"."""
+    value = (value or "").strip()
+    return "" if value == SECRET_MASK else value
+
+
+def openai_key_for(base_url: str, api_key: str | None, stored: AdvisorSettings) -> str:
+    """The key to send to ``base_url``.
+
+    The stored key is only ever sent to the stored endpoint.  Otherwise anyone
+    who can reach the settings screen could point the "test" or "fetch models"
+    button at their own server and collect the key from the Authorization
+    header (and the server would happily fetch internal URLs for them).
+    """
+    key = _given(api_key)
+    if key:
+        return key
+    stored_url = normalise_base_url(stored.openai_base_url)
+    if stored_url and normalise_base_url(base_url) == stored_url:
+        return stored.openai_api_key.strip()
+    return ""
+
+
 @router.post("/advisor/test")
 async def test_provider(payload: TestRequest | None = None) -> dict[str, Any]:
     """Run a real request against the configured (or supplied) backend."""
@@ -87,15 +111,18 @@ async def test_provider(payload: TestRequest | None = None) -> dict[str, Any]:
     cfg: AdvisorSettings = settings.advisor.model_copy(deep=True)
 
     if payload:
-        for field in (
-            "provider", "api_key", "model",
-            "openai_base_url", "openai_api_key", "openai_model", "codex_model",
-        ):
-            value = getattr(payload, field, None)
+        for field in ("provider", "model", "openai_model", "codex_model"):
+            value = (getattr(payload, field, None) or "").strip()
             if value:
                 setattr(cfg, field, value)
-        if payload.openai_base_url:
-            cfg.openai_base_url = normalise_base_url(payload.openai_base_url)
+        if _given(payload.api_key):
+            # Only ever sent to api.anthropic.com - no redirection possible.
+            cfg.api_key = _given(payload.api_key)
+        if (payload.openai_base_url or "").strip():
+            cfg.openai_base_url = normalise_base_url(payload.openai_base_url or "")
+        cfg.openai_api_key = openai_key_for(
+            cfg.openai_base_url, payload.openai_api_key, settings.advisor,
+        )
 
     # A throwaway advisor so the shared one keeps its budget and its clients.
     from ..core.advisor.service import Advisor
@@ -113,16 +140,24 @@ async def test_provider(payload: TestRequest | None = None) -> dict[str, Any]:
     return {"ok": ok, "message": message, "provider": cfg.provider, **extra}
 
 
-@router.get("/advisor/openai/models")
-async def list_openai_models(base_url: str = "", api_key: str = "") -> dict[str, Any]:
+class OpenAIModelsRequest(BaseModel):
+    base_url: str = ""
+    api_key: str | None = None
+
+
+@router.post("/advisor/openai/models")
+async def list_openai_models(payload: OpenAIModelsRequest | None = None) -> dict[str, Any]:
     """Ask an OpenAI-compatible endpoint what it can serve.
 
     Purely a convenience for the settings form - plenty of endpoints do not
-    implement /models, and that is not an error.
+    implement /models, and that is not an error.  A POST, so the key never
+    ends up in a URL (access logs, browser history); the stored key only goes
+    to the stored endpoint (see ``openai_key_for``).
     """
+    payload = payload or OpenAIModelsRequest()
     settings = load_settings()
-    url = normalise_base_url(base_url or settings.advisor.openai_base_url)
-    key = api_key or settings.advisor.openai_api_key
+    url = normalise_base_url(payload.base_url or settings.advisor.openai_base_url)
+    key = openai_key_for(url, payload.api_key, settings.advisor)
     if not url:
         raise HTTPException(status_code=400, detail="Keine Endpunkt-URL angegeben.")
 
@@ -201,30 +236,60 @@ class CodexCompleteRequest(BaseModel):
     state: str | None = None
 
 
+def _flow_expired(flow: OAuthFlow) -> bool:
+    created = flow.created_at
+    if created is None:
+        return True
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=dt.timezone.utc)
+    return utcnow() - created > FLOW_TTL
+
+
 @router.post("/advisor/codex/complete")
 async def codex_complete(payload: CodexCompleteRequest) -> dict[str, Any]:
-    """Finish the sign-in with whatever the user pasted back."""
+    """Finish the sign-in with whatever the user pasted back.
+
+    The ``state`` ties the pasted redirect to a flow this server started: with
+    a state (from the pasted URL, or sent along by the settings screen) only
+    that exact flow is accepted - after removing the suffix the authorization
+    server may append - and only within ``FLOW_TTL``.  Accepting "the newest
+    flow" for a state that matches nothing would let a redirect from somebody
+    else's sign-in log this server into their account.  Only a bare code
+    without any state falls back to the newest pending flow.
+    """
     try:
         code, state_from_url = codex_oauth.extract_code(payload.pasted)
     except OAuthError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    state = state_from_url or payload.state
+    url_state = codex_oauth.strip_state_suffix(state_from_url) if state_from_url else ""
+    sent_state = (payload.state or "").strip()
+    if url_state and sent_state and url_state != sent_state:
+        raise HTTPException(
+            status_code=400,
+            detail="Die eingefuegte Adresse gehoert zu einem anderen Anmeldevorgang. "
+                   "Bitte die Anmeldung neu starten.",
+        )
+    state = url_state or sent_state
+    _prune_flows()
     with session_scope() as s:
-        flow = s.get(OAuthFlow, state) if state else None
-        if flow is None:
-            # Fall back to the most recent pending flow: a user who pasted only
-            # the code has no state to offer, and refusing would be unhelpful.
+        if state:
+            flow = s.get(OAuthFlow, state)
+            if flow is not None and flow.provider != "openai_codex":
+                flow = None
+        else:
+            # A user who pasted only the code has no state to offer.
             flow = (
                 s.query(OAuthFlow)
                 .filter(OAuthFlow.provider == "openai_codex")
                 .order_by(OAuthFlow.created_at.desc())
                 .first()
             )
-        if flow is None:
+        if flow is None or _flow_expired(flow):
             raise HTTPException(
                 status_code=409,
-                detail="Kein laufender Anmeldevorgang gefunden. Bitte die Anmeldung neu starten.",
+                detail="Kein passender laufender Anmeldevorgang gefunden (oder er ist "
+                       "abgelaufen). Bitte die Anmeldung neu starten.",
             )
         verifier = flow.code_verifier
         redirect_uri = flow.redirect_uri or codex_oauth.REDIRECT_URI
