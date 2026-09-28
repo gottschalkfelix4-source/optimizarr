@@ -67,6 +67,9 @@ class QueueWorker:
         self._stopping = False
         self.blocked_reason = ""
         self.blocked_kind = ""
+        #: "Jetzt starten": ignore the schedule until the queue has run dry.
+        #: Kept in memory only - after a restart the window applies again.
+        self.schedule_override = False
 
     # -- lifecycle ---------------------------------------------------------- #
 
@@ -140,6 +143,18 @@ class QueueWorker:
             loop.call_soon_threadsafe(token.set)
         return True
 
+    def start_now(self) -> None:
+        """Run the queue now, whatever the schedule says, until it is empty."""
+        if not self.schedule_override:
+            log.info("schedule overridden: starting the queue now")
+        self.schedule_override = True
+
+    def end_override(self) -> None:
+        """Back to the schedule - by hand, or once the queue has run dry."""
+        if self.schedule_override:
+            log.info("schedule override ended")
+        self.schedule_override = False
+
     def _set_blocked(self, kind: str, reason: str) -> None:
         if kind == "disk" and self.blocked_kind != "disk":
             log.warning("queue on hold: %s", reason)
@@ -155,7 +170,7 @@ class QueueWorker:
         # tick found.
         if settings.queue.paused:
             kind, text = "paused", "Warteschlange ist pausiert."
-        elif not allowed:
+        elif not allowed and not self.schedule_override:
             kind, text = "schedule", reason
         elif self.blocked_kind in ("disk", "scan"):
             kind, text = self.blocked_kind, self.blocked_reason
@@ -165,6 +180,7 @@ class QueueWorker:
             "running_jobs": self.active_job_ids,
             "paused": settings.queue.paused,
             "schedule_ok": allowed,
+            "schedule_override": self.schedule_override,
             "blocked_reason": text,
             "blocked_kind": kind,
             "max_concurrent": settings.queue.max_concurrent_jobs,
@@ -192,7 +208,7 @@ class QueueWorker:
             self._set_blocked("paused", "Warteschlange ist pausiert.")
             return
         allowed, reason = within_schedule(settings)
-        if not allowed:
+        if not allowed and not self.schedule_override:
             self._set_blocked("schedule", reason)
             return
         if scanner.state.running and settings.queue.max_concurrent_jobs <= 1:
@@ -215,6 +231,11 @@ class QueueWorker:
             return
 
         if not await asyncio.to_thread(_has_queued_jobs):
+            if not self._running and self.schedule_override:
+                # Everything that was waiting is done: new jobs follow the
+                # schedule again instead of starting in the middle of the day.
+                self.end_override()
+                bus.publish("queue.changed", {})
             self._set_blocked("", "")
             return
 

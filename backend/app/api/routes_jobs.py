@@ -194,6 +194,23 @@ def pause_queue(payload: QueueControl) -> dict[str, Any]:
     return {"paused": payload.paused, "worker": worker.queue_worker.status()}
 
 
+class StartNow(BaseModel):
+    active: bool = True
+
+
+@router.post("/queue/start-now")
+def start_now(payload: StartNow) -> dict[str, Any]:
+    """Start the queue outside the schedule - until it has run dry."""
+    if payload.active:
+        if not worker._has_queued_jobs():
+            raise HTTPException(status_code=409, detail="Keine wartenden Jobs.")
+        worker.queue_worker.start_now()
+    else:
+        worker.queue_worker.end_override()
+    bus.publish("queue.changed", {})
+    return {"active": worker.queue_worker.schedule_override, "worker": worker.queue_worker.status()}
+
+
 @router.post("/queue/reorder")
 def reorder(payload: dict[str, Any], session: Session = Depends(get_session)) -> dict[str, Any]:
     """Accepts {"order": [job_id, ...]} - index becomes the priority."""

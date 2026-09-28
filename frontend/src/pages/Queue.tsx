@@ -8,6 +8,7 @@ import {
   HardDrive,
   Layers,
   Pause,
+  Play,
   RotateCcw,
   ScanLine,
   Trash2,
@@ -95,6 +96,21 @@ export default function Queue() {
     onError: (e: Error) => push(e.message, "error"),
   });
 
+  const startNow = useMutation({
+    mutationFn: (on: boolean) => endpoints.startNow(on),
+    onSuccess: (result) => {
+      push(
+        result.active
+          ? "Konvertierung startet jetzt - bis die Warteschlange leer ist."
+          : "Zeitfenster gilt wieder.",
+        "info",
+      );
+      queryClient.invalidateQueries({ queryKey: ["jobs"] });
+      queryClient.invalidateQueries({ queryKey: ["system"] });
+    },
+    onError: (e: Error) => push(e.message, "error"),
+  });
+
   const items = active.data?.items ?? [];
   const running = items.filter((j) => j.state === "running");
   const queued = items.filter((j) => j.state === "queued");
@@ -147,7 +163,41 @@ export default function Queue() {
       )}
       {kind === "schedule" && (
         <Callout tone="info" icon={<Clock className="size-4" />}>
-          {worker?.blocked_reason} Jobs starten automatisch, sobald das Zeitfenster erreicht ist.
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <span>
+              {worker?.blocked_reason} Jobs starten automatisch, sobald das Zeitfenster erreicht
+              ist.
+            </span>
+            {queuedCount > 0 && (
+              <button
+                className="btn-primary btn-sm"
+                onClick={() => startNow.mutate(true)}
+                disabled={startNow.isPending}
+                title="Zeitfenster ignorieren, bis die Warteschlange leer ist"
+              >
+                <Play className="size-3.5" aria-hidden="true" />
+                Jetzt starten
+              </button>
+            )}
+          </div>
+        </Callout>
+      )}
+      {worker?.schedule_override && !worker.schedule_ok && kind !== "paused" && (
+        <Callout tone="info" icon={<Play className="size-4" />}>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <span>
+              Zeitfenster übersprungen: Die Warteschlange läuft jetzt, bis sie leer ist. Danach gilt
+              das Zeitfenster wieder.
+            </span>
+            <button
+              className="btn-ghost btn-sm"
+              onClick={() => startNow.mutate(false)}
+              disabled={startNow.isPending}
+            >
+              <Clock className="size-3.5" aria-hidden="true" />
+              Zeitfenster wieder beachten
+            </button>
+          </div>
         </Callout>
       )}
       {kind === "disk" && (

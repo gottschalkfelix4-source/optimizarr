@@ -80,3 +80,18 @@ def test_counts_are_zero_on_an_empty_queue(client):
 def test_jobs_rejects_unknown_filters_and_huge_limits(client):
     assert client.get("/api/jobs", params={"state": "bogus"}).status_code == 422
     assert client.get("/api/jobs", params={"limit": 1001}).status_code == 422
+
+
+def test_start_now_needs_waiting_jobs_and_can_be_withdrawn(client, monkeypatch):
+    from app.core import worker
+    monkeypatch.setattr(worker, "queue_worker", worker.QueueWorker())
+
+    assert client.post("/api/queue/start-now", json={"active": True}).status_code == 409
+
+    _jobs(["queued"])
+    r = client.post("/api/queue/start-now", json={"active": True})
+    assert r.status_code == 200
+    assert r.json()["active"] is True and r.json()["worker"]["schedule_override"] is True
+
+    r = client.post("/api/queue/start-now", json={"active": False})
+    assert r.json()["active"] is False

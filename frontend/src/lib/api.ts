@@ -429,6 +429,8 @@ export interface QueueStatus {
   running_jobs: number[];
   paused: boolean;
   schedule_ok: boolean;
+  /** "Jetzt starten": the schedule is ignored until the queue has run dry. */
+  schedule_override?: boolean;
   blocked_reason: string;
   /** Missing on backends that predate it - see ``blockedKind`` in format.ts. */
   blocked_kind?: BlockedKind;
@@ -903,6 +905,7 @@ export const endpoints = {
   retryJob: (id: number) => api.post<{ ok: boolean; message: string }>(`/jobs/${id}/retry`),
   clearFinished: () => api.del<{ removed: number }>("/jobs/finished"),
   pauseQueue: (paused: boolean) => api.post<{ paused: boolean }>("/queue/pause", { paused }),
+  startNow: (active: boolean) => api.post<{ active: boolean }>("/queue/start-now", { active }),
 
   series: (opts?: RequestOpts) =>
     api.get<{ items: SeriesSummary[]; totals: SeriesTally }>("/series", opts),

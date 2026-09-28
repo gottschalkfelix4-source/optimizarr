@@ -113,6 +113,62 @@ def test_status_reports_the_kind_of_block(monkeypatch):
     assert worker.QueueWorker().status()["blocked_kind"] == "schedule"
 
 
+def _outside_window(cfg):
+    cfg.queue.schedule_enabled = True
+    cfg.queue.schedule_days = []
+    now = dt.datetime.now()
+    # A one-minute window twelve hours away: never "now".
+    start = (now + dt.timedelta(hours=12)).strftime("%H:%M")
+    cfg.queue.schedule_start = cfg.queue.schedule_end = start
+
+
+def test_start_now_runs_the_queue_outside_the_window(tmp_path, monkeypatch):
+    _, job_id, _ = queued_job(tmp_path)
+    cfg = AppSettings()
+    _outside_window(cfg)
+    monkeypatch.setattr(worker, "load_settings", lambda: cfg)
+    monkeypatch.setattr(encoder, "workdir_space_problem", lambda settings: "")
+    run_job = AsyncMock()
+    monkeypatch.setattr(encoder, "run_job", run_job)
+
+    w = worker.QueueWorker()
+    asyncio.run(w._tick())
+    assert not run_job.called
+    assert w.status()["blocked_kind"] == "schedule"
+
+    w.start_now()
+    assert w.status()["blocked_kind"] == ""
+    assert w.status()["schedule_override"] is True
+
+    async def tick_and_finish():
+        await w._tick()
+        await asyncio.gather(*list(w._running.values()))
+    asyncio.run(tick_and_finish())
+    assert run_job.await_args.args[0] == job_id
+
+
+def test_start_now_ends_once_the_queue_is_empty(monkeypatch):
+    cfg = AppSettings()
+    _outside_window(cfg)
+    monkeypatch.setattr(worker, "load_settings", lambda: cfg)
+    monkeypatch.setattr(encoder, "workdir_space_problem", lambda settings: "")
+    w = worker.QueueWorker()
+    w.start_now()
+    asyncio.run(w._tick())
+    assert w.schedule_override is False
+    assert w.status()["blocked_kind"] == "schedule"
+
+
+def test_pause_still_wins_over_start_now(monkeypatch):
+    cfg = AppSettings()
+    _outside_window(cfg)
+    cfg.queue.paused = True
+    monkeypatch.setattr(worker, "load_settings", lambda: cfg)
+    w = worker.QueueWorker()
+    w.start_now()
+    assert w.status()["blocked_kind"] == "paused"
+
+
 # --- 6. cancel races ---------------------------------------------------------- #
 
 def test_claimed_job_can_be_cancelled_before_its_task_exists(tmp_path):
