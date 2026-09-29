@@ -516,3 +516,53 @@ def test_late_progress_write_cannot_undo_a_finished_job():
     encoder._persist_progress(ids[1], {"progress": 0.5})
     assert job_row(ids[0]).progress == 1.0
     assert job_row(ids[1]).progress == 0.5
+
+
+@pytest.mark.parametrize("forced", [False, True])
+@pytest.mark.parametrize("output_size", [990, 1000, 1500])
+def test_forced_conversion_keeps_result_without_savings(tmp_path, monkeypatch, forced, output_size):
+    markers = {planner.FORCED: True, planner.RESTORE_STATE: "skipped"} if forced else None
+    source, job_id, file_id = make_job(tmp_path, markers=markers)
+    before = probe_info(source)
+    after = probe_info(source, size=output_size, video_codec="av1")
+    monkeypatch.setattr(encoder.ffmpeg, "probe", AsyncMock(side_effect=[before, after]))
+    monkeypatch.setattr(encoder.quality, "verify_output", AsyncMock(return_value=(True, "")))
+    monkeypatch.setattr(encoder, "_run_encode", fake_encoder([], size=output_size))
+    cfg = settings(require_smaller=True, min_accept_saving_percent=10)
+    cfg.analysis.convert_all_h264 = False
+
+    outcome = run(job_id, cfg)
+
+    assert outcome.ok is forced
+    assert source.read_bytes() == (b"y" * output_size if forced else b"x" * 1000)
+    if forced:
+        assert job_row(job_id).state == JobState.DONE.value
+        media = media_row(file_id)
+        assert media.size == output_size
+        assert media.original_size == 1000
+        assert media.estimated_saving_bytes == max(0, 1000 - output_size)
+        assert media.estimated_saving_pct == pytest.approx(max(0, 1000 - output_size) / 10)
+        if output_size > 1000:
+            assert "50% groesser" in outcome.reason
+    else:
+        assert job_row(job_id).state == JobState.REJECTED.value
+
+
+@pytest.mark.parametrize("gate", ["integrity", "quality", "unmeasurable"])
+def test_forced_larger_result_still_requires_valid_output(tmp_path, monkeypatch, gate):
+    source, job_id, _ = make_job(tmp_path, markers={planner.FORCED: True})
+    monkeypatch.setattr(encoder.ffmpeg, "probe", AsyncMock(return_value=probe_info(source)))
+    monkeypatch.setattr(encoder.quality, "verify_output",
+                        AsyncMock(return_value=(gate != "integrity", "invalid streams")))
+    monkeypatch.setattr(encoder, "_run_encode", fake_encoder([], size=1500))
+    score = None if gate == "unmeasurable" else quality.QualityScore(50, "vmaf", 50)
+    check_quality = AsyncMock(return_value=score)
+    monkeypatch.setattr(encoder, "_spot_check_quality", check_quality)
+
+    outcome = run(job_id, settings(require_smaller=True, verify_vmaf=True))
+
+    assert not outcome.ok
+    assert job_row(job_id).state == JobState.REJECTED.value
+    assert source.read_bytes() == b"x" * 1000
+    if gate != "integrity":
+        check_quality.assert_awaited_once()

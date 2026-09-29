@@ -609,7 +609,7 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
               className="btn-primary"
               onClick={() => enqueue.mutate(true)}
               disabled={enqueue.isPending}
-              title="Ausschluss und Mindestersparnis für diese Datei übergehen"
+              title="Ausschluss und Ersparnisregeln übergehen – auch größere Ergebnisse übernehmen"
             >
               <Zap className="size-4" aria-hidden="true" />
               Trotzdem konvertieren

@@ -431,8 +431,9 @@ function RunningJob({
 
       {projected > 0 && !onTrack && (
         <p className="mt-2 text-[11px] text-warn-400">
-          Das Ergebnis könnte größer werden als das Original – Optimizarr verwirft es dann
-          automatisch und lässt die Datei unverändert.
+          {job.forced
+            ? "Das Ergebnis könnte größer werden als das Original. Bei „Trotzdem konvertieren“ wird es nach bestandenen Prüfungen dennoch übernommen."
+            : "Das Ergebnis könnte größer werden als das Original. Ob es übernommen wird, hängt von den eingestellten Ersparnisregeln und dem H.264-Umstellungsmodus ab."}
         </p>
       )}
     </div>

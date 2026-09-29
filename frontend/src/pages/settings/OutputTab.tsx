@@ -18,11 +18,11 @@ export function OutputTab({ draft, update }: { draft: Settings; update: UpdateFn
             checked={draft.output.require_smaller}
             onChange={(require_smaller) => update("output", { require_smaller })}
             label="Ergebnis muss kleiner sein als das Original"
-            hint="Verhindert größere Ergebnisse. Gilt nicht für H.264, wenn die vollständige Umstellung unter Analyse aktiviert ist."
+            hint="Verhindert größere Ergebnisse. „Trotzdem konvertieren“ und H.264 bei aktivierter vollständiger Umstellung sind davon ausgenommen."
           />
           <Field
             label="Mindestersparnis zum Behalten"
-            hint="Ergebnisse unter dieser Ersparnis werden verworfen. H.264 im Umstellungsmodus ist davon ausgenommen."
+            hint="Ergebnisse unter dieser Ersparnis werden verworfen. „Trotzdem konvertieren“ und H.264 im Umstellungsmodus sind davon ausgenommen."
           >
             <SliderField
               value={draft.output.min_accept_saving_percent}

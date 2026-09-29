@@ -209,8 +209,8 @@ export function ForceConfirm({
             trotzdem erzwingen.
           </li>
           <li>
-            Die Mindestersparnis gilt für diese Jobs nicht. Wäre ein Ergebnis größer als das
-            Original, wird es wie gewohnt verworfen.
+            Größenbegrenzung und Mindestersparnis gelten für diese Jobs nicht. Auch größere
+            Ergebnisse werden übernommen, wenn die übrigen aktivierten Prüfungen bestehen.
           </li>
           <li>
             {noun}, die vor der Analyse ausgeschlossen wurden, bekommen ihren Plan erst beim Start –

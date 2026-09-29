@@ -133,7 +133,9 @@ und [Codex 0.153.4](https://learn.chatgpt.com/docs/changelog).
 ## Was garantiert nicht passiert
 
 Bevor ein Original ersetzt wird, gelten die konfigurierten Pruefungen.
-Im H.264-Umstellungsmodus entfallen fuer H.264 nur Groesse und Mindestersparnis:
+Bei **Trotzdem konvertieren** entfallen Groessenbegrenzung und Mindestersparnis:
+Auch ein groesseres Ergebnis wird uebernommen. Das gilt ebenfalls fuer H.264 im
+H.264-Umstellungsmodus. Integritaets- und aktivierte Qualitaetspruefungen bleiben erhalten:
 
 | Prüfung | Was geprüft wird |
 |---|---|

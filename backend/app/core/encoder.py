@@ -1,8 +1,8 @@
 """Job execution: run the encode, then decide whether to keep the result.
 
 The analyzer predicts; this module measures the actual result and enforces the
-configured gates. Explicit H.264 migration allows larger files, while integrity
-and configured quality checks still apply before an original is replaced.
+configured gates. Forced conversion and explicit H.264 migration allow larger
+files; integrity and configured quality checks still apply before replacement.
 """
 from __future__ import annotations
 
@@ -531,15 +531,14 @@ async def run_job(
         saved = outcome.input_size - outcome.output_size
         saved_pct = (saved / outcome.input_size * 100) if outcome.input_size else 0.0
         migrate = settings.analysis.requires_h264_conversion(info.video_codec)
-        if not migrate and settings.output.require_smaller and saved <= 0:
+        if not migrate and not forced and settings.output.require_smaller and saved <= 0:
             return await _reject_async(
                 job_id, file_id, outcome,
                 f"Ergebnis waere groesser gewesen ({_fmt(outcome.output_size)} statt "
                 f"{_fmt(outcome.input_size)}) - Original bleibt unveraendert.",
             )
-        # A forced job was queued knowing the analysis expected little or
-        # nothing; the saving threshold would reject exactly what was asked
-        # for.  "Never bigger than the original" above still applies.
+        # Forced jobs explicitly accept the conversion even without savings,
+        # including larger results. Integrity and quality gates still apply.
         if not migrate and not forced and saved_pct < settings.output.min_accept_saving_percent:
             return await _reject_async(
                 job_id, file_id, outcome,
