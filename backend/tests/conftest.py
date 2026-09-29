@@ -86,3 +86,15 @@ def hermetic_client(tmp_path_factory) -> Iterator[TestClient]:
     with isolated_app_state(tmp_path_factory.mktemp("app")):
         with TestClient(app, headers=CSRF_HEADERS) as client:
             yield client
+
+
+@pytest.fixture(autouse=True)
+def isolated_output_modules(tmp_path, tmp_path_factory, monkeypatch):
+    from app.core import output_files, output_validation, trash
+    monkeypatch.setattr(output_files, "CONFIG_DIR", tmp_path / "config")
+    monkeypatch.setattr(output_files, "COMMIT_JOURNAL_DIR", tmp_path / "config" / "pending-commits")
+    monkeypatch.setattr(output_files, "TRASH_ROOTS_FILE", tmp_path / "config" / "trash-roots.json")
+    monkeypatch.setattr(trash, "CONFIG_DIR", tmp_path / "config")
+    work = tmp_path_factory.mktemp("quality-work")
+    work.mkdir(exist_ok=True)
+    monkeypatch.setattr(output_validation, "TRANSCODE_DIR", work)

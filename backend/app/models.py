@@ -138,6 +138,8 @@ class MediaFile(Base):
     original_size: Mapped[int] = mapped_column(BigInteger, default=0)
     converted_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
     measured_vmaf: Mapped[float | None] = mapped_column(Float, nullable=True)
+    quality_metric: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    quality_value: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     first_seen: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow)
     last_seen: Mapped[dt.datetime] = mapped_column(DateTime, default=utcnow)
@@ -175,6 +177,8 @@ class Job(Base):
     output_size: Mapped[int] = mapped_column(BigInteger, default=0)
     predicted_size: Mapped[int] = mapped_column(BigInteger, default=0)
     vmaf: Mapped[float | None] = mapped_column(Float, nullable=True)
+    quality_metric: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    quality_value: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     error: Mapped[str] = mapped_column(Text, default="")
     log: Mapped[str] = mapped_column(Text, default="")
@@ -206,6 +210,8 @@ class LearningSample(Base):
     predicted_bitrate: Mapped[float] = mapped_column(Float, default=0.0)
     actual_bitrate: Mapped[float] = mapped_column(Float, default=0.0)
     actual_vmaf: Mapped[float | None] = mapped_column(Float, nullable=True)
+    quality_metric: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    quality_value: Mapped[float | None] = mapped_column(Float, nullable=True)
     encoder: Mapped[str] = mapped_column(String(32), default="")
     crf: Mapped[float] = mapped_column(Float, default=0.0)
     source_codec: Mapped[str] = mapped_column(String(32), default="")

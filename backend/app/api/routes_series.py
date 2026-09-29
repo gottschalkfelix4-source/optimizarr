@@ -4,12 +4,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..core import series, worker
+from ..core import series, worker, group_cache
 from ..db import get_session
 from ..models import LibraryPath, MediaFile
 from . import serializers
@@ -21,6 +21,7 @@ COLUMNS = (
     MediaFile.id, MediaFile.path, MediaFile.library_id, MediaFile.state,
     MediaFile.video_codec, MediaFile.ignored, MediaFile.size, MediaFile.original_size,
     MediaFile.estimated_saving_bytes, MediaFile.converted_at,
+    MediaFile.width, MediaFile.height, MediaFile.decision_reason, MediaFile.error,
 )
 
 
@@ -28,14 +29,15 @@ def load_groups(
     session: Session, library_id: int | None = None, columns: tuple[Any, ...] = COLUMNS,
 ) -> list[series.SeriesGroup]:
     """Every folder group, series and movies alike."""
-    libraries = {
-        row.id: (row.path, row.name or Path(row.path).name or row.path)
-        for row in session.execute(select(LibraryPath)).scalars()
-    }
-    query = select(*columns).where(MediaFile.library_id.is_not(None))
-    if library_id is not None:
-        query = query.where(MediaFile.library_id == library_id)
-    return series.group(session.execute(query).all(), libraries)
+    def build():
+        libraries = {
+            row.id: (row.path, row.name or Path(row.path).name or row.path)
+            for row in session.execute(select(LibraryPath)).scalars()
+        }
+        query = select(*COLUMNS).where(MediaFile.library_id.is_not(None))
+        return series.group(session.execute(query).all(), libraries)
+    groups = group_cache.snapshot(session, build)
+    return [g for g in groups if library_id is None or g.library_id == library_id]
 
 
 def _series(session: Session, library_id: int | None = None) -> list[series.SeriesGroup]:
@@ -68,12 +70,17 @@ def _summary(entry: series.SeriesGroup) -> dict[str, Any]:
 
 
 @router.get("/series")
-def list_series(session: Session = Depends(get_session)) -> dict[str, Any]:
+def list_series(
+    session: Session = Depends(get_session), search: str = Query("", max_length=500), filter: group_cache.GroupFilter = "all",
+    sort: group_cache.GroupSort = "name", page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200),
+) -> dict[str, Any]:
     entries = _series(session)
     totals = series.Tally()
     for entry in entries:
         totals.merge(entry.tally)
-    return {"items": [_summary(e) for e in entries], "totals": tally_dict(totals)}
+    result = group_cache.browse([_summary(e) for e in entries], search, filter, sort, page, page_size)
+    result.pop("filtered")
+    return {**result, "totals": tally_dict(totals)}
 
 
 @router.get("/series/detail")

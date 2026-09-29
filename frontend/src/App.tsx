@@ -9,6 +9,7 @@ import { setSizeUnit } from "./lib/format";
 
 // One chunk per page: the charts library only loads with the pages that draw
 // charts, not with the first paint of every page.
+const TrashPage = lazy(() => import("./pages/Trash"));
 const Dashboard = lazy(() => import("./pages/Dashboard"));
 const HistoryPage = lazy(() => import("./pages/History"));
 const Insights = lazy(() => import("./pages/Insights"));
@@ -46,6 +47,7 @@ export default function App() {
               <Route path="/movies" element={<MoviesPage />} />
               <Route path="/queue" element={<Queue />} />
               <Route path="/insights" element={<Insights />} />
+              <Route path="/trash" element={<TrashPage />} />
               <Route path="/history" element={<HistoryPage />} />
               <Route path="/settings" element={<SettingsPage />} />
               <Route path="*" element={<Dashboard />} />

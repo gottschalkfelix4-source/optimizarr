@@ -268,3 +268,10 @@ export function confidenceLabel(value: number): { label: string; className: stri
   if (value >= 0.55) return { label: "mittel", className: "text-warn-400" };
   return { label: "niedrig", className: "text-danger-400" };
 }
+
+/** Historic scores without a metric must never claim to be measured VMAF. */
+export function qualityLabel(score: { vmaf: number | null; quality_metric?: string | null; quality_value?: number | null }): string {
+  if (score.quality_metric === "vmaf" && score.quality_value != null) return `VMAF ${score.quality_value.toFixed(1)}`;
+  if (score.quality_metric === "ssim" && score.quality_value != null) return `SSIM ${score.quality_value.toFixed(4)}${score.vmaf != null ? ` · VMAF-Schätzung ${score.vmaf.toFixed(1)}` : ""}`;
+  return score.vmaf != null ? `Qualitätswert ${score.vmaf.toFixed(1)} (Messverfahren unbekannt)` : "Nicht gemessen";
+}

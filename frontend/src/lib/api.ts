@@ -217,6 +217,8 @@ export interface MediaFile {
   original_size: number;
   converted_at: string | null;
   measured_vmaf: number | null;
+  quality_metric?: string | null;
+  quality_value?: number | null;
   audio_count: number;
   subtitle_count: number;
   audio_streams?: AudioStream[];
@@ -296,6 +298,8 @@ export interface AnalysisResult {
     segments: number;
     grain_level: number;
     vmaf: number | null;
+  quality_metric?: string | null;
+  quality_value?: number | null;
     speed_factor: number;
     ok: boolean;
     error: string;
@@ -328,6 +332,8 @@ export interface Job {
   output_size: number;
   predicted_size: number;
   vmaf: number | null;
+  quality_metric?: string | null;
+  quality_value?: number | null;
   error: string;
   created_at: string;
   started_at: string | null;
@@ -865,6 +871,9 @@ export const endpoints = {
       webhookUrl ? { webhook_url: webhookUrl } : {},
     ),
 
+  trash: (opts?: RequestOpts) => api.get<{ items: TrashItem[]; total_size: number }>("/trash", opts),
+  restoreTrash: (id: string) => api.post<{ ok: boolean; source: string; kept_output: string | null }>(`/trash/${id}/restore`),
+
   libraryPaths: (opts?: RequestOpts) => api.get<LibraryPathEntry[]>("/library/paths", opts),
   libraryCodecs: (opts?: RequestOpts) => api.get<LibraryCodecs>("/library/codecs", opts),
   addLibraryPath: (payload: { path: string; name?: string }) =>
@@ -907,14 +916,16 @@ export const endpoints = {
   pauseQueue: (paused: boolean) => api.post<{ paused: boolean }>("/queue/pause", { paused }),
   startNow: (active: boolean) => api.post<{ active: boolean }>("/queue/start-now", { active }),
 
-  series: (opts?: RequestOpts) =>
-    api.get<{ items: SeriesSummary[]; totals: SeriesTally }>("/series", opts),
+  series: (params: GroupParams = {}, opts?: RequestOpts) =>
+    api.get<GroupPage<SeriesSummary>>(`/series${query({ ...params })}`, opts),
   seriesDetail: (key: string, opts?: RequestOpts) =>
     api.get<SeriesDetail>(`/series/detail${query({ key })}`, opts),
   enqueueSeries: (payload: { key: string; season?: number; force?: boolean }) =>
     api.post<EnqueueResult>("/series/enqueue", payload),
-  movies: (opts?: RequestOpts) =>
-    api.get<{ items: MovieSummary[]; totals: SeriesTally }>("/movies", opts),
+  movies: (params: GroupParams = {}, opts?: RequestOpts) =>
+    api.get<GroupPage<MovieSummary>>(`/movies${query({ ...params })}`, opts),
+  enqueueMovies: (params: { search: string; filter: string; force: boolean }) =>
+    api.post<EnqueueResult>(`/movies/enqueue${query({ ...params, force: String(params.force) })}`),
 
   stats: (opts?: RequestOpts) => api.get<Stats>("/stats", opts),
   modelStats: (opts?: RequestOpts) =>
@@ -929,6 +940,8 @@ export const endpoints = {
         crf: number;
         source_codec: string;
         vmaf: number | null;
+  quality_metric?: string | null;
+  quality_value?: number | null;
       }[];
     }>("/stats/model", opts),
   /** ``level`` is filtered by the server, so the limit applies to that level. */
@@ -938,3 +951,15 @@ export const endpoints = {
       opts,
     ),
 };
+
+export interface GroupPage<T> {
+  items: T[]; totals: SeriesTally; total: number; all_count: number;
+  page: number; page_size: number; pages: number; complete_count: number;
+  pending_count?: number; force_count?: number;
+}
+export interface GroupParams { search?: string; filter?: string; sort?: string; page?: number; page_size?: number }
+
+export interface TrashItem {
+  id: string; source: string; path: string; size: number;
+  trashed_at: string; expires_at: string | null; conflict: string;
+}

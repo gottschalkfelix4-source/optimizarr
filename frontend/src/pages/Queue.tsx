@@ -1,3 +1,4 @@
+import { qualityLabel } from "../lib/format";
 /** The encode queue: what runs now, what is waiting, what happened. */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -480,7 +481,7 @@ function FinishedJob({
             <span className={change.smaller ? "text-save-400" : "text-warn-400"}>
               ({change.text})
             </span>
-            {job.vmaf != null && job.vmaf > 0 && ` · VMAF ${job.vmaf.toFixed(1)}`}
+            {job.vmaf != null && job.vmaf > 0 && ` · ${qualityLabel(job)}`}
             {" · "}
             {relativeTime(job.finished_at)}
           </p>

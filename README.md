@@ -63,7 +63,9 @@ Filmkorn-Synthese am meisten spart.
 **3. Qualitätssuche (optional)**
 Zusätzlich wird pro Datei der höchste CRF-Wert gesucht, der das Qualitätsziel noch hält.
 Gemessen wird mit VMAF, wenn das ffmpeg es kann, sonst mit SSIM – umgerechnet auf die
-vertraute VMAF-Skala, damit „94 ist praktisch nicht unterscheidbar" weiter gilt.
+VMAF-Skala als grobe Orientierung. Die Oberfläche unterscheidet gemessenen VMAF,
+SSIM-Rohwert und VMAF-Schätzung; die Schätzung ist keine gemessene VMAF-Qualität.
+Bei alten Ergebnissen ohne gespeichertes Messverfahren wird dieses als unbekannt angezeigt.
 
 ### Das Lernmodell
 
@@ -138,7 +140,7 @@ Im H.264-Umstellungsmodus entfallen fuer H.264 nur Groesse und Mindestersparnis:
 | Integrität | Ist die Datei lesbar, enthält sie tatsächlich AV1, stimmt die Laufzeit? |
 | Größe | Ist das Ergebnis kleiner als das Original? |
 | Mindestersparnis | Lohnt der Gewinn den Qualitätsverlust überhaupt? |
-| Qualität (optional) | Erreicht die fertige Datei das VMAF-Minimum? |
+| Qualität (optional) | Erreichen die geprüften Ausschnitte das Qualitätsminimum (VMAF oder SSIM-Schätzung)? |
 
 Fällt eine Prüfung durch, wird das Ergebnis gelöscht, das Original bleibt **bitgenau**
 erhalten, und die Datei wird mit einer nachvollziehbaren Begründung als „übersprungen"
@@ -147,9 +149,24 @@ markiert – damit derselbe Versuch nicht beim nächsten Scan wieder Rechenzeit 
 Originale wandern standardmäßig in einen Papierkorb statt gelöscht zu werden. Ist unter
 **Einstellungen → Ausgabe** kein eigener Papierkorb-Ordner eingetragen, landet das Original
 im Ordner `.optimizarr-trash` direkt im jeweiligen Bibliotheksordner. Der liegt auf
-demselben Dateisystem wie die Datei, das Verschieben ist also nur ein Umbenennen statt
-einer Kopie über Laufwerksgrenzen. Der Scanner überspringt diesen Ordner. Nach Ablauf der
-Aufbewahrungszeit (Standard 14 Tage) wird er geleert.
+demselben Dateisystem wie die Datei. Wenn Hardlinks unterstützt werden, braucht das
+Sichern des Originals keine vollständige Kopie. Der Scanner überspringt diesen Ordner.
+Nach Ablauf der Aufbewahrungszeit (Standard 14 Tage) werden nur **protokollierte,
+unveränderte Originale** gelöscht. Maßgeblich ist der protokollierte Verschiebezeitpunkt.
+Alte Papierkorb-Dateien ohne Einzelnachweis werden nicht automatisch übernommen oder
+gelöscht – sie bleiben zur manuellen Verwaltung erhalten.
+
+Unter **Papierkorb** stehen Originalpfad, Speicherbedarf, Löschdatum und Konflikte.
+**Wiederherstellen** bringt das Original zurück und bewahrt die konvertierte Version
+zusätzlich mit einer `.original`-Kennzeichnung auf. Das Original wird anschließend
+ignoriert, damit es nicht automatisch erneut konvertiert wird. Geänderte oder fremde
+Dateien am Ziel werden nicht überschrieben. Laufende Scans und wartende/laufende Jobs
+für die Datei müssen vorher beendet werden. Bei unterbrochener Nacharbeit lässt sich
+eine bereits erfolgte Wiederherstellung über denselben Eintrag abschließen.
+
+Vor jeder Dateiersetzung muss ein Wiederherstellungsjournal erfolgreich geschrieben
+und auf den Datenträger synchronisiert sein. Scheitert das, bleibt das Original unberührt.
+Das Konfigurationsvolume muss diese Synchronisierung unterstützen.
 
 Die neue Datei bekommt standardmäßig **ein neues Änderungsdatum** (`preserve_mtime` ist
 aus). So erkennen Plex und Jellyfin sicher, dass sich die Datei geändert hat, und lesen die
@@ -409,7 +426,11 @@ backend/app/
     quality.py     VMAF/SSIM-Messung, Filmkorn-Schätzung
     planner.py     Analyse-Ergebnis -> ffmpeg-Kommandozeile
     analyzer.py    Entscheidungslogik (die drei Stufen)
-    encoder.py     Job-Ausführung und die Sicherheits-Gates
+    encoder.py     Job-Ausführung und Ergebnisverbuchung
+    output_files.py Sichere Dateiersetzung, Speicher und Dateirechte
+    output_validation.py Qualitätsprüfung fertiger Encodes
+    trash.py       Protokollierter Papierkorb, Aufbewahrung und Wiederherstellung
+    group_cache.py Zwischengespeicherte Gruppen, Suche und Seitennavigation
     scanner.py     Bibliotheks-Scan
     worker.py      Warteschlange und Zeitplan
     advisor/
@@ -428,3 +449,15 @@ unraid/            Community-Applications-Template
 ## Lizenz
 
 MIT
+
+### Große Bibliotheken und Veröffentlichung
+
+Film- und Serienübersichten verwenden serverseitige Suche, Sortierung und Seiten
+(standardmäßig 50 Einträge). Gruppierungen und Summen werden zwischengespeichert und
+nach Änderungen an Bibliothek oder Dateien verworfen. Sammelaktionen für Filme gelten
+weiterhin für alle Treffer des Filters, auch auf anderen Seiten.
+
+Die CI lädt das gebaute Docker-Image zunächst lokal, prüft den Start und führt einen
+kurzen echten AV1-/Opus-Encode mit Metadatenprüfung und vollständiger Dekodierung aus.
+Erst danach werden die Tags dieses bereits geprüften Images veröffentlicht. Bei Pull
+Requests laufen dieselben Prüfungen ohne Veröffentlichung.

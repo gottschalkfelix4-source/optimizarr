@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import config, db
 from app.config import AppSettings
+from app.core import output_files
 from app.core import analyzer, encoder, planner, quality, scanner
 from app.core.advisor import Advice
 from app.core.ffmpeg import MediaInfo
@@ -270,7 +271,7 @@ def test_failed_commit_leaves_no_staging_copy_in_the_library(tmp_path, monkeypat
     cfg = AppSettings()
     cfg.output.mode = "replace"
     cfg.output.original_action = "trash"
-    monkeypatch.setattr(encoder, "_move_to_trash", Mock(side_effect=OSError("no space")))
+    monkeypatch.setattr(output_files, "_move_to_trash", Mock(side_effect=OSError("no space")))
     with pytest.raises(OSError):
         encoder._commit_output(str(source), str(temp_out), planner.EncodePlan(container="mkv"),
                                cfg, info(path=str(source)))

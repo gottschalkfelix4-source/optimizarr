@@ -95,18 +95,18 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short
 
-      - name: Bauen und veroeffentlichen
+      - name: Image fuer Pruefung bauen
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: ${{ github.event_name != 'pull_request' }}
+          push: false
+          load: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Smoke-Test des Images
-        if: github.event_name != 'pull_request'
         run: |
           docker run -d --name smoke -p 8080:8080 \
             -e PUID=0 -e PGID=0 \
@@ -126,7 +126,9 @@ jobs:
                 echo "Im Image fehlen Encoder:${missing}"
                 exit 1
               fi
-              echo "Encoder vorhanden: libsvtav1 av1_qsv av1_vaapi libopus."
+              docker cp scripts/smoke-encode.py smoke:/tmp/smoke-encode.py
+              docker exec smoke python3 /tmp/smoke-encode.py
+              echo "Image-Start und echter AV1-/Opus-Encode erfolgreich."
               exit 0
             fi
             sleep 3
@@ -134,3 +136,13 @@ jobs:
           echo "Container ist nicht hochgekommen:"
           docker logs smoke
           exit 1
+
+      # Push the exact local image that passed the checks, without rebuilding.
+      - name: Geprueftes Image veroeffentlichen
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          while IFS= read -r image_tag; do
+            [ -z "$image_tag" ] || docker push "$image_tag"
+          done <<< "$IMAGE_TAGS"

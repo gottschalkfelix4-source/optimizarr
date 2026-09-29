@@ -149,7 +149,7 @@ export default function Dashboard() {
           footer={
             stats?.realised.average_vmaf ? (
               <p className="mt-3 text-[11px] text-ink-500">
-                Durchschnittliche Qualität: VMAF {stats.realised.average_vmaf.toFixed(1)}
+                Durchschnitt gemessener VMAF-Werte: {stats.realised.average_vmaf.toFixed(1)}
               </p>
             ) : null
           }

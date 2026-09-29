@@ -50,6 +50,8 @@ def media_file(row: MediaFile, full: bool = False) -> dict[str, Any]:
         "original_size": row.original_size,
         "converted_at": iso(row.converted_at),
         "measured_vmaf": row.measured_vmaf,
+        "quality_metric": row.quality_metric,
+        "quality_value": row.quality_value,
         "audio_count": len(row.audio_streams or []),
         "subtitle_count": len(row.subtitle_streams or []),
     }
@@ -80,6 +82,8 @@ def job(row: Job, include_log: bool = False) -> dict[str, Any]:
         "output_size": row.output_size,
         "predicted_size": row.predicted_size,
         "vmaf": row.vmaf,
+        "quality_metric": row.quality_metric,
+        "quality_value": row.quality_value,
         "error": row.error,
         "created_at": iso(row.created_at),
         "started_at": iso(row.started_at),

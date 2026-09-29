@@ -1,7 +1,9 @@
+import { GroupPagination } from "../components/GroupPagination";
+import { useDebouncedValue } from "../lib/hooks";
 /** Movie overview: every film in the library and how far it is converted, Radarr style. */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, Film, Play, Search, Zap } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   BucketBar,
@@ -10,7 +12,6 @@ import {
   Legend,
   Stat,
   fileReason,
-  pick,
 } from "../components/groups";
 import { EmptyState, ErrorState, Panel, Select, Skeleton, StateBadge } from "../components/ui";
 import {
@@ -18,7 +19,6 @@ import {
   type EnqueueResult,
   type MovieFile,
   type MovieSummary,
-  type SeriesTally,
 } from "../lib/api";
 import { bytes, number, resolutionLabel, STATE_LABELS } from "../lib/format";
 import { useToast } from "../lib/live";
@@ -41,10 +41,7 @@ const SORTS = [
   { value: "potential", label: "Noch möglich" },
 ];
 
-/** Rows rendered at once - big movie libraries run into the thousands. */
-const PAGE = 200;
 
-const complete = (t: SeriesTally) => t.episodes > 0 && t.in_av1 === t.episodes;
 
 const fileCount = (n: number) => `${number(n)} ${n === 1 ? "Datei" : "Dateien"}`;
 
@@ -55,58 +52,27 @@ export default function MoviesPage() {
   const [filter, setFilter] = useState("all");
   const [sort, setSort] = useState("title");
   const [open, setOpen] = useState<Set<string>>(new Set());
-  const [limit, setLimit] = useState(PAGE);
-  const [confirm, setConfirm] = useState<number[] | null>(null);
 
-  useEffect(() => setLimit(PAGE), [search, filter, sort]);
+  const [confirm, setConfirm] = useState<boolean>(false);
 
+
+
+  const [page, setPage] = useState(1);
+  const debouncedSearch = useDebouncedValue(search, 250);
+  useEffect(() => setPage(1), [debouncedSearch, filter, sort]);
   const { data, isLoading, isError, error, refetch } = useQuery({
-    queryKey: ["movies"],
-    queryFn: endpoints.movies,
+    queryKey: ["movies", debouncedSearch, filter, sort, page],
+    queryFn: ({ signal }) => endpoints.movies({ search: debouncedSearch, filter, sort, page, page_size: 50 }, { signal }),
     refetchInterval: 30000,
   });
-
-  const items = useMemo(() => {
-    const needle = search.trim().toLowerCase();
-    const list = (data?.items ?? []).filter((m) => {
-      if (needle && !`${m.title} ${m.year ?? ""} ${m.name}`.toLowerCase().includes(needle)) {
-        return false;
-      }
-      switch (filter) {
-        case "open":
-          return !complete(m);
-        case "complete":
-          return complete(m);
-        case "candidates":
-          return m.counts.pending > 0;
-        case "excluded":
-          return m.counts.excluded > 0;
-        case "active":
-          return m.counts.active > 0;
-        case "failed":
-          return m.counts.failed > 0;
-        default:
-          return true;
-      }
-    });
-    const byTitle = (a: MovieSummary, b: MovieSummary) =>
-      a.title.localeCompare(b.title, "de") || (a.year ?? 0) - (b.year ?? 0);
-    const descending: Record<string, (m: MovieSummary) => number> = {
-      year: (m) => m.year ?? 0,
-      size: (m) => m.total_size,
-      saved: (m) => m.saved_bytes,
-      potential: (m) => m.potential_saving,
-    };
-    const key = descending[sort];
-    return key ? [...list].sort((a, b) => key(b) - key(a) || byTitle(a, b)) : list;
-  }, [data, search, filter, sort]);
+  const items = data?.items ?? [];
 
   const enqueue = useMutation({
-    mutationFn: (p: { ids: number[]; force: boolean }) =>
-      endpoints.enqueue({ file_ids: p.ids, force: p.force }),
+    mutationFn: (p: { ids?: number[]; force: boolean }) =>
+      p.ids ? endpoints.enqueue({ file_ids: p.ids, force: p.force }) : endpoints.enqueueMovies({ search: debouncedSearch, filter, force: p.force }),
     onSuccess: (result: EnqueueResult) => {
       push(result.message, result.added ? "success" : "info");
-      setConfirm(null);
+      setConfirm(false);
       ["movies", "series", "jobs", "files"].forEach((key) =>
         queryClient.invalidateQueries({ queryKey: [key] }),
       );
@@ -121,14 +87,13 @@ export default function MoviesPage() {
       return next;
     });
 
-  // Bulk actions work on everything the filter shows, not just the rendered page.
-  const inFilter = items.flatMap((m) => m.files);
-  const pendingIds = pick(inFilter, false).map((f) => f.id);
-  const forceIds = pick(inFilter, true).map((f) => f.id);
+  // The server applies bulk actions to every match, including other pages.
+  const pendingCount = data?.pending_count ?? 0;
+  const forceCount = data?.force_count ?? 0;
 
   const totals = data?.totals;
-  const movieCount = data?.items.length ?? 0;
-  const completeCount = (data?.items ?? []).filter(complete).length;
+  const movieCount = data?.all_count ?? 0;
+  const completeCount = data?.complete_count ?? 0;
 
   return (
     <div className="space-y-6">
@@ -185,22 +150,22 @@ export default function MoviesPage() {
         <Legend />
         {!isLoading && items.length > 0 && (
           <div className="flex flex-wrap items-center gap-2 border-b border-ink-800/80 px-5 py-2.5">
-            <span className="mr-auto text-xs text-ink-500">{number(items.length)} Filme im Filter</span>
+            <span className="mr-auto text-xs text-ink-500">{number(data?.total ?? 0)} {data?.total === 1 ? "Film" : "Filme"} im Filter</span>
             <button
               className="btn-ghost btn-sm"
-              disabled={!pendingIds.length || enqueue.isPending}
-              onClick={() => enqueue.mutate({ ids: pendingIds, force: false })}
+              disabled={!pendingCount || enqueue.isPending}
+              onClick={() => enqueue.mutate({ force: false })}
             >
               <Play className="size-3.5" />
-              Kandidaten einreihen ({pendingIds.length})
+              Kandidaten einreihen ({pendingCount})
             </button>
             <button
               className="btn-ghost btn-sm border-warn-500/40 text-warn-400"
-              disabled={!forceIds.length || enqueue.isPending}
-              onClick={() => setConfirm(forceIds)}
+              disabled={!forceCount || enqueue.isPending}
+              onClick={() => setConfirm(true)}
             >
               <Zap className="size-3.5" />
-              Alle im Filter trotzdem konvertieren ({forceIds.length})
+              Alle im Filter trotzdem konvertieren ({forceCount})
             </button>
           </div>
         )}
@@ -244,7 +209,7 @@ export default function MoviesPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {items.slice(0, limit).map((m) => (
+                  {items.map((m) => (
                     <MovieRows
                       key={m.key}
                       movie={m}
@@ -257,25 +222,19 @@ export default function MoviesPage() {
                 </tbody>
               </table>
             </div>
-            {items.length > limit && (
-              <div className="border-t border-ink-800/80 px-5 py-3 text-center">
-                <button className="btn-ghost btn-sm" onClick={() => setLimit((l) => l + PAGE)}>
-                  Weitere {number(Math.min(PAGE, items.length - limit))} anzeigen
-                </button>
-              </div>
-            )}
           </>
         )}
+        {data && <GroupPagination page={data.page} pages={data.pages} total={data.total} onPage={setPage} />}
       </Panel>
 
       <ForceConfirm
-        open={confirm !== null}
-        count={confirm?.length ?? 0}
+        open={confirm}
+        count={forceCount}
         noun="Dateien"
         subtitle={`Filme · ${FILTERS.find((f) => f.value === filter)?.label ?? ""}`}
         pending={enqueue.isPending}
-        onClose={() => setConfirm(null)}
-        onConfirm={() => confirm && enqueue.mutate({ ids: confirm, force: true })}
+        onClose={() => setConfirm(false)}
+        onConfirm={() => enqueue.mutate({ force: true })}
       />
     </div>
   );

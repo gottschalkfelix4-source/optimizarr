@@ -202,6 +202,8 @@ async def lifespan(app: FastAPI):
     TRANSCODE_DIR.mkdir(parents=True, exist_ok=True)
 
     Base.metadata.create_all(engine())
+    from .migrations import upgrade
+    upgrade(engine())
     settings = load_settings(force=True)
     if reset_auth_requested() and settings.security.auth_enabled:
         settings.security.auth_enabled = False
@@ -290,6 +292,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+from .api import routes_trash
+app.include_router(routes_trash.router, prefix="/api", tags=["trash"])
 
 app.include_router(routes_system.router, prefix="/api", tags=["system"])
 app.include_router(routes_library.router, prefix="/api", tags=["library"])

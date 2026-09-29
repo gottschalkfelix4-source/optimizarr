@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import config, db
 from app.config import AppSettings
-from app.core import encoder, planner
+from app.core import output_files as encoder, planner, trash
 from app.core.ffmpeg import MediaInfo
 from app.models import Base, LibraryPath
 
@@ -150,7 +150,7 @@ def test_failure_after_the_swap_brings_the_original_back(tmp_path, monkeypatch, 
 
         monkeypatch.setattr(encoder.os, "unlink", failing_unlink)
     else:
-        monkeypatch.setattr(encoder, "_move_file", lambda *a: (_ for _ in ()).throw(OSError(28, "full")))
+        monkeypatch.setattr(trash, "_secure_copy", lambda *a: (_ for _ in ()).throw(OSError(28, "full")))
     with pytest.raises(OSError):
         commit(source, temp, settings(action), library_root=str(lib))
     assert source.read_bytes() == b"original"
@@ -271,7 +271,7 @@ def _old_trash_file(root, name="x.mkv", stamp="2020-01-01"):
     return path
 
 
-def test_purge_covers_every_library_trash_and_the_configured_one(tmp_path):
+def test_purge_preserves_unrecorded_files_even_in_known_trash_roots(tmp_path):
     lib_a, lib_b = tmp_path / "a", tmp_path / "b"
     lib_a.mkdir()
     lib_b.mkdir()
@@ -286,8 +286,8 @@ def test_purge_covers_every_library_trash_and_the_configured_one(tmp_path):
     ]
     cfg = settings("trash", trash_dir=str(configured))
     cfg.output.trash_retention_days = 14
-    assert encoder.purge_trash(cfg) == 3
-    assert not any(p.exists() for p in old)
+    assert encoder.purge_trash(cfg) == 0
+    assert all(p.exists() for p in old)
 
 
 def test_purge_only_touches_the_dated_trash_folders(tmp_path):
@@ -307,7 +307,10 @@ def test_purge_finds_a_folder_trash_used_without_a_library(tmp_path):
     cfg = settings("trash")
     cfg.output.trash_retention_days = 1
     dest = Path(encoder._move_to_trash(str(source), cfg))
-    os.utime(dest, (0, 0))
+    for record in trash.records_dir().glob("*.json"):
+        entry = json.loads(record.read_text())
+        entry["trashed_at"] = 0
+        record.write_text(json.dumps(entry))
     assert encoder.purge_trash(cfg) == 1
 
 

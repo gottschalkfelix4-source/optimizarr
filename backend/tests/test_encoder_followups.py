@@ -19,6 +19,7 @@ from app import config, db  # noqa: E402
 from app.config import AppSettings  # noqa: E402
 from app.core import encoder, ffmpeg, quality  # noqa: E402
 from app.core.ffmpeg import MediaInfo  # noqa: E402
+from app.core import output_files, trash
 from app.models import Base, FileState, Job, JobState, MediaFile  # noqa: E402
 
 
@@ -30,8 +31,8 @@ def isolated(monkeypatch, tmp_path):
     monkeypatch.setattr(db, "_SessionLocal", None)
     monkeypatch.setattr(config, "_cache", None)
     monkeypatch.setattr(encoder, "TRANSCODE_DIR", tmp_path / "transcode")
-    monkeypatch.setattr(encoder, "COMMIT_JOURNAL_DIR", tmp_path / "config" / "pending-commits")
-    monkeypatch.setattr(encoder, "TRASH_ROOTS_FILE", tmp_path / "config" / "trash-roots.json")
+    monkeypatch.setattr(output_files, "COMMIT_JOURNAL_DIR", tmp_path / "config" / "pending-commits")
+    monkeypatch.setattr(output_files, "TRASH_ROOTS_FILE", tmp_path / "config" / "trash-roots.json")
     monkeypatch.setattr(encoder, "CONFIG_DIR", tmp_path / "config")
     (tmp_path / "transcode").mkdir()
     yield
@@ -248,7 +249,7 @@ def test_measurements_pass_the_cancel_event_and_do_not_retry_after_it(monkeypatc
 
 # --- 4. what the old default recycle folder still holds -------------------------- #
 
-def test_purge_still_cleans_the_old_config_trash_after_the_switch(tmp_path):
+def test_purge_preserves_unrecorded_legacy_trash(tmp_path):
     old = tmp_path / "config" / "trash" / "2020-01-01" / "Serie" / "x.mkv"
     old.parent.mkdir(parents=True)
     old.write_bytes(b"x")
@@ -256,8 +257,8 @@ def test_purge_still_cleans_the_old_config_trash_after_the_switch(tmp_path):
     cfg = AppSettings()
     cfg.output.trash_dir = ""  # after the migration
     cfg.output.trash_retention_days = 14
-    assert encoder.purge_trash(cfg) == 1
-    assert not old.exists()
+    assert encoder.purge_trash(cfg) == 0
+    assert old.exists()
 
 
 # --- filter list of newer ffmpeg builds ------------------------------------------ #

@@ -1,7 +1,9 @@
+import { GroupPagination } from "../components/GroupPagination";
+import { useDebouncedValue } from "../lib/hooks";
 /** Series overview: the library grouped by series and season, Sonarr style. */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, Play, Search, Tv, Zap } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   BucketBar,
@@ -48,41 +50,15 @@ export default function SeriesPage() {
   const [sort, setSort] = useState("name");
   const [open, setOpen] = useState<Set<string>>(new Set());
 
+  const [page, setPage] = useState(1);
+  const debouncedSearch = useDebouncedValue(search, 250);
+  useEffect(() => setPage(1), [debouncedSearch, filter, sort]);
   const { data, isLoading, isError, error, refetch } = useQuery({
-    queryKey: ["series"],
-    queryFn: endpoints.series,
+    queryKey: ["series", debouncedSearch, filter, sort, page],
+    queryFn: ({ signal }) => endpoints.series({ search: debouncedSearch, filter, sort, page, page_size: 50 }, { signal }),
     refetchInterval: 30000,
   });
-
-  const items = useMemo(() => {
-    const needle = search.trim().toLowerCase();
-    const list = (data?.items ?? []).filter((s) => {
-      if (needle && !s.name.toLowerCase().includes(needle)) return false;
-      switch (filter) {
-        case "open":
-          return s.in_av1 < s.episodes;
-        case "complete":
-          return s.episodes > 0 && s.in_av1 === s.episodes;
-        case "candidates":
-          return s.counts.pending > 0;
-        case "excluded":
-          return s.counts.excluded > 0;
-        case "failed":
-          return s.counts.failed > 0;
-        default:
-          return true;
-      }
-    });
-    const byName = (a: SeriesSummary, b: SeriesSummary) => a.name.localeCompare(b.name, "de");
-    const descending: Record<string, (s: SeriesSummary) => number> = {
-      size: (s) => s.total_size,
-      saved: (s) => s.saved_bytes,
-      potential: (s) => s.potential_saving,
-    };
-    if (sort === "progress") return [...list].sort((a, b) => share(a) - share(b) || byName(a, b));
-    const key = descending[sort];
-    return key ? [...list].sort((a, b) => key(b) - key(a) || byName(a, b)) : list;
-  }, [data, search, filter, sort]);
+  const items = data?.items ?? [];
 
   const toggle = (key: string) =>
     setOpen((prev) => {
@@ -92,14 +68,14 @@ export default function SeriesPage() {
     });
 
   const totals = data?.totals;
-  const hasSeries = (data?.items.length ?? 0) > 0;
+  const hasSeries = (data?.all_count ?? 0) > 0;
 
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <Stat
           label="Serien"
-          value={number(data?.items.length ?? 0)}
+          value={number(data?.all_count ?? 0)}
           hint={totals ? `${number(totals.episodes)} Folgen` : undefined}
         />
         <Stat
@@ -173,6 +149,7 @@ export default function SeriesPage() {
             ))}
           </ul>
         )}
+        {data && <GroupPagination page={data.page} pages={data.pages} total={data.total} onPage={setPage} />}
       </Panel>
     </div>
   );

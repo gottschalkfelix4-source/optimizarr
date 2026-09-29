@@ -14,6 +14,7 @@ from ..db import session_scope
 from ..models import HistoryEntry, Job, JobState, LearningSample, MediaFile, FileState
 from . import encoder, hwaccel, planner, predictor, scanner
 from .events import bus
+from . import maintenance
 
 log = logging.getLogger(__name__)
 
@@ -261,6 +262,7 @@ class QueueWorker:
             )
             self._running[job_id] = task
 
+    @maintenance.claim_guard
     def _claim_jobs(self, limit: int) -> list[int]:
         """Reserve the next jobs so a second tick cannot pick them up twice.
 
@@ -507,6 +509,7 @@ queue_worker = QueueWorker()
 scheduler = Scheduler()
 
 
+@maintenance.enqueue_guard
 def enqueue_files(
     file_ids: list[int], priority: int | None = None, force: bool = False,
 ) -> tuple[int, list[str]]:

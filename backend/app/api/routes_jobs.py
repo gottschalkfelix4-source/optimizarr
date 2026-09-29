@@ -251,7 +251,7 @@ def stats(session: Session = Depends(get_session)) -> dict[str, Any]:
         select(
             func.sum(MediaFile.original_size - MediaFile.size),
             func.count(MediaFile.id),
-            func.avg(MediaFile.measured_vmaf),
+            func.avg(case((MediaFile.quality_metric == "vmaf", MediaFile.quality_value), else_=None)),
         ).where(replaced)
     ).first()
 
@@ -369,6 +369,8 @@ def model_stats(session: Session = Depends(get_session)) -> dict[str, Any]:
             "crf": r.crf,
             "source_codec": r.source_codec,
             "vmaf": r.actual_vmaf,
+            "quality_metric": r.quality_metric,
+            "quality_value": r.quality_value,
         })
     return {"stats": predictor.model().stats(), "samples": points}
 

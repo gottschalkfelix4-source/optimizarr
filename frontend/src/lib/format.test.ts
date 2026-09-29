@@ -211,3 +211,12 @@ describe("ignore button visibility", () => {
     });
   });
 });
+
+import { qualityLabel } from "./format";
+describe("quality labels", () => {
+  it("distinguishes measured VMAF, estimated VMAF and historic unknown scores", () => {
+    expect(qualityLabel({ vmaf: 94, quality_metric: "ssim", quality_value: 0.98 })).toBe("SSIM 0.9800 · VMAF-Schätzung 94.0");
+    expect(qualityLabel({ vmaf: 94, quality_metric: "vmaf", quality_value: 94 })).toBe("VMAF 94.0");
+    expect(qualityLabel({ vmaf: 94 })).toContain("Messverfahren unbekannt");
+  });
+});

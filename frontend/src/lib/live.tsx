@@ -48,12 +48,13 @@ export const INVALIDATION_MAP: Record<string, string[]> = {
   "scan.finished": ["scan", "files", "series", "movies", "stats", "system", "history"],
   "file.analyzed": ["files", "stats"],
   "job.started": ["jobs", "files", "series", "movies", "system"],
-  "job.finished": ["jobs", "files", "series", "movies", "stats", "history", "system", "model"],
+  "job.finished": ["trash", "jobs", "files", "series", "movies", "stats", "history", "system", "model"],
   "queue.changed": ["jobs", "files", "series", "movies", "system", "settings"],
   "settings.changed": ["settings", "system"],
   "library.changed": ["library", "files", "series", "movies", "stats"],
   "hardware.detected": ["system"],
   "model.updated": ["model", "system"],
+  "trash.changed": ["trash", "files", "movies", "series", "stats", "history"],
   history: ["history"],
 };
 

@@ -20,6 +20,7 @@ from ..models import FileState, HistoryEntry, LibraryPath, MediaFile, ScanRun, u
 from . import analyzer, ffmpeg, hwaccel
 from .advisor import get_advisor
 from .events import bus
+from . import maintenance
 
 log = logging.getLogger(__name__)
 
@@ -685,7 +686,7 @@ async def run_scan(trigger: str = "manual", analyze_only_ids: list[int] | None =
     leave ``state.running`` set, or no scan and no queued encode would ever
     start again until a restart.
     """
-    if state.running:
+    if state.running or maintenance.active:
         return {"ok": False, "error": BUSY_MESSAGE}
 
     cancel = asyncio.Event()
