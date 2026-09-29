@@ -281,9 +281,10 @@ def test_missing_files_are_not_queued_even_when_forced(library):
 @pytest.mark.parametrize("forced,output_size,accepted", [
     (True, 95, True),       # 5% is below the threshold - accepted because forced
     (False, 95, False),     # the same result, not forced: rejected as before
-    (True, 150, False),     # forced or not, a bigger file never replaces the original
+    (True, 150, True),      # forced conversion also accepts larger output
+    (False, 150, False),    # normal jobs still enforce the size gate
 ])
-def test_forced_job_skips_the_saving_threshold_but_not_the_size_gate(
+def test_forced_job_skips_both_saving_threshold_and_size_gate(
     monkeypatch, tmp_path, forced, output_size, accepted,
 ):
     source = tmp_path / "Dark - S01E01.mkv"
