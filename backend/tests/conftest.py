@@ -21,6 +21,9 @@ from typing import Iterator
 import pytest
 
 _RUN_DIR = Path(tempfile.mkdtemp(prefix="optimizarr-tests-"))
+# Desktop-specific process settings must not affect protocol assertions.
+for override in ("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "CODEX_APP_SERVER_LOGIN_CLIENT_ID", "CODEX_ISSUER_OVERRIDE", "CODEX_REFRESH_TOKEN_URL_OVERRIDE"):
+    os.environ.pop(override, None)
 os.environ.setdefault("OPTIMIZARR_CONFIG_DIR", str(_RUN_DIR / "config"))
 os.environ.setdefault("OPTIMIZARR_TRANSCODE_DIR", str(_RUN_DIR / "transcode"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -90,6 +93,9 @@ def hermetic_client(tmp_path_factory) -> Iterator[TestClient]:
 
 @pytest.fixture(autouse=True)
 def isolated_output_modules(tmp_path, tmp_path_factory, monkeypatch):
+    from app.core import background, scratch
+    monkeypatch.setattr(background, "stopping", False)
+    monkeypatch.setattr(scratch, "_reservations", {})
     from app.core import output_files, output_validation, trash
     monkeypatch.setattr(output_files, "CONFIG_DIR", tmp_path / "config")
     monkeypatch.setattr(output_files, "COMMIT_JOURNAL_DIR", tmp_path / "config" / "pending-commits")

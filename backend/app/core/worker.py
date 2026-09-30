@@ -12,7 +12,7 @@ from sqlalchemy import delete, func, select
 from ..config import AppSettings, load_settings
 from ..db import session_scope
 from ..models import HistoryEntry, Job, JobState, LearningSample, MediaFile, FileState
-from . import encoder, hwaccel, planner, predictor, scanner
+from . import background, encoder, hwaccel, planner, predictor, scanner, scratch
 from .events import bus
 from . import maintenance
 
@@ -38,7 +38,7 @@ def within_schedule(settings: AppSettings, now: dt.datetime | None = None) -> tu
     if not cfg.schedule_enabled:
         return True, ""
     now = now or dt.datetime.now()
-    if now.weekday() not in (cfg.schedule_days or list(range(7))):
+    if now.weekday() not in cfg.schedule_days:
         return False, f"Heute ({WEEKDAYS_DE[now.weekday()]}) ist kein Encoding-Tag."
     try:
         sh, sm = (int(x) for x in cfg.schedule_start.split(":"))
@@ -115,6 +115,8 @@ class QueueWorker:
                     encoder.close_interrupted_job(job_id, True)
                 except Exception:
                     log.exception("could not requeue job %s", job_id)
+                finally:
+                    scratch.release(job_id)
         self._running.clear()
         self._cancels.clear()
 
@@ -203,6 +205,8 @@ class QueueWorker:
                 pass
 
     async def _tick(self) -> None:
+        if not self._running:
+            await background.run_in_thread(encoder.recover_interrupted_commits)
         settings = load_settings()
 
         if settings.queue.paused:
@@ -250,8 +254,8 @@ class QueueWorker:
         if self._stop.is_set():
             return
 
-        job_ids = await asyncio.to_thread(self._claim_jobs, slots)
         self._set_blocked("", "")
+        job_ids = await background.run_in_thread(self._claim_jobs, slots)
         for job_id in job_ids:
             cancel = self._cancels[job_id]
             if self._stopping:
@@ -280,11 +284,19 @@ class QueueWorker:
                     .limit(limit)
                 ).scalars().all()
                 for job in rows:
+                    cfg = load_settings()
+                    media = s.get(MediaFile, job.file_id)
+                    need = scratch.required(max(job.input_size or 0, media.size if media else 0), job.predicted_size or 0)
+                    problem = scratch.reserve(job.id, need, encoder.TRANSCODE_DIR, cfg.queue.min_free_disk_gb)
+                    if problem:
+                        self._set_blocked("disk", problem)
+                        break
                     self._cancels[job.id] = encoder.CancelToken()
                     job.state = JobState.RUNNING.value
                     claimed.append(job.id)
         except BaseException:
             for job_id in claimed:
+                scratch.release(job_id)
                 self._cancels.pop(job_id, None)
             raise
         return claimed
@@ -315,6 +327,7 @@ class QueueWorker:
             except Exception:
                 log.exception("could not mark job %s as failed", job_id)
         finally:
+            scratch.release(job_id)
             self._running.pop(job_id, None)
             self._cancels.pop(job_id, None)
             bus.publish("queue.changed", {})
@@ -427,6 +440,7 @@ class Scheduler:
         self._tasks: set[asyncio.Task] = set()
         self._last_launch: dt.datetime | None = None
         self.next_scan: dt.datetime | None = None
+        self._first_scan_base: dt.datetime | None = None
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -443,7 +457,8 @@ class Scheduler:
                 pass
 
     def _spawn(self, coro: Any, name: str) -> asyncio.Task:
-        task = asyncio.create_task(coro, name=name)
+        from . import background
+        task = background.spawn(coro, name)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return task
@@ -465,7 +480,9 @@ class Scheduler:
             ).scalar()
             last_try = s.execute(select(func.max(ScanRun.started_at))).scalar()
         last_done, last_try = _aware(last_done), _aware(last_try)
-        base = last_done or last_try or dt.datetime.now(dt.timezone.utc)
+        if self._first_scan_base is None:
+            self._first_scan_base = dt.datetime.now(dt.timezone.utc)
+        base = last_done or last_try or self._first_scan_base
         due = base + dt.timedelta(hours=hours)
         retry = dt.timedelta(hours=min(float(hours), SCAN_RETRY_HOURS))
         for attempt in (last_try, self._last_launch):
@@ -492,9 +509,11 @@ class Scheduler:
 
                 if (now - last_purge).total_seconds() > 86400:
                     last_purge = now
-                    removed = await asyncio.to_thread(encoder.purge_trash, settings)
+                    removed = await background.run_in_thread(encoder.purge_trash, settings)
                     if removed:
                         log.info("purged %d files from trash", removed)
+                    from . import upkeep
+                    await background.run_in_thread(upkeep.prune, settings)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -521,14 +540,25 @@ def enqueue_files(
     """
     added = 0
     skipped: list[str] = []
+    from .output_files import pending_commits
+    pending = pending_commits()["files"]
     with session_scope() as s:
         for file_id in file_ids:
+            if file_id in pending:
+                skipped.append(f"#{file_id}: Ergebnisverbuchung wartet auf Wiederherstellung")
+                continue
             media = s.get(MediaFile, file_id)
             if media is None:
                 skipped.append(f"#{file_id}: nicht gefunden")
                 continue
             if media.state == FileState.MISSING.value:
                 skipped.append(f"{media.path}: fehlt auf der Platte")
+                continue
+            if media.state == FileState.DONE.value:
+                skipped.append(f"{media.path}: bereits konvertiert")
+                continue
+            if not force and (media.ignored or media.state != FileState.CANDIDATE.value):
+                skipped.append(f"{media.path}: kein freigegebener Kandidat; Erzwingen erforderlich")
                 continue
             if media.plan is None and not force:
                 skipped.append(f"{media.path}: noch nicht analysiert")

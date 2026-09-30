@@ -345,7 +345,8 @@ def test_crash_after_the_swap_rolls_back_to_the_original(tmp_path):
     backup.write_bytes(b"original")
     staging = folder / ".optimizarr-staging-1-1234abcd-Film.mkv"
     _journal({"staging": str(staging), "source": str(source), "target": str(source),
-              "backup": str(backup), "replace": True, "action": "trash"})
+              "backup": str(backup), "replace": True, "action": "trash", "version": 2,
+              "source_fingerprint": encoder._fingerprint(backup), "output_fingerprint": encoder._fingerprint(source)})
     encoder.recover_interrupted_commits()
     assert source.read_bytes() == b"original"
     assert leftovers(folder) == []

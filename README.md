@@ -398,14 +398,18 @@ löscht ihn.
 
 ## Entwicklung
 
+Backend und Dateiarbeit werden unter Linux mit Python 3.13 entwickelt und geprüft.
+Unter Windows dafür WSL2 oder Docker verwenden. Die [Betriebsanleitung](docs/BETRIEB.md)
+beschreibt Sicherung, Wiederherstellung, Aufbewahrung und Bibliotheksbenchmarks.
+
 ```bash
 # Backend
-python -m venv .venv && .venv/bin/pip install -r backend/requirements.txt
+python3.13 -m venv .venv && .venv/bin/pip install --require-hashes -r backend/dev-requirements.lock
 OPTIMIZARR_CONFIG_DIR=./data/config OPTIMIZARR_TRANSCODE_DIR=./data/transcode \
   .venv/bin/uvicorn app.main:app --reload --app-dir backend --port 8080
 
 # Frontend (Port 5173, leitet /api an 8080 weiter)
-cd frontend && npm install && npm run dev
+cd frontend && npm ci && npm run dev
 
 # Tests
 .venv/bin/pytest backend/tests -q

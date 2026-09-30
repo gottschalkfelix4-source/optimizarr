@@ -8,13 +8,13 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from .. import security
 from ..config import DEFAULT_MEDIA_ROOT, TRANSCODE_DIR, load_settings
-from ..core import analyzer, codecs, ffmpeg, hwaccel, planner, scanner, worker
+from ..core import analyzer, background, codecs, ffmpeg, hwaccel, planner, scanner, worker
 from ..core.advisor import get_advisor
 from ..core.events import bus
 from ..db import get_session, session_scope
@@ -438,7 +438,7 @@ def _serialized_file(file_id: int) -> dict[str, Any]:
 
 
 @router.post("/files/{file_id}/analyze")
-async def analyze_file(file_id: int, depth: str | None = None) -> dict[str, Any]:
+async def analyze_file(file_id: int, depth: Literal["quick", "sample", "vmaf"] | None = None) -> dict[str, Any]:
     """Re-run the analysis for one file, on demand, at any depth."""
     settings = load_settings()
     path, _ = await asyncio.to_thread(_file_row, file_id)
@@ -470,8 +470,15 @@ async def analyze_file(file_id: int, depth: str | None = None) -> dict[str, Any]
 # --------------------------------------------------------------------------- #
 
 class ScanRequest(BaseModel):
-    depth: str | None = None
-    file_ids: list[int] | None = None
+    depth: Literal["quick", "sample", "vmaf"] | None = None
+    file_ids: list[int] | None = Field(None, min_length=1, max_length=10000)
+
+    @field_validator("file_ids")
+    @classmethod
+    def valid_ids(cls, value):
+        if value is not None and any(i <= 0 for i in value):
+            raise ValueError("Datei-IDs muessen positiv sein.")
+        return list(dict.fromkeys(value)) if value is not None else None
 
 
 # Scans started from the API.  asyncio keeps only weak references to tasks.
@@ -496,11 +503,11 @@ async def start_scan(payload: ScanRequest | None = None) -> dict[str, Any]:
             detail="Keine Bibliothekspfade konfiguriert. Bitte zuerst unter "
                    "Einstellungen -> Bibliothek einen Ordner hinzufuegen.",
         )
-    task = asyncio.create_task(scanner.run_scan(
+    task = background.spawn(scanner.run_scan(
         trigger="manual",
         depth=payload.depth if payload else None,
         analyze_only_ids=payload.file_ids if payload else None,
-    ))
+    ), "optimizarr-api-scan")
     _scan_tasks.add(task)
     task.add_done_callback(_scan_tasks.discard)
     await asyncio.sleep(0.1)
@@ -535,7 +542,7 @@ def scan_history(
 
 class DryRunRequest(BaseModel):
     seconds: int = Field(15, ge=2, le=120, description="Wieviel Material probeweise kodiert wird")
-    force_encoder: str | None = Field(
+    force_encoder: Literal["libsvtav1", "av1_qsv", "av1_vaapi"] | None = Field(
         None, description="Encoder abweichend vom Plan erzwingen, z.B. libsvtav1"
     )
     disable_hw_decode: bool = False
@@ -575,7 +582,9 @@ async def dry_run(file_id: int, payload: DryRunRequest | None = None) -> dict[st
     if payload.disable_hw_decode:
         plan.hw_decode = False
 
-    dest = TRANSCODE_DIR / f"optimizarr-dryrun-{file_id}.{plan.container}"
+    import uuid
+    TRANSCODE_DIR.mkdir(parents=True, exist_ok=True)
+    dest = TRANSCODE_DIR / f"optimizarr-dryrun-{file_id}-{uuid.uuid4().hex}.{plan.container}"
     args = planner.build_ffmpeg_args(plan, info, path, str(dest))
     # Insert the duration limit right after the input so only a slice is read.
     limited = list(args)

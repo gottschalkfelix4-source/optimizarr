@@ -181,11 +181,13 @@ class SecurityMiddleware:
     async def _authorized(self, headers: Headers) -> bool:
         try:
             sec = self.get_security()
-        except Exception:  # pragma: no cover - settings must never lock everybody out
+        except Exception:
             log.exception("could not read the security settings")
+            return False
+        if not sec.auth_enabled:
             return True
-        if not (sec.auth_enabled and sec.password):
-            return True
+        if not sec.password:
+            return False
         creds = parse_basic_auth(headers.get("authorization"))
         if creds is None:
             return False

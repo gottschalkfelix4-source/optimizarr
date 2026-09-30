@@ -214,6 +214,11 @@ describe("ignore button visibility", () => {
 
 import { qualityLabel } from "./format";
 describe("quality labels", () => {
+  it("shows successful coverage and the worst measured excerpt", () => {
+    expect(qualityLabel({ vmaf: 94, quality_metric: "vmaf", quality_value: 94,
+      quality_details: { successful: 2, planned: 2, worst_vmaf: 91 } }))
+      .toBe("VMAF 94.0 · 2/2 Ausschnitte · schlechtester Wert 91.0");
+  });
   it("distinguishes measured VMAF, estimated VMAF and historic unknown scores", () => {
     expect(qualityLabel({ vmaf: 94, quality_metric: "ssim", quality_value: 0.98 })).toBe("SSIM 0.9800 · VMAF-Schätzung 94.0");
     expect(qualityLabel({ vmaf: 94, quality_metric: "vmaf", quality_value: 94 })).toBe("VMAF 94.0");

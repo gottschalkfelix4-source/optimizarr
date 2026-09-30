@@ -55,12 +55,22 @@ export function OutputTab({ draft, update }: { draft: Settings; update: UpdateFn
             />
           </Field>
           <Toggle
+            checked={draft.output.verify_full_decode}
+            onChange={(verify_full_decode) => update("output", { verify_full_decode })}
+            label="Gesamte Video- und Tonspuren decodieren"
+            hint="Erkennt beschädigte Pakete hinter lesbaren Metadaten. Liest die gesamte Ausgabe und benötigt zusätzliche Zeit."
+          />
+          <Toggle
             checked={draft.output.verify_vmaf}
             onChange={(verify_vmaf) => update("output", { verify_vmaf })}
             label="Qualität der fertigen Datei messen (VMAF / SSIM)"
             hint="Sehr gründlich, kostet aber zusätzliche Rechenzeit pro Datei."
           />
           {draft.output.verify_vmaf && (
+            <div className="space-y-4">
+            <Field label="Erforderliche erfolgreiche Messungen" hint="Zwei Ausschnitte werden geprüft. Das Qualitätsminimum gilt für den schlechtesten gemessenen Ausschnitt.">
+              <NumberField value={draft.output.min_quality_samples} onChange={(min_quality_samples) => update("output", { min_quality_samples })} min={1} max={2} ariaLabel="Erforderliche erfolgreiche Messungen" />
+            </Field>
             <Field label="Qualitätsminimum (VMAF-Skala)">
               <SliderField
                 value={draft.output.min_accept_vmaf}
@@ -71,6 +81,7 @@ export function OutputTab({ draft, update }: { draft: Settings; update: UpdateFn
                 ariaLabel="Qualitätsminimum (VMAF-Skala)"
               />
             </Field>
+            </div>
           )}
         </div>
       </Panel>

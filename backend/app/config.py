@@ -26,9 +26,9 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, ValidationError, ValidationInfo, field_validator
+from pydantic import BaseModel, Field, ValidationError, ValidationInfo, field_validator, model_validator
 
 from . import security
 from .core.codecs import is_excluded, normalise, normalise_list as _normalise_codecs
@@ -158,6 +158,11 @@ class EncodingSettings(BaseModel):
     def _check_extra_args(cls, v: str) -> str:
         return security.check_extra_ffmpeg_args(v)
 
+    @model_validator(mode="after")
+    def _order_crf_range(self):
+        self.crf_min, self.crf_max = sorted((self.crf_min, self.crf_max))
+        return self
+
 
 class AudioSettings(BaseModel):
     mode: Literal["copy", "opus", "opus_if_bloated"] = Field(
@@ -214,9 +219,25 @@ class OutputSettings(BaseModel):
         5.0, ge=0.0, le=90.0, description="Reject the result if it saved less than this"
     )
     verify_output: bool = Field(True, description="Re-probe the result and compare duration/streams")
+    verify_full_decode: bool = False
     max_duration_drift_seconds: float = Field(2.0, ge=0.1, le=60.0)
     verify_vmaf: bool = Field(False, description="Measure VMAF on the finished file before accepting")
     min_accept_vmaf: float = Field(90.0, ge=50.0, le=100.0)
+    min_quality_samples: int = Field(2, ge=1, le=2)
+
+    @field_validator("sidecar_suffix")
+    @classmethod
+    def _check_suffix(cls, value: str) -> str:
+        value = value.strip()
+        if not value or any(c in value for c in "/\\\0\r\n"):
+            raise ValueError("Namenszusatz darf nicht leer sein oder Pfadtrenner enthalten.")
+        return value
+
+    @model_validator(mode="after")
+    def _require_output_directory(self):
+        if self.mode == "separate_dir" and not self.output_dir:
+            raise ValueError("Im Modus separater Ausgabeordner muss ein Ordner angegeben werden.")
+        return self
 
     @field_validator("output_dir")
     @classmethod
@@ -244,7 +265,16 @@ class QueueSettings(BaseModel):
     schedule_enabled: bool = False
     schedule_start: str = Field("22:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
     schedule_end: str = Field("07:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
-    schedule_days: list[int] = Field(default_factory=lambda: [0, 1, 2, 3, 4, 5, 6])
+    schedule_days: list[Annotated[int, Field(ge=0, le=6)]] = Field(
+        default_factory=lambda: [0, 1, 2, 3, 4, 5, 6], min_length=1, max_length=7,
+    )
+
+    @field_validator("schedule_days", mode="before")
+    @classmethod
+    def _unique_days(cls, value):
+        if isinstance(value, list) and all(type(day) is int for day in value):
+            return sorted(set(value))
+        return value
     cpu_threads: int = Field(
         0, ge=0,
         description="0 = all cores; limits SVT-AV1 (pin) and the decoder threads per job",
@@ -384,6 +414,15 @@ class UiSettings(BaseModel):
     dashboard_refresh_seconds: int = Field(3, ge=1, le=60)
 
 
+class MaintenanceSettings(BaseModel):
+    history_retention_days: int = Field(90, ge=0, le=3650)
+    job_retention_days: int = Field(365, ge=0, le=3650)
+    scan_retention_days: int = Field(90, ge=0, le=3650)
+    restored_manifest_retention_days: int = Field(180, ge=0, le=3650)
+    max_learning_samples: int = Field(10000, ge=2000, le=100000)
+    max_backups: int = Field(7, ge=1, le=100)
+
+
 class AppSettings(BaseModel):
     """The whole configuration tree."""
 
@@ -399,6 +438,7 @@ class AppSettings(BaseModel):
     notifications: NotificationSettings = Field(default_factory=NotificationSettings)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     ui: UiSettings = Field(default_factory=UiSettings)
+    maintenance: MaintenanceSettings = Field(default_factory=MaintenanceSettings)
 
     @field_validator("library")
     @classmethod
@@ -448,8 +488,16 @@ def _validate_group(name: str, model: type[BaseModel], value: dict[str, Any]) ->
         try:
             return model.model_validate(data)
         except ValidationError as exc:
+            if name == "security":
+                raise ValueError("Gespeicherte Anmeldung ist ungueltig.") from None
             bad = {e["loc"][0] for e in exc.errors() if e.get("loc")} & set(data)
             if not bad:
+                if name == "security":
+                    raise ValueError("Gespeicherte Anmeldung ist ungueltig.") from exc
+                if name == "output" and data.get("mode") == "separate_dir" and not data.get("output_dir"):
+                    data["mode"] = "sidecar"
+                    log.warning("invalid output folder: keeping originals through sidecar output")
+                    continue
                 log.warning("settings group %s is unusable, using defaults", name)
                 return model()
             log.warning("ignoring invalid stored setting(s) %s.%s", name, ", ".join(sorted(map(str, bad))))
@@ -462,6 +510,8 @@ def _rows_to_settings(rows: dict[str, Any]) -> AppSettings:
     payload: dict[str, Any] = {}
     for name, field in AppSettings.model_fields.items():
         value = rows.get(name)
+        if name == "security" and name in rows and not isinstance(value, dict):
+            raise ValueError("Gespeicherte Anmeldung ist ungueltig.")
         if isinstance(value, dict):
             payload[name] = _validate_group(name, field.annotation, value)  # type: ignore[arg-type]
     return AppSettings.model_validate(payload)
@@ -481,9 +531,15 @@ def load_settings(force: bool = False) -> AppSettings:
             with session_scope() as s:
                 for row in s.query(Setting).all():
                     rows[row.key] = row.value
+            if "security" not in rows and _cache is not None and _cache.security.auth_enabled:
+                rows["security"] = _cache.security.model_dump()
+            settings = _rows_to_settings(rows)
         except Exception:
-            rows = {}
-        _cache = _rows_to_settings(rows)
+            log.exception("could not read settings; preserving the last valid configuration")
+            if _cache is not None:
+                return _cache
+            raise
+        _cache = settings
         return _cache
 
 

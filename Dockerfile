@@ -2,7 +2,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1 - build the web UI
 # ---------------------------------------------------------------------------
-FROM node:24-bookworm-slim AS frontend
+FROM node:24-bookworm-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6 AS frontend
 
 WORKDIR /build
 COPY frontend/package.json frontend/package-lock.json ./
@@ -20,9 +20,10 @@ RUN npm run build
 # hand.  It has no libvmaf (checked with jellyfin-ffmpeg 7.1): quality is
 # measured with SSIM and mapped onto the VMAF scale, see core/quality.py.
 # ---------------------------------------------------------------------------
-FROM debian:trixie-slim
+FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
 
 ARG JELLYFIN_FFMPEG_PACKAGE=jellyfin-ffmpeg7
+ARG JELLYFIN_FFMPEG_VERSION=7.1.4-3-trixie
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -59,7 +60,7 @@ RUN set -eux; \
     echo "deb [signed-by=/etc/apt/keyrings/jellyfin.gpg arch=$(dpkg --print-architecture)] \
 https://repo.jellyfin.org/debian trixie main" > /etc/apt/sources.list.d/jellyfin.list; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ${JELLYFIN_FFMPEG_PACKAGE}; \
+    apt-get install -y --no-install-recommends ${JELLYFIN_FFMPEG_PACKAGE}=${JELLYFIN_FFMPEG_VERSION}; \
     ln -sf /usr/lib/jellyfin-ffmpeg/ffmpeg /usr/local/bin/ffmpeg; \
     ln -sf /usr/lib/jellyfin-ffmpeg/ffprobe /usr/local/bin/ffprobe; \
     \
@@ -68,9 +69,9 @@ https://repo.jellyfin.org/debian trixie main" > /etc/apt/sources.list.d/jellyfin
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # --- python dependencies ---------------------------------------------------
-COPY backend/requirements.txt /tmp/requirements.txt
-RUN pip3 install --break-system-packages --no-cache-dir -r /tmp/requirements.txt \
-    && rm -f /tmp/requirements.txt
+COPY backend/requirements.lock /tmp/requirements.lock
+RUN pip3 install --break-system-packages --no-cache-dir --require-hashes -r /tmp/requirements.lock \
+    && rm -f /tmp/requirements.lock
 
 # --- application -----------------------------------------------------------
 WORKDIR /app

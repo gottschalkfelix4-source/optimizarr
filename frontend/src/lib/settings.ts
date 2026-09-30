@@ -47,6 +47,7 @@ export function diffSettings(saved: Settings, draft: Settings): SettingsPatch {
  *  page never reads a property of ``undefined``. */
 const FALLBACKS: Partial<Record<keyof Settings, Record<string, unknown>>> = {
   analysis: { dolby_vision: "skip" },
+  output: { verify_full_decode: false, min_quality_samples: 2 },
   notifications: {
     webhook_url: "",
     notify_on_job_done: false,
@@ -55,6 +56,7 @@ const FALLBACKS: Partial<Record<keyof Settings, Record<string, unknown>>> = {
   },
   security: { auth_enabled: false, username: "admin", password: "" },
   ui: { size_unit: "binary", dashboard_refresh_seconds: 3 },
+  maintenance: { history_retention_days: 90, job_retention_days: 365, scan_retention_days: 90, restored_manifest_retention_days: 180, max_learning_samples: 10000, max_backups: 7 },
 };
 
 export function normalizeSettings(settings: Settings): Settings {

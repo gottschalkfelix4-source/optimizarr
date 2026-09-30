@@ -67,7 +67,8 @@ export default function Insights() {
   });
 
   const stats = data?.stats;
-  const samples = data?.samples ?? [];
+  const samples = (data?.samples ?? []).filter(sample => sample.prediction_kind === "applied");
+  const evaluation = data?.evaluation;
   const hw = info?.hardware;
 
   if (isError && !data) {
@@ -132,8 +133,13 @@ export default function Insights() {
             <div className="grid grid-cols-2 gap-3">
               <StatBox
                 icon={<Target className="size-4" />}
-                label="Mittlerer Fehler"
+                label="Trainingsfehler"
                 value={stats?.trained ? `±${stats.mean_abs_error_pct.toFixed(1)} %` : "-"}
+              />
+              <StatBox
+                icon={<Target className="size-4" />}
+                label="Fehler vor dem Lernen"
+                value={evaluation?.mean_abs_error_pct != null ? `${evaluation.mean_abs_error_pct.toFixed(1)} %` : "Noch keine Messung"}
               />
               <StatBox
                 icon={<Brain className="size-4" />}
@@ -141,6 +147,8 @@ export default function Insights() {
                 value={number(stats?.samples ?? 0)}
               />
             </div>
+            <p className="hint">{evaluation?.samples ?? 0} gespeicherte Vorhersagen vor dem jeweiligen Encode, verglichen mit dem Ergebnis. Alte Basiswerte zählen nicht als unabhängige Messung.</p>
+            {evaluation?.encoders.map(item => <p className="hint" key={item.encoder}>{item.encoder}: {item.mean_abs_error_pct.toFixed(1)} % mittlerer Fehler aus {item.samples} Jobs</p>)}
 
             {stats?.top_signals?.length ? (
               <div>

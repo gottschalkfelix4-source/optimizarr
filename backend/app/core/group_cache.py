@@ -56,9 +56,12 @@ def snapshot(session: Session, build, key="groups"):
         version = _versions.get(bind, 0)
         if cached and cached[0] == version and time.monotonic() - cached[1] < 30:
             return cached[2]
-        result = build()
-        _cache.setdefault(bind, {})[key] = (version, time.monotonic(), result)
-        return result
+    # Building can query/sort 100k rows. Writers must still be able to invalidate.
+    result = build()
+    with _lock:
+        if _versions.get(bind, 0) == version:
+            _cache.setdefault(bind, {})[key] = (version, time.monotonic(), result)
+    return result
 
 
 def browse(items: list[dict], search: str, state: str, sort: str, page: int, page_size: int) -> dict:

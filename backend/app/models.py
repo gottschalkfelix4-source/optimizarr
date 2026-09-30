@@ -138,6 +138,7 @@ class MediaFile(Base):
     original_size: Mapped[int] = mapped_column(BigInteger, default=0)
     converted_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
     measured_vmaf: Mapped[float | None] = mapped_column(Float, nullable=True)
+    quality_details: Mapped[Any] = mapped_column(JSON, nullable=True)
     quality_metric: Mapped[str | None] = mapped_column(String(16), nullable=True)
     quality_value: Mapped[float | None] = mapped_column(Float, nullable=True)
 
@@ -177,6 +178,7 @@ class Job(Base):
     output_size: Mapped[int] = mapped_column(BigInteger, default=0)
     predicted_size: Mapped[int] = mapped_column(BigInteger, default=0)
     vmaf: Mapped[float | None] = mapped_column(Float, nullable=True)
+    quality_details: Mapped[Any] = mapped_column(JSON, nullable=True)
     quality_metric: Mapped[str | None] = mapped_column(String(16), nullable=True)
     quality_value: Mapped[float | None] = mapped_column(Float, nullable=True)
 
@@ -208,6 +210,7 @@ class LearningSample(Base):
 
     features: Mapped[Any] = mapped_column(JSON)          # dict of float
     predicted_bitrate: Mapped[float] = mapped_column(Float, default=0.0)
+    applied_bitrate: Mapped[float | None] = mapped_column(Float, nullable=True)
     actual_bitrate: Mapped[float] = mapped_column(Float, default=0.0)
     actual_vmaf: Mapped[float | None] = mapped_column(Float, nullable=True)
     quality_metric: Mapped[str | None] = mapped_column(String(16), nullable=True)

@@ -5,7 +5,7 @@ import asyncio
 import datetime as dt
 import json
 import logging
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
@@ -30,11 +30,11 @@ router = APIRouter()
 # --------------------------------------------------------------------------- #
 
 class EnqueueRequest(BaseModel):
-    file_ids: list[int] = Field(default_factory=list)
-    priority: int | None = None
+    file_ids: list[Annotated[int, Field(strict=True, gt=0)]] = Field(default_factory=list, max_length=10000)
+    priority: int | None = Field(None, ge=0, le=1000000)
     all_candidates: bool = False
-    min_saving_pct: float | None = None
-    limit: int | None = None
+    min_saving_pct: float | None = Field(None, ge=0, le=100)
+    limit: int | None = Field(None, ge=1, le=10000)
     # Queue despite exclusions and skip verdicts - see worker.enqueue_files.
     force: bool = False
 
@@ -128,6 +128,9 @@ def get_job(job_id: int, session: Session = Depends(get_session)) -> dict[str, A
 
 @router.post("/jobs/{job_id}/cancel")
 def cancel_job(job_id: int, session: Session = Depends(get_session)) -> dict[str, Any]:
+    from ..core.output_files import pending_commits
+    if job_id in pending_commits()["jobs"]:
+        raise HTTPException(409, "Die Dateiuebernahme wird noch verbucht; bitte Wiederherstellung abwarten.")
     row = session.get(Job, job_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Job nicht gefunden")
@@ -211,12 +214,16 @@ def start_now(payload: StartNow) -> dict[str, Any]:
     return {"active": worker.queue_worker.schedule_override, "worker": worker.queue_worker.status()}
 
 
+class ReorderRequest(BaseModel):
+    order: list[Annotated[int, Field(strict=True, gt=0)]] = Field(default_factory=list, max_length=10000)
+
+
 @router.post("/queue/reorder")
-def reorder(payload: dict[str, Any], session: Session = Depends(get_session)) -> dict[str, Any]:
+def reorder(payload: ReorderRequest, session: Session = Depends(get_session)) -> dict[str, Any]:
     """Accepts {"order": [job_id, ...]} - index becomes the priority."""
-    order = payload.get("order") or []
+    order = list(dict.fromkeys(payload.order))
     for index, job_id in enumerate(order):
-        row = session.get(Job, int(job_id))
+        row = session.get(Job, job_id)
         if row and row.state == JobState.QUEUED.value:
             row.priority = index
     session.commit()
@@ -356,13 +363,18 @@ def model_stats(session: Session = Depends(get_session)) -> dict[str, Any]:
         select(LearningSample).order_by(LearningSample.created_at.desc()).limit(200)
     ).scalars().all()
     points = []
+    evaluated = []
     for r in reversed(rows):
         if r.predicted_bitrate <= 0 or r.actual_bitrate <= 0:
             continue
-        error = (r.actual_bitrate - r.predicted_bitrate) / r.predicted_bitrate * 100
+        prediction = r.applied_bitrate or r.predicted_bitrate
+        error = (r.actual_bitrate - prediction) / prediction * 100
+        if r.applied_bitrate and r.applied_bitrate > 0:
+            evaluated.append((r.encoder, abs(r.actual_bitrate - r.applied_bitrate) / r.actual_bitrate * 100))
         points.append({
             "created_at": serializers.iso(r.created_at),
-            "predicted_kbps": round(r.predicted_bitrate / 1000),
+            "predicted_kbps": round(prediction / 1000),
+            "prediction_kind": "applied" if r.applied_bitrate else "legacy_base",
             "actual_kbps": round(r.actual_bitrate / 1000),
             "error_pct": round(error, 1),
             "encoder": r.encoder,
@@ -372,7 +384,14 @@ def model_stats(session: Session = Depends(get_session)) -> dict[str, Any]:
             "quality_metric": r.quality_metric,
             "quality_value": r.quality_value,
         })
-    return {"stats": predictor.model().stats(), "samples": points}
+    encoders = sorted({encoder for encoder, _ in evaluated})
+    evaluation = {
+        "samples": len(evaluated),
+        "mean_abs_error_pct": round(sum(error for _, error in evaluated) / len(evaluated), 2) if evaluated else None,
+        "encoders": [{"encoder": encoder, "samples": sum(enc == encoder for enc, _ in evaluated),
+                      "mean_abs_error_pct": round(sum(err for enc, err in evaluated if enc == encoder) / sum(enc == encoder for enc, _ in evaluated), 2)} for encoder in encoders],
+    }
+    return {"stats": predictor.model().stats(), "evaluation": evaluation, "samples": points}
 
 
 @router.get("/history")

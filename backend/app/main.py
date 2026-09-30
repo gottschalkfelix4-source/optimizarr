@@ -17,7 +17,7 @@ from .api import (
     routes_advisor, routes_jobs, routes_library, routes_movies, routes_series, routes_system,
 )
 from .config import AppSettings, CONFIG_DIR, TRANSCODE_DIR, load_settings, save_settings
-from .core import hwaccel, notify, scanner, worker
+from .core import background, hwaccel, notify, scanner, worker
 from .core.events import bus
 from .db import engine, session_scope
 from .models import Base, HistoryEntry, Job, JobState, MediaFile, FileState, ScanRun, utcnow
@@ -36,8 +36,13 @@ STATIC_DIR = Path(os.environ.get("OPTIMIZARR_STATIC_DIR", "/app/static"))
 def _recover_orphans() -> None:
     """A container restart leaves jobs stuck in 'running' - put them back."""
     with session_scope() as s:
+        from .core.output_files import pending_commits
+        commits = pending_commits()
+        pending = commits["jobs"]
         stuck_jobs = s.query(Job).filter(Job.state == JobState.RUNNING.value).all()
         for job in stuck_jobs:
+            if job.id in pending:
+                continue
             job.state = JobState.QUEUED.value
             job.progress = 0.0
             job.fps = 0.0
@@ -58,6 +63,8 @@ def _recover_orphans() -> None:
             MediaFile.state.in_([FileState.ENCODING.value, FileState.ANALYZING.value])
         ).all()
         for media in stuck_files:
+            if media.id in commits["files"]:
+                continue
             if media.id in queued_files:
                 media.state = FileState.QUEUED.value
             elif media.plan:
@@ -189,7 +196,7 @@ _background: set[asyncio.Task] = set()
 
 
 def _spawn(coro, name: str) -> asyncio.Task:
-    task = asyncio.create_task(coro, name=name)
+    task = background.spawn(coro, name)
     _background.add(task)
     task.add_done_callback(_background.discard)
     return task
@@ -197,6 +204,7 @@ def _spawn(coro, name: str) -> asyncio.Task:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    background.stopping = False
     log.info("Optimizarr %s starting", __version__)
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     TRANSCODE_DIR.mkdir(parents=True, exist_ok=True)
@@ -213,8 +221,8 @@ async def lifespan(app: FastAPI):
     save_settings(settings)  # materialise defaults on first run
 
     bus.bind_loop(asyncio.get_running_loop())
-    _recover_orphans()
     _clean_transcode_dir()
+    _recover_orphans()
 
     # Samples from the old GPU quality handling go before the first fit.
     try:
@@ -263,12 +271,16 @@ async def lifespan(app: FastAPI):
     finally:
         log.info("shutting down")
         scanner.cancel_scan()
-        for task in list(_background):
-            task.cancel()
-        if _background:
-            await asyncio.gather(*_background, return_exceptions=True)
-        await worker.queue_worker.stop()
-        await worker.scheduler.stop()
+        queue_stop = asyncio.create_task(worker.queue_worker.stop())
+        try:
+            await worker.scheduler.stop()
+            # Notification delivery waits indefinitely; stop these helpers.
+            for task in list(_background):
+                if task.get_name() != "optimizarr-initial-scan":
+                    task.cancel()
+            await background.shutdown()
+        finally:
+            await queue_stop
 
 
 app = FastAPI(

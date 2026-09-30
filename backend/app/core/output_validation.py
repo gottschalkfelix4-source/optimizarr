@@ -27,6 +27,7 @@ def _mid_frame(start: float, fps: float) -> float:
 async def _spot_check_quality(
     source: str, output: str, info: ffmpeg.MediaInfo,
     cancel: asyncio.Event | None = None,
+    minimum_samples: int = 2,
 ) -> quality.QualityScore | None:
     """Measure a few short slices - scoring a whole film would take hours.
 
@@ -70,10 +71,11 @@ async def _spot_check_quality(
                 scores.append(score)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
-    if not scores or len({s.metric for s in scores}) != 1:
+    if len(scores) < minimum_samples or len({s.metric for s in scores}) != 1:
         return None
     return quality.QualityScore(
         value=sum(s.value for s in scores) / len(scores),
         metric=scores[0].metric,
         vmaf_estimate=sum(s.vmaf_estimate for s in scores) / len(scores),
+        successful=len(scores), planned=len(positions), worst_vmaf=min(s.vmaf_estimate for s in scores),
     )

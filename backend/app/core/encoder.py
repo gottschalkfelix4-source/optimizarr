@@ -13,7 +13,7 @@ import logging
 import os
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -24,12 +24,12 @@ from ..db import session_scope
 from ..models import (
     FileState, HistoryEntry, Job, JobState, LearningSample, MediaFile, utcnow,
 )
-from . import analyzer, codecs, ffmpeg, planner, predictor, quality
+from . import analyzer, codecs, ffmpeg, planner, predictor, quality, scratch
 from .encode_types import EncodeOutcome, JobCancelled, SourceChangedError
 # Public compatibility exports keep worker integrations stable after extraction.
 from .output_files import (
     _commit_output, library_root_for, purge_trash, recover_interrupted_commits,
-    sweep_stale_staging, original_backup_path, free_backup_path, _move_to_trash,
+    sweep_stale_staging, original_backup_path, free_backup_path, _move_to_trash, finish_commit,
 )
 from .output_validation import _mid_frame, _spot_check_quality
 from .events import bus
@@ -345,6 +345,11 @@ async def run_job(
         # space filling up in between.  Out of space is the machine's problem,
         # not this file's: back into the queue instead of failing it.
         problem = await asyncio.to_thread(workdir_space_problem, settings)
+        if not problem:
+            problem = await asyncio.to_thread(
+                scratch.reserve, job_id, scratch.required(start.known_size, plan.estimated_size if plan else 0),
+                TRANSCODE_DIR, settings.queue.min_free_disk_gb,
+            )
         if problem:
             await asyncio.to_thread(close_interrupted_job, job_id, True, problem)
             outcome.requeued = True
@@ -372,6 +377,11 @@ async def run_job(
             return await _reject_async(job_id, file_id, outcome, dv_problem)
 
         outcome.input_size = info.size or src_stat.st_size
+        problem = await asyncio.to_thread(scratch.reserve, job_id, scratch.required(outcome.input_size, plan.estimated_size if plan else 0), TRANSCODE_DIR, settings.queue.min_free_disk_gb)
+        if problem:
+            await asyncio.to_thread(close_interrupted_job, job_id, True, problem)
+            outcome.requeued, outcome.reason = True, problem
+            return outcome
         if plan is None:
             plan = await asyncio.to_thread(_plan_forced_job, job_id, info, settings, hw)
         elif changed or not _streams_match(plan, info):
@@ -493,11 +503,18 @@ async def run_job(
             ))
 
             plan.encoder = "libsvtav1"
+            # Grain measurement survives the encoder switch; capture it before
+            # discarding the GPU-specific prediction features.
+            plan.film_grain = _cpu_film_grain(plan, info, settings)
+            # The GPU prediction belongs to a different encoder/quality mapping.
+            # Do not train or evaluate the CPU result against those features.
+            plan.base_video_bitrate = 0
+            plan.prediction_features = {}
+            plan.predicted_video_bitrate = 0
             plan.hw_decode = False
             plan.pix_fmt = "yuv420p10le" if plan.pix_fmt in ("p010le", "yuv420p10le") else "yuv420p"
             # The hardware plan had grain synthesis switched off because the
             # GPU cannot do it; SVT-AV1 can.
-            plan.film_grain = _cpu_film_grain(plan, info, settings)
             outcome.fell_back_to_cpu = True
             outcome.hw_failure_reason = reason
             temp_out.unlink(missing_ok=True)
@@ -526,6 +543,17 @@ async def run_job(
             )
             if not ok:
                 return await _reject_async(job_id, file_id, outcome, f"Ergebnis nicht plausibel: {why}")
+        if settings.output.verify_full_decode:
+            try:
+                code, _, error = await ffmpeg.run_simple(
+                    ["-v", "error", "-xerror", "-err_detect", "explode", "-i", str(temp_out),
+                     "-map", "0:v:0", "-map", "0:a?", "-f", "null", "-"],
+                    timeout=settings.encoding.max_encode_hours * 3600, cancel_event=cancel,
+                )
+            except ffmpeg.FFmpegCancelled:
+                raise JobCancelled() from None
+            if code:
+                return await _reject_async(job_id, file_id, outcome, f"Vollstaendiges Decoding fehlgeschlagen: {error[-1000:]}")
 
         # ---------------- gate 2: is it actually smaller? ----------------- #
         saved = outcome.input_size - outcome.output_size
@@ -549,7 +577,7 @@ async def run_job(
         # ---------------- gate 3: did quality hold up? -------------------- #
         if settings.output.verify_vmaf:
             bus.publish("job.log", {"job_id": job_id, "message": "Qualitaet wird geprueft..."})
-            score = await _spot_check_quality(source, str(temp_out), info, cancel)
+            score = await _spot_check_quality(source, str(temp_out), info, cancel, settings.output.min_quality_samples)
             if cancel.is_set():
                 raise JobCancelled()
             if score is None:
@@ -563,10 +591,13 @@ async def run_job(
             outcome.vmaf = score.vmaf_estimate
             outcome.quality_metric = score.metric
             outcome.quality_value = score.value
-            if score.vmaf_estimate < settings.output.min_accept_vmaf:
+            outcome.quality_details = {"successful": score.successful, "planned": score.planned, "worst_vmaf": score.worst_vmaf}
+            gate_score = score.worst_vmaf if score.worst_vmaf is not None else score.vmaf_estimate
+            await _append_log_async(job_id, f"Qualitaetspruefung: {score.successful}/{score.planned} Ausschnitte, schlechtester VMAF-Wert/SSIM-Schaetzung {gate_score:.1f}.")
+            if gate_score < settings.output.min_accept_vmaf:
                 return await _reject_async(
                     job_id, file_id, outcome,
-                    f"Qualitaet zu niedrig: {score.describe()} unter dem Minimum von "
+                    f"Qualitaet zu niedrig: schlechtester Ausschnitt {gate_score:.1f} ({score.describe()}) unter dem Minimum von "
                     f"{settings.output.min_accept_vmaf:.0f}.",
                 )
 
@@ -576,34 +607,47 @@ async def run_job(
 
         # ---------------- commit ------------------------------------------ #
         notes: list[str] = []
-        try:
-            final_path = await asyncio.to_thread(
-                _commit_output, source, str(temp_out), plan, settings, info,
-                source_signature, start.library_root, notes,
-            )
-        except SourceChangedError as exc:
-            return await _fail_async(job_id, file_id, outcome, str(exc))
-        for note in notes:
-            await _append_log_async(job_id, note)
-
-        outcome.ok = True
         size_change = f"{saved_pct:.0f}% gespart" if saved >= 0 else f"{-saved_pct:.0f}% groesser"
         outcome.reason = (
             f"Fertig: {_fmt(outcome.input_size)} -> {_fmt(outcome.output_size)} "
             f"({size_change})"
         )
-        # The row must describe the file that is now on disk, not the one the
-        # scan saw months ago.
-        final_info: ffmpeg.MediaInfo | None = None
-        if settings.output.mode == "replace":
-            try:
-                final_info = await ffmpeg.probe(final_path)
-            except ffmpeg.FFmpegError as exc:
-                log.warning("could not re-read %s after the encode: %s", final_path, exc)
-        await asyncio.to_thread(
-            _record_success, job_id, file_id, outcome, final_path, plan, info, settings,
-            final_info,
-        )
+        outcome.elapsed = time.time() - started_wall
+
+        async def finalize() -> None:
+            replay = {
+                "job_id": job_id, "file_id": file_id, "outcome": asdict(outcome),
+                "plan": plan.to_dict(), "info": {k: v for k, v in asdict(info).items() if k != "raw"},
+                # No credentials belong in an on-disk commit manifest.
+                "output_mode": settings.output.mode,
+            }
+            final_path = await asyncio.to_thread(
+                _commit_output, source, str(temp_out), plan, settings, info,
+                source_signature, start.library_root, notes, replay,
+            )
+            final_info = None
+            if settings.output.mode == "replace":
+                try:
+                    final_info = await ffmpeg.probe(final_path)
+                except ffmpeg.FFmpegError as exc:
+                    log.warning("could not re-read %s after the encode: %s", final_path, exc)
+            await asyncio.to_thread(
+                _record_success, job_id, file_id, outcome, final_path, plan, info, settings, final_info,
+            )
+            await asyncio.to_thread(finish_commit, job_id)
+            outcome.ok = True
+            for note in notes:
+                await _append_log_async(job_id, note)
+
+        # A thread cannot be cancelled halfway through a filesystem mutation.
+        # Finish both durable steps before shutdown is allowed to close this job.
+        finalizer = asyncio.create_task(finalize(), name=f"optimizarr-commit-{job_id}")
+        try:
+            await asyncio.shield(finalizer)
+        except asyncio.CancelledError:
+            await finalizer
+        except SourceChangedError as exc:
+            return await _fail_async(job_id, file_id, outcome, str(exc))
         return outcome
 
     except JobCancelled:
@@ -616,6 +660,7 @@ async def run_job(
         log.exception("job %s crashed", job_id)
         return await _fail_async(job_id, file_id, outcome, f"Unerwarteter Fehler: {exc}")
     finally:
+        scratch.release(job_id)
         if temp_out is not None:
             try:
                 if temp_out.exists():
@@ -697,6 +742,7 @@ def _learning_sample(
         job_id=job_id,
         features=features,
         predicted_bitrate=float(base),
+        applied_bitrate=float(plan.predicted_video_bitrate) if plan.predicted_video_bitrate > 0 else None,
         actual_bitrate=float(actual_video),
         actual_vmaf=outcome.vmaf,
         quality_metric=outcome.quality_metric or None,
@@ -716,6 +762,10 @@ def _record_success(
     with session_scope() as s:
         job = s.get(Job, job_id)
         media = s.get(MediaFile, file_id)
+        if job is not None and job.state == JobState.DONE.value:
+            return  # journal replay after DB commit must not duplicate history/learning
+        if job is None or media is None:
+            raise RuntimeError("Job oder Datei fuer die Ergebnisverbuchung fehlt.")
         if job:
             job.state = JobState.DONE.value
             job.finished_at = utcnow()
@@ -725,6 +775,7 @@ def _record_success(
             job.vmaf = outcome.vmaf
             job.quality_metric = outcome.quality_metric or None
             job.quality_value = outcome.quality_value
+            job.quality_details = outcome.quality_details
             job.plan = {**plan.to_dict(), **planner.job_markers(job.plan)}
             job.error = ""
         if media:
@@ -733,6 +784,7 @@ def _record_success(
             media.measured_vmaf = outcome.vmaf
             media.quality_metric = outcome.quality_metric or None
             media.quality_value = outcome.quality_value
+            media.quality_details = outcome.quality_details
 
             if settings.output.mode == "replace":
                 # The row now describes the new file - it took the old one's place.
@@ -792,6 +844,20 @@ def _record_success(
         "saved_bytes": outcome.input_size - outcome.output_size,
         "message": outcome.reason,
     })
+
+
+def reconcile_commit(entry: dict[str, Any]) -> None:
+    """Replay committed output bookkeeping before orphan jobs are requeued."""
+    data = entry["reconciliation"]
+    settings = AppSettings()
+    settings.output.mode = data["output_mode"]
+    outcome = EncodeOutcome(**data["outcome"])
+    outcome.ok = True
+    plan = EncodePlan.from_dict(data["plan"])
+    if plan is None:
+        raise ValueError("Wiederherstellungsjournal enthaelt keinen gueltigen Plan.")
+    info = ffmpeg.MediaInfo(**data["info"])
+    _record_success(data["job_id"], data["file_id"], outcome, entry["target"], plan, info, settings)
 
 
 def _plan_forced_job(
@@ -907,6 +973,12 @@ async def _append_log_async(job_id: int, message: str) -> None:
 def _fail(job_id: int, file_id: int, outcome: EncodeOutcome, message: str) -> EncodeOutcome:
     outcome.ok = False
     outcome.reason = message
+    from .output_files import pending_commits
+    if job_id in pending_commits()["jobs"]:
+        # Filesystem outcome is durable; do not turn it into another encode.
+        outcome.reason = f"Ergebnisverbuchung wartet auf Wiederherstellung: {message}"
+        log.error("job %s has a pending commit: %s", job_id, message)
+        return outcome
     with session_scope() as s:
         job = s.get(Job, job_id)
         if job:
@@ -948,6 +1020,7 @@ def _reject(job_id: int, file_id: int, outcome: EncodeOutcome, message: str) -> 
             job.quality_metric = outcome.quality_metric or None
             job.quality_value = outcome.quality_value
             job.error = message[:4000]
+            job.quality_details = outcome.quality_details
         media = s.get(MediaFile, file_id)
         if media:
             # Remember the verdict so a later scan does not retry the same thing.

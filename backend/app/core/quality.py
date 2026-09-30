@@ -62,6 +62,9 @@ class QualityScore:
     value: float                  # raw score in the native metric
     metric: str                   # "vmaf" or "ssim"
     vmaf_estimate: float          # always on the 0..100 VMAF-like scale
+    successful: int = 1
+    planned: int = 1
+    worst_vmaf: float | None = None
 
     @property
     def is_exact(self) -> bool:

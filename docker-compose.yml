@@ -4,6 +4,7 @@ services:
     image: ghcr.io/gottschalkfelix4-source/optimizarr:latest
     container_name: optimizarr
     restart: unless-stopped
+    stop_grace_period: 60s
     ports:
       - "8474:8080"
     environment:

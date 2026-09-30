@@ -217,6 +217,7 @@ export interface MediaFile {
   original_size: number;
   converted_at: string | null;
   measured_vmaf: number | null;
+  quality_details?: { successful: number; planned: number; worst_vmaf: number | null } | null;
   quality_metric?: string | null;
   quality_value?: number | null;
   audio_count: number;
@@ -319,6 +320,7 @@ export interface AnalysisResult {
 }
 
 export interface Job {
+  quality_details?: { successful: number; planned: number; worst_vmaf: number | null } | null;
   id: number;
   file_id: number;
   state: JobState;
@@ -622,8 +624,10 @@ export interface Settings {
     require_smaller: boolean;
     min_accept_saving_percent: number;
     verify_output: boolean;
+    verify_full_decode: boolean;
     max_duration_drift_seconds: number;
     verify_vmaf: boolean;
+    min_quality_samples: number;
     min_accept_vmaf: number;
   };
   queue: {
@@ -687,6 +691,10 @@ export interface Settings {
   ui: {
     size_unit: "binary" | "decimal";
     dashboard_refresh_seconds: number;
+  };
+  maintenance: {
+    history_retention_days: number; job_retention_days: number; scan_retention_days: number;
+    restored_manifest_retention_days: number; max_learning_samples: number; max_backups: number;
   };
 }
 
@@ -931,9 +939,11 @@ export const endpoints = {
   modelStats: (opts?: RequestOpts) =>
     api.get<{
       stats: ModelStats;
+      evaluation?: { samples: number; mean_abs_error_pct: number | null; encoders: { encoder: string; samples: number; mean_abs_error_pct: number }[] };
       samples: {
         created_at: string;
         predicted_kbps: number;
+        prediction_kind?: "applied" | "legacy_base";
         actual_kbps: number;
         error_pct: number;
         encoder: string;
@@ -950,6 +960,8 @@ export const endpoints = {
       `/history${query({ limit: params.limit ?? 60, level: params.level === "all" ? undefined : params.level })}`,
       opts,
     ),
+  createBackup: () => api.post<{ id: string; size: number; download_url: string }>("/system/backups"),
+  runMaintenance: () => api.post<Record<string, number>>("/system/maintenance"),
 };
 
 export interface GroupPage<T> {

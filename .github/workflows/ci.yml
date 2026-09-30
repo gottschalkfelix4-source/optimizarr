@@ -23,13 +23,12 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
-          cache-dependency-path: backend/requirements.txt
+          cache-dependency-path: backend/dev-requirements.lock
 
       - name: Abhaengigkeiten installieren
         run: |
           python -m pip install --upgrade pip
-          pip install -r backend/requirements.txt
-          pip install pytest httpx
+          pip install --require-hashes -r backend/dev-requirements.lock
 
       - name: ffmpeg bereitstellen
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
@@ -135,6 +134,32 @@ jobs:
           done
           echo "Container ist nicht hochgekommen:"
           docker logs smoke
+          exit 1
+
+      - name: Standardbenutzer mit schreibbaren Volumes pruefen
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}
+        run: |
+          docker volume create smoke-config
+          docker volume create smoke-transcode
+          docker volume create smoke-media
+          docker run --rm --entrypoint sh -v smoke-media:/media "$IMAGE" -c 'chown 99:100 /media'
+          docker run -d --name smoke-user -p 8081:8080 \
+            -v smoke-config:/config -v smoke-transcode:/transcode -v smoke-media:/media:nocopy "$IMAGE"
+          trap 'docker rm -f smoke-user >/dev/null 2>&1 || true; docker volume rm smoke-config smoke-transcode smoke-media >/dev/null 2>&1 || true' EXIT
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8081/api/health >/dev/null; then
+              docker cp scripts/smoke-nonroot.py smoke-user:/tmp/smoke-nonroot.py
+              docker cp scripts/smoke-encode.py smoke-user:/tmp/smoke-encode.py
+              docker cp scripts/smoke-job.py smoke-user:/tmp/smoke-job.py
+              docker exec --user 99:100 smoke-user python3 /tmp/smoke-nonroot.py
+              docker exec --user 99:100 smoke-user python3 /tmp/smoke-encode.py
+              docker exec --user 99:100 smoke-user python3 /tmp/smoke-job.py
+              exit 0
+            fi
+            sleep 3
+          done
+          docker logs smoke-user
           exit 1
 
       # Push the exact local image that passed the checks, without rebuilding.

@@ -10,3 +10,7 @@ def upgrade(engine) -> None:
             for name, ddl in (("quality_metric", "VARCHAR(16)"), ("quality_value", "FLOAT")):
                 if name not in columns:
                     connection.exec_driver_sql(f'ALTER TABLE "{table}" ADD COLUMN "{name}" {ddl}')
+            if table in ("jobs", "media_files") and "quality_details" not in columns:
+                connection.exec_driver_sql(f'ALTER TABLE "{table}" ADD COLUMN "quality_details" JSON')
+            if table == "learning_samples" and "applied_bitrate" not in columns:
+                connection.exec_driver_sql('ALTER TABLE "learning_samples" ADD COLUMN "applied_bitrate" FLOAT')

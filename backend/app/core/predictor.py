@@ -283,6 +283,9 @@ class LearnedModel:
     def fit(self, samples: Sequence[dict[str, Any]], trust_threshold: int = 15) -> None:
         """samples: [{features: {...}, predicted_bitrate, actual_bitrate}, ...]"""
         self.trust_threshold = max(3, trust_threshold)
+        self.weights = self.mean = self.scale = None
+        self.intercept = self.residual_std = self.mean_abs_error_pct = 0.0
+        self.trained = False
         rows: list[list[float]] = []
         targets: list[float] = []
         for s in samples:
@@ -306,6 +309,7 @@ class LearnedModel:
             if targets:
                 self.intercept = float(np.mean(targets))
                 self.residual_std = float(np.std(targets))
+                self.mean_abs_error_pct = float(np.mean(np.abs(np.expm1(np.asarray(targets) - self.intercept)))) * 100
                 self.trained = True
             return
 

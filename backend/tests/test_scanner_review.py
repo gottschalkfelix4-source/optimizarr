@@ -10,7 +10,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.pool import StaticPool
 
 os.environ.setdefault("OPTIMIZARR_CONFIG_DIR", str(Path(tempfile.gettempdir()) / "optimizarr-pytest/config"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -30,8 +29,12 @@ MiB = 1024 * 1024
 
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch, tmp_path):
-    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    # Probe workers need separate transactions. StaticPool shares one DBAPI
+    # connection, so another worker's commit/rollback can undo a metadata update.
+    engine = create_engine(f"sqlite:///{tmp_path / 'scanner.db'}", connect_args={"check_same_thread": False, "timeout": 30})
     Base.metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
     monkeypatch.setattr(db, "_engine", engine)
     monkeypatch.setattr(db, "_SessionLocal", None)
     monkeypatch.setattr(config, "_cache", None)

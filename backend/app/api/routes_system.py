@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from .. import config as cfg
@@ -24,6 +25,41 @@ from ..version import __version__
 
 log = logging.getLogger(__name__)
 router = APIRouter()
+
+
+@router.post("/system/backups")
+def create_backup():
+    from ..core import upkeep
+    try:
+        if not load_settings().security.auth_enabled and upkeep.contains_credentials():
+            raise ValueError("Sicherung enthaelt Anmeldedaten. Bitte die Anmeldung fuer den Web-Download aktivieren oder bei gestopptem Container lokal sichern.")
+        return upkeep.backup()
+    except (OSError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@router.get("/system/backups/{backup_id}")
+def download_backup(backup_id: str):
+    from ..core import upkeep
+    try:
+        path = upkeep.backup_path(backup_id)
+        if not load_settings().security.auth_enabled:
+            import json, zipfile
+            with zipfile.ZipFile(path) as archive:
+                credentials = json.loads(archive.read("backup-manifest.json")).get("contains_credentials", True)
+            if credentials:
+                raise HTTPException(409, "Sicherung mit Anmeldedaten erfordert aktivierte Anmeldung.")
+        return FileResponse(path, media_type="application/zip", filename=f"optimizarr-{backup_id}.zip")
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.post("/system/maintenance")
+def run_maintenance():
+    from ..core import upkeep
+    result = upkeep.prune()
+    bus.publish("history", {"message": "Metadaten nach Aufbewahrungsregeln bereinigt."})
+    return result
 
 
 @router.get("/system/info")

@@ -280,7 +280,11 @@ def _target_path(source: str, plan: EncodePlan, settings: AppSettings) -> str:
     suffix = f".{plan.container}"
     cfg = settings.output
     if cfg.mode == "sidecar":
+        if not cfg.sidecar_suffix.strip():
+            raise ValueError("Namenszusatz darf nicht leer sein.")
         return str(src.with_name(f"{src.stem}{cfg.sidecar_suffix}{suffix}"))
+    if cfg.mode == "separate_dir" and not cfg.output_dir:
+        raise ValueError("Separater Ausgabeordner fehlt.")
     if cfg.mode == "separate_dir" and cfg.output_dir:
         out_root = Path(cfg.output_dir)
         # Mirror the library layout underneath the output directory.
@@ -355,12 +359,68 @@ def _journal_write(entry: dict[str, Any]) -> Path:
     return path
 
 
+def _fingerprint(path: str | Path) -> list[int] | None:
+    """Identity of a regular file; never follow a substituted symlink."""
+    import stat
+    try:
+        st = os.lstat(path)
+        if stat.S_ISREG(st.st_mode):
+            return [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns]
+    except OSError:
+        pass
+    return None
+
+
+def _owned(path: str | Path, fingerprint: list[int] | None) -> bool:
+    return fingerprint is not None and _fingerprint(path) == fingerprint
+
+
+def _publish_new(staging: Path, target: str) -> None:
+    """Publish without replacing a target created by another writer."""
+    try:
+        os.link(staging, target)
+    except FileExistsError:
+        raise FileExistsError(f"Ziel {target} existiert bereits - nichts ersetzt.") from None
+    except OSError as exc:
+        # No portable atomic no-replace rename exists on all supported mounts.
+        # Refuse instead of silently falling back to a destructive replace.
+        raise OSError(f"Ziel kann nicht sicher ohne Ueberschreiben angelegt werden: {target}: {exc}") from exc
+    staging.unlink()
+    _fsync_dir(Path(target).parent)
+
+
+def finish_commit(job_id: int) -> None:
+    """Remove only this job's reconciled, unchanged output journal."""
+    for path in COMMIT_JOURNAL_DIR.glob("*.json"):
+        entry = json.loads(path.read_text(encoding="utf-8"))
+        if (entry.get("reconciliation") or {}).get("job_id") == job_id:
+            if entry.get("phase") != "filesystem_done" or not _owned(entry["target"], entry.get("output_fingerprint")):
+                raise OSError("Ausgabe hat sich vor Abschluss der Verbuchung veraendert.")
+            path.unlink()
+            durable.sync_dir(path.parent)
+
+
+def pending_commits() -> dict[str, set[int]]:
+    result = {"jobs": set(), "files": set()}
+    for path in COMMIT_JOURNAL_DIR.glob("*.json"):
+        try:
+            entry = json.loads(path.read_text(encoding="utf-8"))
+            data = entry.get("reconciliation") or {}
+            for key, field in (("jobs", "job_id"), ("files", "file_id")):
+                if type(data.get(field)) is int:
+                    result[key].add(data[field])
+        except (OSError, ValueError, AttributeError):
+            log.error("unreadable commit journal preserved: %s", path)
+    return result
+
+
 def _commit_output(
     source: str, temp_out: str, plan: EncodePlan, settings: AppSettings,
     info: ffmpeg.MediaInfo,
     source_signature: tuple[int, int] | None = None,
     library_root: str | None = None,
     notes: list[str] | None = None,
+    reconciliation: dict[str, Any] | None = None,
 ) -> str:
     """Put the finished file in its final place, safely.
 
@@ -370,11 +430,15 @@ def _commit_output(
     """
     target = _target_path(source, plan, settings)
     replacing = settings.output.mode == "replace"
-    same = os.path.abspath(target) == os.path.abspath(source)
-    if replacing and not same and os.path.lexists(target):
+    same = os.path.normcase(os.path.realpath(target)) == os.path.normcase(os.path.realpath(source))
+    if os.path.lexists(target) and os.path.exists(source):
+        same = same or os.path.samefile(target, source)
+    if not replacing and same:
+        raise ValueError("Ausgabedatei und Quelle sind identisch - Original bleibt unveraendert.")
+    if not same and os.path.lexists(target):
         # Film.avi -> Film.mkv next to an unrelated Film.mkv: os.replace would
-        # destroy that file without it ever reaching the trash.  (Sidecar and
-        # separate-dir targets are our own earlier output and may be replaced.)
+        # destroy that file without it ever reaching the trash. Existing sidecar
+        # and separate-dir targets also require an explicit conflict resolution.
         raise FileExistsError(
             f"Ziel {target} existiert bereits und ist nicht die Quelle - nichts ersetzt."
         )
@@ -391,20 +455,31 @@ def _commit_output(
             free_backup_path(source) if action == "keep"
             else Path(source).with_name(f"{BACKUP_PREFIX}{uuid.uuid4().hex[:8]}-{Path(source).name}")
         )
-    journal = _journal_write({
+    entry = {
         "staging": str(staging), "source": source, "target": target,
         "backup": str(backup) if backup else "", "replace": replacing,
         "action": action, "created": time.time(),
-    })
+        "version": 2, "phase": "prepared", "source_fingerprint": _fingerprint(source),
+        "reconciliation": reconciliation,
+    }
+    journal = _journal_write(entry)
+
+    def checkpoint(phase: str) -> None:
+        entry["phase"] = phase
+        if phase == "staged":
+            entry["output_fingerprint"] = _fingerprint(staging)
+        durable.write_json(journal, entry)
     committed = False
     try:
         _stage_and_replace(
             source, temp_out, staging, target, settings,
             expected=source_signature, library_root=library_root, backup=backup, notes=notes,
             original_info={k: v for k, v in asdict(info).items() if k != "raw"},
+            checkpoint=checkpoint,
         )
+        checkpoint("filesystem_done")
         committed = True
-    except BaseException:
+    except BaseException as exc:
         # Never leave a full-size hidden copy in the library - but only while
         # the original is still in place.  Otherwise the staging copy is one
         # of the two files the library still has.
@@ -416,9 +491,13 @@ def _commit_output(
                 "and %s for manual recovery", source, staging, backup,
             )
             journal = None  # the next start rolls it back
+        if isinstance(exc, Exception) and journal is not None and _roll_back_commit(entry):
+            journal.unlink(missing_ok=True)
+            durable.sync_dir(journal.parent)
+            journal = None
         raise
     finally:
-        if journal is not None and committed:
+        if journal is not None and committed and reconciliation is None:
             journal.unlink(missing_ok=True)
             durable.sync_dir(journal.parent)
     return target
@@ -453,6 +532,7 @@ def _stage_and_replace(
     backup: Path | None = None,
     notes: list[str] | None = None,
     original_info: dict | None = None,
+    checkpoint=None,
 ) -> None:
     # --- 1. stage the new file next to its destination, durable ----------- #
     _ensure_room(staging.parent, os.path.getsize(temp_out), temp_out, "die neue Datei")
@@ -474,10 +554,14 @@ def _stage_and_replace(
             pass
     _fsync_file(staging)
     _fsync_dir(staging.parent)
+    if checkpoint:
+        checkpoint("staged")
+    _check_source_unchanged(source, expected)
 
     if settings.output.mode != "replace":
-        os.replace(str(staging), target)
-        _fsync_dir(Path(target).parent)
+        _publish_new(staging, target)
+        if checkpoint:
+            checkpoint("published")
         return
 
     # --- 2. everything that can refuse, before the original is touched --- #
@@ -495,6 +579,8 @@ def _stage_and_replace(
             )
         how = _secure_original(source, backup)
         try:
+            if checkpoint:
+                checkpoint("original_secured")
             os.replace(str(staging), target)
         except BaseException:
             if how == "link":
@@ -503,6 +589,8 @@ def _stage_and_replace(
                 _restore_original(source, backup)
             raise
         _fsync_dir(Path(target).parent)
+        if checkpoint:
+            checkpoint("published")
         if action == "keep":
             return  # the backup name *is* the kept original
         try:
@@ -520,8 +608,9 @@ def _stage_and_replace(
         return
 
     # --- 3b. new name (Film.avi -> Film.mkv): place it, then clear the old - #
-    os.replace(str(staging), target)
-    _fsync_dir(Path(target).parent)
+    _publish_new(staging, target)
+    if checkpoint:
+        checkpoint("published")
     try:
         if action == "trash":
             _move_to_trash(source, settings, library_root, dest=trash_dest, replacement=target, original_info=original_info)
@@ -565,11 +654,22 @@ def recover_interrupted_commits() -> int:
         try:
             entry = json.loads(entry_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            entry_path.unlink(missing_ok=True)
+            log.error("unreadable commit journal preserved: %s", entry_path)
             continue
         try:
-            done = _roll_back_commit(entry)
-        except OSError as exc:
+            replay = entry.get("reconciliation")
+            target_owned = _owned(entry.get("target", ""), entry.get("output_fingerprint"))
+            irreversible = target_owned and not os.path.lexists(entry.get("backup") or "") and (
+                not entry.get("replace") or not os.path.lexists(entry.get("source", ""))
+                or os.path.abspath(entry["target"]) == os.path.abspath(entry["source"])
+            )
+            if replay and target_owned and (entry.get("phase") == "filesystem_done" or irreversible):
+                from .encoder import reconcile_commit
+                reconcile_commit(entry)
+                done = True
+            else:
+                done = _roll_back_commit(entry)
+        except Exception as exc:
             log.error("could not roll back interrupted commit %s: %s", entry, exc)
             done = False
         if done:
@@ -587,19 +687,47 @@ def _roll_back_commit(entry: dict[str, Any]) -> bool:
     if not staging.name.startswith(STAGING_PREFIX) or not source:
         return True  # not ours - nothing to do
 
+    if entry.get("version") == 2:
+        output_fp = entry.get("output_fingerprint")
+        original_fp = entry.get("source_fingerprint")
+        target_exists = os.path.lexists(target)
+        target_owned = _owned(target, output_fp)
+        original_present = _owned(source, original_fp)
+        if backup is not None and os.path.lexists(backup):
+            if not _owned(backup, original_fp) or (os.path.lexists(source) and not original_present and not _owned(source, output_fp)):
+                log.error("interrupted commit: changed source/backup; preserving every file: %s", entry)
+                return False
+            if original_present:
+                backup.unlink()
+            else:
+                _restore_original(source, backup)
+            original_present = True
+        if target_exists and os.path.abspath(target) != os.path.abspath(source):
+            if target_owned and (original_present or not replacing):
+                os.unlink(target)
+            elif not target_owned:
+                # An unrelated writer owns this path. Never delete it.
+                log.warning("interrupted commit: preserving foreign target %s", target)
+        if staging.exists():
+            if not _owned(staging, output_fp) or (replacing and not original_present):
+                return False
+            staging.unlink()
+        if replacing and not original_present and target_owned:
+            log.error("interrupted commit requires manual reconciliation: %s", entry)
+            return False
+        return True
+
     if backup is not None and os.path.lexists(backup):
         if os.path.lexists(source) and os.path.samefile(source, backup):
             backup.unlink()  # only the safety link was made
+        elif os.path.lexists(source):
+            log.error("legacy journal cannot prove ownership of %s; preserving both files", source)
+            return False
         else:
             _restore_original(source, backup)
         log.warning("interrupted commit: %s restored", source)
-    if (
-        replacing and target and os.path.abspath(target) != os.path.abspath(source)
-        and os.path.lexists(target) and not staging.exists() and os.path.lexists(source)
-    ):
-        # The new file was placed next to an original that is still there.
-        os.unlink(target)
-        log.warning("interrupted commit: removed unfinished %s", target)
+    # Legacy journals have no proof of ownership for a separate target.
+    # Preserve it even when an interrupted conversion might have created it.
     if staging.exists():
         if replacing and not os.path.lexists(source):
             log.error("interrupted commit: %s is missing - keeping %s", source, staging)

@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import config, db, main
 from app.config import AppSettings
-from app.core import encoder, planner, scanner, worker
+from app.core import encoder, planner, scanner, scratch, worker
 from app.core.ffmpeg import MediaInfo
 from app.models import Base, FileState, HistoryEntry, Job, JobState, MediaFile, ScanRun
 
@@ -99,6 +99,21 @@ def test_full_scratch_disk_holds_the_queue_instead_of_failing_it(tmp_path, monke
     status = w.status()
     assert status["blocked_kind"] == "disk"
     assert "Speicher" in status["blocked_reason"]
+
+
+def test_reservation_shortage_remains_visible_and_leaves_job_queued(tmp_path, monkeypatch):
+    _, job_id, file_id = queued_job(tmp_path)
+    config.update_settings({"queue": {"min_free_disk_gb": 0}})
+    monkeypatch.setattr(scratch.shutil, "disk_usage", lambda _: SimpleNamespace(free=400 * 1024**2))
+    run_job = AsyncMock()
+    monkeypatch.setattr(encoder, "run_job", run_job)
+    w = worker.QueueWorker()
+    asyncio.run(w._tick())
+    assert not run_job.called
+    job, _ = rows(job_id, file_id)
+    assert job.state == JobState.QUEUED.value
+    assert w.status()["blocked_kind"] == "disk"
+    assert "naechster Job braucht" in w.status()["blocked_reason"]
 
 
 def test_status_reports_the_kind_of_block(monkeypatch):

@@ -28,6 +28,18 @@ export function SystemTab({
     },
     onError: (e: Error) => push(e.message, "error"),
   });
+  const backup = useMutation({
+    mutationFn: endpoints.createBackup,
+    onError: (e: Error) => push(e.message, "error"),
+  });
+  const maintenance = useMutation({
+    mutationFn: endpoints.runMaintenance,
+    onSuccess: (counts) => {
+      push(`${Object.values(counts).reduce((sum, count) => sum + count, 0)} alte Einträge entfernt.`, "success");
+      queryClient.invalidateQueries();
+    },
+    onError: (e: Error) => push(e.message, "error"),
+  });
 
   return (
     <div className="space-y-4">
@@ -83,6 +95,28 @@ export function SystemTab({
             </div>
           ))}
         </dl>
+      </Panel>
+
+      <Panel title="Aufbewahrung und Sicherung">
+        <div className="grid gap-5 md:grid-cols-2">
+          {([
+            ["history_retention_days", "Verlauf aufbewahren", 0, 3650],
+            ["job_retention_days", "Abgeschlossene Jobs aufbewahren", 0, 3650],
+            ["scan_retention_days", "Scanverlauf aufbewahren", 0, 3650],
+            ["restored_manifest_retention_days", "Protokolle abgeschlossener Wiederherstellungen", 0, 3650],
+            ["max_learning_samples", "Lernmessungen behalten", 2000, 100000],
+            ["max_backups", "Sicherungen behalten", 1, 100],
+          ] as const).map(([key, label, min, max]) => <Field key={key} label={label} hint={key.endsWith("days") ? "Tage; 0 bewahrt dauerhaft auf." : undefined}>
+            <NumberField value={draft.maintenance[key]} onChange={(value) => update("maintenance", { [key]: value })} min={min} max={max} ariaLabel={label} />
+          </Field>)}
+        </div>
+        <p className="hint mt-4">Die Bereinigung läuft täglich. Konvertierte Dateien und ihre verbuchte Ersparnis bleiben erhalten. Offene Jobs und Papierkorb-Originale haben eigene Aufbewahrungsregeln.</p>
+        <div className="mt-4 flex flex-wrap items-center gap-3">
+          <button className="btn-ghost" disabled={maintenance.isPending} onClick={() => maintenance.mutate()}>Jetzt bereinigen</button>
+          <button className="btn-ghost" disabled={backup.isPending} onClick={() => backup.mutate()}>Konfiguration sichern</button>
+          {backup.data && <a className="btn-ghost" href={backup.data.download_url} download>Sicherung herunterladen</a>}
+        </div>
+        <p className="hint mt-3">Für eine Sicherung müssen laufende Jobs und Scans beendet sein. Sie enthält Datenbank, Einstellungen, Anmeldedaten und Wiederherstellungsprotokolle. Mediendateien separat sichern. <a className="text-brand-400 underline" href="https://github.com/gottschalkfelix4-source/optimizarr/blob/main/docs/BETRIEB.md" target="_blank" rel="noreferrer">Anleitung zur Wiederherstellung bei gestopptem Container</a></p>
       </Panel>
 
       <Panel title="Zurücksetzen" subtitle="Setzt alle Einstellungen auf die Werkseinstellung zurück">

@@ -61,7 +61,7 @@ describe("LiveProvider", () => {
     expect(spy).not.toHaveBeenCalled();
     act(() => vi.advanceTimersByTime(2000));
     const keys = spy.mock.calls.map(([filters]) => (filters as { queryKey: string[] }).queryKey[0]);
-    expect(keys.sort()).toEqual(["files", "stats"]);
+    expect(keys.sort()).toEqual(["files", "movies", "series", "stats"]);
     for (const call of spy.mock.calls) expect(call[1]).toEqual({ cancelRefetch: false });
   });
 

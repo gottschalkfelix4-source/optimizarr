@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from sqlalchemy import select, update
+from sqlalchemy.orm import load_only
 
 from ..config import AppSettings, TRANSCODE_DIR, load_settings
 from ..db import session_scope
@@ -20,7 +21,7 @@ from ..models import FileState, HistoryEntry, LibraryPath, MediaFile, ScanRun, u
 from . import analyzer, ffmpeg, hwaccel
 from .advisor import get_advisor
 from .events import bus
-from . import maintenance
+from . import maintenance, background
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +34,8 @@ class ScanState:
     run_id: int | None = None
     running: bool = False
     cancel: asyncio.Event | None = None
+    disk_cancel: threading.Event | None = None
+    loop: asyncio.AbstractEventLoop | None = None
     phase: str = "idle"
     total: int = 0
     done: int = 0
@@ -53,6 +56,15 @@ class ScanState:
 
 
 state = ScanState()
+
+
+class ScanCancelled(Exception):
+    pass
+
+
+def _check_cancel(cancel: threading.Event | None) -> None:
+    if cancel is not None and cancel.is_set():
+        raise ScanCancelled(CANCELLED_MESSAGE)
 
 
 # --------------------------------------------------------------------------- #
@@ -114,6 +126,7 @@ def _own_dirs(settings: AppSettings) -> set[str]:
 
 def walk_paths(
     roots: list[tuple[int, str]], settings: AppSettings, report: WalkReport | None = None,
+    cancel: threading.Event | None = None,
 ) -> Iterator[tuple[int, str, int, float]]:
     """Yield (library_id, path, size, mtime) for every eligible video file."""
     report = report if report is not None else WalkReport()
@@ -135,12 +148,14 @@ def walk_paths(
             report.unreadable.append(str(exc.filename))
 
     for lib_id, root in roots:
+        _check_cancel(cancel)
         if not os.path.isdir(root):
             log.warning("Library path missing: %s", root)
             continue
         unreadable_before = len(report.unreadable)
         count = 0
         for dirpath, dirnames, filenames in os.walk(root, onerror=on_error, followlinks=follow):
+            _check_cancel(cancel)
             # Guard against symlink loops when following is enabled.
             if follow:
                 try:
@@ -171,6 +186,7 @@ def walk_paths(
             dirnames[:] = kept
 
             for name in filenames:
+                _check_cancel(cancel)
                 # Hidden files are never media: our own .optimizarr-staging-*
                 # leftovers, macOS "._" resource forks.
                 if name.startswith(".") or Path(name).stem.endswith(".original"):
@@ -342,7 +358,7 @@ def _is_below(path: str, folder: str) -> bool:
     return path == folder or path.startswith(folder + "/")
 
 
-def _sync_disk_to_db(settings: AppSettings, run_id: int) -> tuple[int, int, list[int]]:
+def _sync_disk_to_db(settings: AppSettings, run_id: int, cancel: threading.Event | None = None) -> tuple[int, int, list[int]]:
     """Upsert everything on disk.  Returns (seen, new, ids_needing_probe).
 
     The disk is walked first, without touching the database: on a slow or
@@ -361,7 +377,8 @@ def _sync_disk_to_db(settings: AppSettings, run_id: int) -> tuple[int, int, list
     # ---- walk, no database -------------------------------------------------
     report = WalkReport()
     entries: list[tuple[int, str, int, float]] = []
-    for entry in walk_paths(roots, settings, report):
+    walk = walk_paths(roots, settings, report, cancel) if cancel is not None else walk_paths(roots, settings, report)
+    for entry in walk:
         entries.append(entry)
         if len(entries) % 500 == 0:
             bus.publish("scan.progress", {
@@ -376,8 +393,12 @@ def _sync_disk_to_db(settings: AppSettings, run_id: int) -> tuple[int, int, list
 
     # ---- apply ---------------------------------------------------------------
     with session_scope() as s:
-        existing: dict[str, MediaFile] = {
-            mf.path: mf for mf in s.execute(select(MediaFile)).scalars().all()
+        # Compact inventory for missing-file detection. Heavy ORM rows live for
+        # only one batch, regardless of the size of the complete library.
+        existing = {
+            row.path: row for row in s.execute(select(
+                MediaFile.id, MediaFile.path, MediaFile.library_id, MediaFile.state,
+            ))
         }
 
         seen_paths: set[str] = set()
@@ -393,8 +414,15 @@ def _sync_disk_to_db(settings: AppSettings, run_id: int) -> tuple[int, int, list
         committed_at = time.monotonic()
 
         for index, (lib_id, path, size, mtime) in enumerate(entries, 1):
+            _check_cancel(cancel)
+            if index % 500 == 1:
+                paths = [entry[1] for entry in entries[index - 1:index + 499]]
+                batch_rows = {row.path: row for row in s.scalars(select(MediaFile).where(MediaFile.path.in_(paths)).options(load_only(
+                    MediaFile.id, MediaFile.path, MediaFile.library_id, MediaFile.state,
+                    MediaFile.ignored, MediaFile.size, MediaFile.mtime, MediaFile.last_seen, MediaFile.analyzed_at,
+                )))}
             seen_paths.add(path)
-            row = existing.get(path)
+            row = batch_rows.get(path)
             if row is None:
                 # `existing` is a snapshot.  An encode finishing mid-walk renames
                 # its row (Film.mp4 -> Film.mkv); inserting that path again broke
@@ -426,7 +454,10 @@ def _sync_disk_to_db(settings: AppSettings, run_id: int) -> tuple[int, int, list
                 bus.publish("scan.progress", {
                     "phase": "walk", "seen": len(seen_paths), "new": new_count, "current": path,
                 })
+                if index % 500 == 0:
+                    s.expunge_all()
 
+        _check_cancel(cancel)
         _mark_missing(s, existing, seen_paths, roots, report)
         s.commit()
         purged = _purge_missing(s)
@@ -534,6 +565,10 @@ def _mark_missing(
     for path, row in existing.items():
         if path in seen:
             continue
+        if not isinstance(row, MediaFile):
+            row = s.get(MediaFile, row.id)
+            if row is None:
+                continue
         s.refresh(row)  # may have been renamed by a finished encode
         if row.path in seen:
             continue
@@ -630,7 +665,7 @@ def _store_probe(file_id: int, info: ffmpeg.MediaInfo) -> None:
         # A queued or running job owns the state; a manual re-analysis turned
         # an encoding file into a candidate and _store_analysis then no longer
         # recognised it as busy.
-        if row.state not in (FileState.QUEUED.value, FileState.ENCODING.value):
+        if row.state not in (FileState.QUEUED.value, FileState.ENCODING.value, FileState.DONE.value, FileState.IGNORED.value):
             row.state = FileState.PROBED.value
         row.error = ""
 
@@ -639,6 +674,9 @@ def _store_analysis(file_id: int, result: analyzer.AnalysisResult) -> None:
     with session_scope() as s:
         row = s.get(MediaFile, file_id)
         if row is None:
+            return
+        if row.state == FileState.DONE.value:
+            # Realised savings and the completed encode plan remain authoritative.
             return
         row.estimated_size = result.estimated_size
         row.estimated_saving_bytes = max(0, result.estimated_saving_bytes)
@@ -650,7 +688,7 @@ def _store_analysis(file_id: int, result: analyzer.AnalysisResult) -> None:
         row.plan = result.plan.to_dict() if result.plan else None
         if result.advice is not None and result.advice.ok:
             row.advisor_note = result.advice.reasoning
-        if row.state not in (FileState.QUEUED.value, FileState.ENCODING.value):
+        if row.state not in (FileState.QUEUED.value, FileState.ENCODING.value, FileState.DONE.value, FileState.IGNORED.value):
             row.state = (
                 FileState.CANDIDATE.value if result.should_convert else FileState.SKIPPED.value
             )
@@ -661,7 +699,8 @@ def _mark_error(file_id: int, message: str) -> None:
         row = s.get(MediaFile, file_id)
         if row is None:
             return
-        row.state = FileState.FAILED.value
+        if row.state not in (FileState.DONE.value, FileState.IGNORED.value, FileState.QUEUED.value, FileState.ENCODING.value):
+            row.state = FileState.FAILED.value
         row.error = message[:2000]
 
 
@@ -686,12 +725,15 @@ async def run_scan(trigger: str = "manual", analyze_only_ids: list[int] | None =
     leave ``state.running`` set, or no scan and no queued encode would ever
     start again until a restart.
     """
-    if state.running or maintenance.active:
+    if state.running or maintenance.active or background.stopping:
         return {"ok": False, "error": BUSY_MESSAGE}
 
     cancel = asyncio.Event()
+    disk_cancel = threading.Event()
     state.running = True
     state.cancel = cancel
+    state.disk_cancel = disk_cancel
+    state.loop = asyncio.get_running_loop()
     state.phase = "walk"
     state.done = 0
     state.total = 0
@@ -700,7 +742,7 @@ async def run_scan(trigger: str = "manual", analyze_only_ids: list[int] | None =
     state.run_id = None
 
     run_id: int | None = None
-    probed = analyzed = candidates = 0
+    probed = analyzed = candidates = errors = 0
     error_message = ""
 
     try:
@@ -725,7 +767,16 @@ async def run_scan(trigger: str = "manual", analyze_only_ids: list[int] | None =
         dv_reprobe = analyze_only_ids is None and _dv_reprobe_pending()
         converted_refresh = analyze_only_ids is None and _converted_refresh_pending()
         if analyze_only_ids is None:
-            seen, new_count, todo = await asyncio.to_thread(_sync_disk_to_db, settings, run_id)
+            work = asyncio.create_task(asyncio.to_thread(_sync_disk_to_db, settings, run_id, disk_cancel))
+            try:
+                seen, new_count, todo = await asyncio.shield(work)
+            except asyncio.CancelledError:
+                disk_cancel.set()
+                try:
+                    await work
+                except ScanCancelled:
+                    pass
+                raise
             _log_history("info", "scan",
                          f"Scan gestartet: {seen} Dateien gefunden, {new_count} neu.")
         else:
@@ -752,7 +803,7 @@ async def run_scan(trigger: str = "manual", analyze_only_ids: list[int] | None =
         probe_ok: list[tuple[int, ffmpeg.MediaInfo]] = []
 
         async def probe_one(file_id: int) -> None:
-            nonlocal probed
+            nonlocal probed, errors
             if cancel.is_set():
                 return
             async with probe_sem:
@@ -769,9 +820,11 @@ async def run_scan(trigger: str = "manual", analyze_only_ids: list[int] | None =
                 try:
                     info = await ffmpeg.probe(path)
                 except ffmpeg.FFmpegError as exc:
+                    errors += 1
                     if file_id not in dv_only:   # a DV check alone never fails a file
                         await asyncio.to_thread(_mark_error, file_id, str(exc))
                     log.warning("probe failed for %s: %s", path, exc)
+                    await asyncio.to_thread(_log_history, "error", "scan", f"Datei nicht lesbar: {exc}", file_id)
                 if info is not None and (
                     file_id not in dv_only or ffmpeg.is_dolby_vision(info.hdr_format)
                 ):
@@ -828,7 +881,7 @@ async def run_scan(trigger: str = "manual", analyze_only_ids: list[int] | None =
         workroot = TRANSCODE_DIR
 
         async def analyze_one(file_id: int, info: ffmpeg.MediaInfo) -> None:
-            nonlocal analyzed, candidates
+            nonlocal analyzed, candidates, errors
             if cancel.is_set():
                 return
             async with analyze_sem:
@@ -844,7 +897,9 @@ async def run_scan(trigger: str = "manual", analyze_only_ids: list[int] | None =
                     if cancel.is_set():
                         return
                     log.exception("analysis failed for %s", info.path)
+                    errors += 1
                     await asyncio.to_thread(_mark_error, file_id, f"Analyse fehlgeschlagen: {exc}")
+                    await asyncio.to_thread(_log_history, "error", "scan", f"Analyse fehlgeschlagen: {exc}", file_id)
                     return
                 if cancel.is_set():
                     # An analysis cut short (trial encodes terminated, advisor
@@ -879,7 +934,11 @@ async def run_scan(trigger: str = "manual", analyze_only_ids: list[int] | None =
             if queued:
                 _log_history("info", "queue", f"{queued} Dateien automatisch eingereiht.")
 
-    except asyncio.CancelledError:
+        if errors:
+            error_message = f"{errors} Datei(en) konnten nicht vollstaendig geprueft werden."
+            _safe_history("warning", "scan", error_message)
+
+    except (asyncio.CancelledError, ScanCancelled):
         error_message = CANCELLED_MESSAGE
         _safe_history("warning", "scan", "Scan wurde abgebrochen.")
     except Exception as exc:
@@ -907,11 +966,13 @@ async def run_scan(trigger: str = "manual", analyze_only_ids: list[int] | None =
         state.phase = "idle"
         state.current = ""
         state.cancel = None
+        state.disk_cancel = None
+        state.loop = None
         bus.publish("scan.finished", {
             "run_id": run_id, "probed": probed, "analyzed": analyzed,
             "candidates": candidates, "error": error_message,
         })
-        if _has_pending_analysis():
+        if _has_pending_analysis() and not background.stopping:
             # Re-evaluations requested while this scan ran.
             asyncio.get_running_loop().call_soon(_start_pending_analysis)
 
@@ -958,11 +1019,17 @@ async def _gather_limited(coros: list[Any], cancel: asyncio.Event) -> None:
             for t in tasks:
                 if not t.done():
                     t.cancel()
-        await gathered
+        results = await gathered
+        failures = [result for result in results if isinstance(result, Exception)]
+        if failures:
+            for failure in failures:
+                log.error("scan task failed", exc_info=(type(failure), failure, failure.__traceback__))
+            raise RuntimeError(f"{len(failures)} Scan-Aufgabe(n) fehlgeschlagen: {failures[0]}") from failures[0]
     except asyncio.CancelledError:
         for t in tasks:
             if not t.done():
                 t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         raise
     finally:
         stopper.cancel()
@@ -1009,7 +1076,19 @@ def _auto_queue(settings: AppSettings) -> int:
 
 def cancel_scan() -> bool:
     if state.running and state.cancel is not None:
-        state.cancel.set()
+        if state.disk_cancel is not None:
+            state.disk_cancel.set()
+        if state.loop is not None and state.loop.is_running():
+            try:
+                same_loop = asyncio.get_running_loop() is state.loop
+            except RuntimeError:
+                same_loop = False
+            if same_loop:
+                state.cancel.set()
+            else:
+                state.loop.call_soon_threadsafe(state.cancel.set)
+        else:
+            state.cancel.set()
         return True
     return False
 
@@ -1061,14 +1140,14 @@ def request_analysis(file_ids: list[int]) -> bool:
 
 def _start_pending_analysis() -> None:
     """On the event loop: start the analysis run for everything requested."""
-    if state.running:
+    if state.running or background.stopping:
         return  # run_scan comes back here when it finishes
     with _pending_lock:
         ids = sorted(_pending_analysis)
         _pending_analysis.clear()
     if not ids:
         return
-    task = asyncio.ensure_future(_run_pending(ids))
+    task = background.spawn(_run_pending(ids), "optimizarr-settings-analysis")
     _background.add(task)
     task.add_done_callback(_background.discard)
 

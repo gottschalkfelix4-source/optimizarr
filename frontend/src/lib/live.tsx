@@ -46,7 +46,7 @@ const LiveContext = createContext<LiveContextValue>({
 export const INVALIDATION_MAP: Record<string, string[]> = {
   "scan.started": ["scan", "system"],
   "scan.finished": ["scan", "files", "series", "movies", "stats", "system", "history"],
-  "file.analyzed": ["files", "stats"],
+  "file.analyzed": ["files", "stats", "series", "movies"],
   "job.started": ["jobs", "files", "series", "movies", "system"],
   "job.finished": ["trash", "jobs", "files", "series", "movies", "stats", "history", "system", "model"],
   "queue.changed": ["jobs", "files", "series", "movies", "system", "settings"],

@@ -1,6 +1,6 @@
 """Shared results and exceptions for encoding and output validation."""
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 @dataclass
 class EncodeOutcome:
@@ -13,6 +13,7 @@ class EncodeOutcome:
     vmaf: float | None = None          # on the VMAF scale
     quality_metric: str = ""
     quality_value: float | None = None
+    quality_details: dict = field(default_factory=dict)
     elapsed: float = 0.0
     log_tail: str = ""
     fell_back_to_cpu: bool = False

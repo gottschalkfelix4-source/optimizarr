@@ -27,6 +27,7 @@ import {
   ignoreAction,
   isDolbyVision,
   percent,
+  qualityLabel,
   relativeTime,
   resolutionLabel,
   STATE_LABELS,
@@ -87,7 +88,9 @@ export default function Library() {
   const [page, setPage] = useState(1);
   // Selected file -> its estimated saving.  Kept across pages, so the sum
   // covers every selected file, not only those on the page in view.
-  const [selected, setSelected] = useState<Map<number, number>>(new Map());
+  const [selected, setSelected] = useState<Map<number, { saving: number; force: boolean }>>(new Map());
+  const selectable = (file: MediaFile) => file.state === "candidate" || FORCEABLE_STATES.has(file.state);
+  const selection = (file: MediaFile) => ({ saving: file.estimated_saving_bytes, force: file.ignored || file.state !== "candidate" });
 
   // The open file lives in the URL (?file=), so the browser's back button
   // closes the dialog and links from other pages open it directly.
@@ -146,7 +149,7 @@ export default function Library() {
   }, [data, page]);
 
   const enqueue = useMutation({
-    mutationFn: (fileIds: number[]) => endpoints.enqueue({ file_ids: fileIds }),
+    mutationFn: ({ fileIds, force = false }: { fileIds: number[]; force?: boolean }) => endpoints.enqueue({ file_ids: fileIds, force }),
     onSuccess: (result) => {
       push(result.message, result.added ? "success" : "info");
       setSelected(new Map());
@@ -171,13 +174,26 @@ export default function Library() {
   });
 
   const items = data?.items ?? [];
-  const allSelected = items.length > 0 && items.every((f) => selected.has(f.id));
+  const selectableItems = items.filter(selectable);
+  const allSelected = selectableItems.length > 0 && selectableItems.every((f) => selected.has(f.id));
+
+  useEffect(() => {
+    setSelected((prev) => {
+      const next = new Map(prev);
+      for (const file of items) {
+        if (!next.has(file.id)) continue;
+        if (!selectable(file)) next.delete(file.id);
+        else next.set(file.id, selection(file));
+      }
+      return next;
+    });
+  }, [data]);
 
   const toggleAll = () => {
     setSelected((prev) => {
       const next = new Map(prev);
-      if (allSelected) items.forEach((f) => next.delete(f.id));
-      else items.forEach((f) => next.set(f.id, f.estimated_saving_bytes));
+      if (allSelected) selectableItems.forEach((f) => next.delete(f.id));
+      else selectableItems.forEach((f) => next.set(f.id, selection(f)));
       return next;
     });
   };
@@ -186,18 +202,20 @@ export default function Library() {
     setSelected((prev) => {
       const next = new Map(prev);
       if (next.has(file.id)) next.delete(file.id);
-      else next.set(file.id, file.estimated_saving_bytes);
+      else if (selectable(file)) next.set(file.id, selection(file));
       return next;
     });
 
   const selectedSaving = useMemo(
-    () => [...selected.values()].reduce((sum, saving) => sum + Math.max(0, saving), 0),
+    () => [...selected.values()].reduce((sum, entry) => sum + (entry.force ? 0 : Math.max(0, entry.saving)), 0),
     [selected],
   );
   const selectedElsewhere = useMemo(
     () => [...selected.keys()].filter((id) => !items.some((f) => f.id === id)).length,
     [selected, items],
   );
+  const candidates = [...selected].filter(([, entry]) => !entry.force).map(([id]) => id);
+  const excluded = [...selected].filter(([, entry]) => entry.force).map(([id]) => id);
 
   return (
     <div className="space-y-4">
@@ -263,14 +281,22 @@ export default function Library() {
             <button className="btn-ghost btn-sm" onClick={() => setSelected(new Map())}>
               Auswahl aufheben
             </button>
-            <button
+            {candidates.length > 0 && <button
               className="btn-primary btn-sm"
-              onClick={() => enqueue.mutate([...selected.keys()])}
+              onClick={() => enqueue.mutate({ fileIds: candidates })}
               disabled={enqueue.isPending}
             >
               {enqueue.isPending ? <Spinner className="size-3.5" /> : <Play className="size-3.5" aria-hidden="true" />}
-              Konvertieren
-            </button>
+              {excluded.length ? `Kandidaten konvertieren (${candidates.length})` : "Konvertieren"}
+            </button>}
+            {excluded.length > 0 && <button
+              className="btn-ghost btn-sm"
+              onClick={() => enqueue.mutate({ fileIds: excluded, force: true })}
+              disabled={enqueue.isPending}
+              title="Ignorieren und Analyseentscheidung für diese Auswahl ausdrücklich übergehen"
+            >
+              <Zap className="size-3.5" aria-hidden="true" /> Konvertieren erzwingen ({excluded.length})
+            </button>}
           </div>
         )}
       </div>
@@ -304,6 +330,7 @@ export default function Library() {
                     <input
                       type="checkbox"
                       checked={allSelected}
+                      disabled={selectableItems.length === 0}
                       onChange={toggleAll}
                       className="size-4 cursor-pointer rounded border-ink-600 bg-ink-800 accent-brand-500"
                       aria-label="Alle auf dieser Seite auswählen"
@@ -328,7 +355,7 @@ export default function Library() {
                     selected={selected.has(file.id)}
                     onToggle={() => toggleOne(file)}
                     onOpen={() => openDetail(file.id)}
-                    onQueue={() => enqueue.mutate([file.id])}
+                    onQueue={() => enqueue.mutate({ fileIds: [file.id] })}
                     onIgnore={(ignored) => ignore.mutate({ id: file.id, ignored })}
                   />
                 ))}
@@ -390,6 +417,7 @@ function FileRow({
         <input
           type="checkbox"
           checked={selected}
+          disabled={file.state !== "candidate" && !FORCEABLE_STATES.has(file.state)}
           onChange={onToggle}
           className="size-4 cursor-pointer rounded border-ink-600 bg-ink-800 accent-brand-500"
           aria-label={`${file.name} auswählen`}
@@ -678,6 +706,12 @@ function FileDetail({ fileId, onClose }: { fileId: number | null; onClose: () =>
           )}
 
           {file.error && <Callout tone="danger">{file.error}</Callout>}
+
+          {file.measured_vmaf != null && (
+            <p className="text-sm text-ink-300">
+              Ergebnisprüfung: {qualityLabel({ ...file, vmaf: file.measured_vmaf })}
+            </p>
+          )}
 
           {/* --- source vs target --- */}
           <div className="grid gap-4 sm:grid-cols-2">
