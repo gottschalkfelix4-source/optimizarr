@@ -335,7 +335,7 @@ class AdvisorSettings(BaseModel):
 
     # --- ChatGPT sign-in (Codex).  Tokens live in the oauth_credentials table. ---
     codex_model: str = Field(
-        "gpt-6-astra",
+        "gpt-6.1-sol",
         description=(
             "Model requested over the ChatGPT backend. Slugs rotate and depend on the "
             "plan - the settings screen can fetch the account's actual list."

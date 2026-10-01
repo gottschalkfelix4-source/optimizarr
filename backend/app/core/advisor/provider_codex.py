@@ -47,15 +47,18 @@ MODELS_URL = f"{BASE_URL}/models"
 #: documented cause of 403s.  The user agent is built to match the CLI's shape
 #: for the same reason.
 ORIGINATOR = codex_oauth.ORIGINATOR
-# Compatibility baseline: Codex 0.153.4 includes Astra in its model picker.
+# Compatibility baseline: Codex 0.159.3; GPT-6.1 Sol entered the catalog in 0.159.1.
 # https://learn.chatgpt.com/docs/changelog
-CLIENT_VERSION = "0.153.4"
+CLIENT_VERSION = "0.159.3"
 
 #: Fallback list only.  Model slugs rotate and depend on the account's plan, so
 #: the real list is fetched from the backend and cached; this is what the UI
 #: offers when that call fails.
 FALLBACK_MODELS = [
+    "gpt-6.1-sol",
     "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",

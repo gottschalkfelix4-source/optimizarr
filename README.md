@@ -118,15 +118,15 @@ nicht selbst auffangen. Der Anmelde-Assistent führt deshalb durch drei Schritte
 Feld kopieren. Wer das Codex-CLI schon eingerichtet hat, kann stattdessen den Inhalt von
 `~/.codex/auth.json` einfügen.
 
-Die Codex-Anbindung im Image verwendet den Kompatibilitaetsstand **0.153.4**
-und bietet **GPT-6 Astra** (`gpt-6-astra`) als Standard fuer neue Konfigurationen an.
+Die Codex-Anbindung im Image verwendet den Kompatibilitaetsstand **0.159.3**
+und bietet **GPT-6.1 Sol** (`gpt-6.1-sol`) als Standard fuer neue Konfigurationen an.
 Sie ist direkt in Optimizarr implementiert; eine separate Codex-CLI wird nicht gestartet.
 Nach einem Image-Update bleiben gespeicherte Modelleinstellungen erhalten.
 Zum Wechsel unter **Einstellungen → KI-Berater → ChatGPT-Anmeldung** auf
-**GPT-6 Astra verwenden** klicken, speichern und **Testen** ausfuehren.
-**Liste abrufen** aktualisiert die vom Konto gemeldeten Modelle; ob Astra nutzbar ist,
+**GPT-6.1 Sol verwenden** klicken, speichern und **Testen** ausfuehren.
+**Liste abrufen** aktualisiert die vom Konto gemeldeten Modelle; ob Sol 6.1 nutzbar ist,
 haengt vom Kontozugang ab. Siehe [Codex-Modelle](https://learn.chatgpt.com/docs/models)
-und [Codex 0.153.4](https://learn.chatgpt.com/docs/changelog).
+und [Codex 0.159.3 / GPT-6.1 Sol](https://learn.chatgpt.com/docs/changelog).
 
 ---
 

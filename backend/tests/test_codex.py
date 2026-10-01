@@ -142,7 +142,7 @@ def test_secrets_are_redacted_from_text():
 # Request shape for the ChatGPT backend
 # --------------------------------------------------------------------------- #
 
-@pytest.mark.parametrize("model", ["gpt-6-astra", "gpt-5.6-sol"])
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "gpt-6-astra", "gpt-5.6-sol"])
 def test_request_body_obeys_the_backend_constraints(model):
     provider = CodexProvider(
         AdvisorSettings(provider="openai_codex", codex_model=model)
@@ -198,34 +198,36 @@ def test_headers_survive_a_missing_account_id():
 def test_fallback_model_list_has_no_retired_slugs():
     assert "gpt-5-codex" not in FALLBACK_MODELS      # historical slug
     assert "codex-mini-latest" not in FALLBACK_MODELS
-    assert FALLBACK_MODELS[0] == "gpt-6-astra"
+    assert FALLBACK_MODELS[0] == "gpt-6.1-sol"
+    assert {"gpt-6-astra", "gpt-6-sol", "gpt-6-luna"} <= set(FALLBACK_MODELS)
     assert len(FALLBACK_MODELS) == len(set(FALLBACK_MODELS))
 
 
-def test_astra_default_preserves_an_explicit_saved_model():
+@pytest.mark.parametrize("saved", ["gpt-6-astra", "gpt-5.6-terra", "gpt-6.1-sol"])
+def test_sol_default_preserves_an_explicit_saved_model(saved):
     from app.config import _rows_to_settings
 
-    assert _rows_to_settings({}).advisor.codex_model == "gpt-6-astra"
-    assert _rows_to_settings({"advisor": {"codex_model": "gpt-5.6-terra"}}).advisor.codex_model == "gpt-5.6-terra"
+    assert _rows_to_settings({}).advisor.codex_model == "gpt-6.1-sol"
+    assert _rows_to_settings({"advisor": {"codex_model": saved}}).advisor.codex_model == saved
     body = CodexProvider(AdvisorSettings(codex_model=" "))._build_body("sys", "user")
-    assert body["model"] == "gpt-6-astra"
+    assert body["model"] == "gpt-6.1-sol"
 
 
 @pytest.mark.anyio
-async def test_astra_model_discovery_and_request_use_updated_client(monkeypatch):
+async def test_sol_model_discovery_and_request_use_updated_client(monkeypatch):
     from unittest.mock import AsyncMock
 
     calls = []
 
     def handler(request):
         calls.append(request.method)
-        assert request.headers["version"] == "0.153.4" == CLIENT_VERSION
+        assert request.headers["version"] == "0.159.3" == CLIENT_VERSION
         assert f"/{CLIENT_VERSION} " in request.headers["User-Agent"]
         if request.method == "GET":
             assert request.url.params["client_version"] == CLIENT_VERSION
-            return httpx.Response(200, json={"models": [{"slug": "gpt-6-astra"}]})
+            return httpx.Response(200, json={"models": [{"slug": "gpt-6.1-sol"}]})
         body = json.loads(request.content)
-        assert body["model"] == "gpt-6-astra"
+        assert body["model"] == "gpt-6.1-sol"
         assert body["reasoning"]["effort"] == "low"
         event = {"type": "response.completed", "response": {
             "output": [{"type": "message", "content": [{"type": "output_text", "text": json.dumps(GOOD)}]}],
@@ -238,11 +240,11 @@ async def test_astra_model_discovery_and_request_use_updated_client(monkeypatch)
     monkeypatch.setattr(provider, "_valid_tokens", AsyncMock(return_value=TokenSet(access_token="test-token")))
     try:
         models, _ = await provider.list_models()
-        assert models == ["gpt-6-astra"]
+        assert models == ["gpt-6.1-sol"]
         await provider.list_models()  # cached
         await provider.list_models(force=True)
         raw = await provider.complete("sys", "user", 30)
-        assert raw.model == "gpt-6-astra"
+        assert raw.model == "gpt-6.1-sol"
         assert extract_json(raw.text) == GOOD
         assert (raw.input_tokens, raw.output_tokens) == (10, 20)
         assert calls == ["GET", "GET", "POST"]
