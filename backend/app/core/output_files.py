@@ -390,13 +390,19 @@ def _publish_new(staging: Path, target: str) -> None:
 
 
 def finish_commit(job_id: int) -> None:
-    """Remove only this job's reconciled, unchanged output journal."""
+    """Remove this job's journal; concurrent/repeated completion is harmless."""
     for path in COMMIT_JOURNAL_DIR.glob("*.json"):
-        entry = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            # Another finalizer can remove a listed journal before we open it.
+            # Do not hide permission, I/O or JSON errors in existing journals.
+            continue
+        entry = json.loads(text)
         if (entry.get("reconciliation") or {}).get("job_id") == job_id:
             if entry.get("phase") != "filesystem_done" or not _owned(entry["target"], entry.get("output_fingerprint")):
                 raise OSError("Ausgabe hat sich vor Abschluss der Verbuchung veraendert.")
-            path.unlink()
+            path.unlink(missing_ok=True)
             durable.sync_dir(path.parent)
 
 

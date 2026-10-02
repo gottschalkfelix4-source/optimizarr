@@ -566,3 +566,35 @@ def test_forced_larger_result_still_requires_valid_output(tmp_path, monkeypatch,
     assert source.read_bytes() == b"x" * 1000
     if gate != "integrity":
         check_quality.assert_awaited_once()
+
+
+@pytest.mark.parametrize("error", [PermissionError("cleanup denied"), ValueError("invalid journal")])
+def test_cleanup_error_cannot_reclassify_committed_success(tmp_path, monkeypatch, caplog, error):
+    from app.core import output_files
+    journal_dir = tmp_path / "journals"
+    monkeypatch.setattr(output_files, "COMMIT_JOURNAL_DIR", journal_dir)
+    source, job_id, file_id = make_job(tmp_path)
+    monkeypatch.setattr(encoder.ffmpeg, "probe", AsyncMock(return_value=probe_info(source)))
+    monkeypatch.setattr(encoder.quality, "verify_output", AsyncMock(return_value=(True, "")))
+    monkeypatch.setattr(encoder, "_run_encode", fake_encoder([]))
+    monkeypatch.setattr(encoder, "finish_commit", Mock(side_effect=error))
+    outcome = run(job_id, settings(mode="sidecar"))
+    assert outcome.ok
+    assert job_row(job_id).state == JobState.DONE.value
+    assert not job_row(job_id).error
+    assert "post-commit cleanup failed" in caplog.text
+    assert str(error) in caplog.text
+    assert source.read_bytes() == b"x" * 1000
+    import json
+    journals = list(journal_dir.glob("*.json"))
+    assert len(journals) == 1
+    entry = json.loads(journals[0].read_text())
+    assert Path(entry["target"]).read_bytes() == b"y" * 500
+    # Startup reconciliation must not count a committed result twice.
+    encoder.reconcile_commit(entry)
+    with db.session_scope() as s:
+        assert s.query(HistoryEntry).filter(HistoryEntry.level == "success").count() == 1
+        assert s.query(HistoryEntry).filter(HistoryEntry.level == "error").count() == 0
+        assert s.query(LearningSample).filter(LearningSample.job_id == job_id).count() == 1
+    output_files.finish_commit(job_id)
+    assert not list(journal_dir.glob("*.json"))

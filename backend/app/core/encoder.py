@@ -634,8 +634,10 @@ async def run_job(
             await asyncio.to_thread(
                 _record_success, job_id, file_id, outcome, final_path, plan, info, settings, final_info,
             )
-            await asyncio.to_thread(finish_commit, job_id)
+            # Publication and bookkeeping have committed. Cleanup/logging must
+            # never turn this success into a failure (or duplicate its history).
             outcome.ok = True
+            await asyncio.to_thread(finish_commit, job_id)
             for note in notes:
                 await _append_log_async(job_id, note)
 
@@ -657,6 +659,10 @@ async def run_job(
         await asyncio.to_thread(close_interrupted_job, job_id, requeue)
         return outcome
     except Exception as exc:  # pragma: no cover - defensive
+        if outcome.ok:
+            log.exception("job %s committed successfully but post-commit cleanup failed; "
+                          "remaining journals are preserved for recovery", job_id)
+            return outcome
         log.exception("job %s crashed", job_id)
         return await _fail_async(job_id, file_id, outcome, f"Unerwarteter Fehler: {exc}")
     finally:

@@ -382,3 +382,101 @@ def test_old_staging_copies_are_swept_only_next_to_their_file(tmp_path):
     assert encoder.sweep_stale_staging([str(folder)]) == 1
     assert not redundant.exists()
     assert orphan.exists() and foreign.exists()
+
+
+# Deterministic interleavings: all files are synthetic and isolated by tmp_path.
+def _finished_journal(tmp_path, job_id):
+    target = tmp_path / f"output-{job_id}.mkv"
+    target.write_bytes(b"encoded")
+    return encoder._journal_write({
+        "reconciliation": {"job_id": job_id}, "phase": "filesystem_done",
+        "target": str(target), "output_fingerprint": encoder._fingerprint(target),
+    })
+
+
+def test_finish_commit_other_job_removes_listed_manifest(tmp_path, monkeypatch):
+    other = _finished_journal(tmp_path, 1)
+    own = _finished_journal(tmp_path, 2)
+    real_read = Path.read_text
+    interleaved = False
+
+    def read_after_other_finishes(path, *args, **kwargs):
+        nonlocal interleaved
+        if path == other and not interleaved:
+            interleaved = True
+            encoder.finish_commit(1)
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_after_other_finishes)
+    encoder.finish_commit(2)
+    assert interleaved
+    assert not other.exists() and not own.exists()
+    assert (tmp_path / "output-1.mkv").read_bytes() == b"encoded"
+    assert (tmp_path / "output-2.mkv").read_bytes() == b"encoded"
+    encoder.finish_commit(2)  # repeated completion is harmless
+
+
+def test_finish_commit_same_job_finishes_before_unlink(tmp_path, monkeypatch):
+    own = _finished_journal(tmp_path, 1)
+    real_unlink = Path.unlink
+    interleaved = False
+
+    def unlink_after_other_finishes(path, *args, **kwargs):
+        nonlocal interleaved
+        if path == own and not interleaved:
+            interleaved = True
+            encoder.finish_commit(1)
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink_after_other_finishes)
+    encoder.finish_commit(1)
+    assert interleaved and not own.exists()
+
+
+@pytest.mark.parametrize("operation", ["read", "unlink", "sync", "parse", "ownership"])
+def test_finish_commit_real_errors_remain_visible(tmp_path, monkeypatch, operation):
+    own = _finished_journal(tmp_path, 1)
+    def denied(*args, **kwargs):
+        raise PermissionError("synthetic permission failure")
+    if operation == "read":
+        monkeypatch.setattr(Path, "read_text", denied)
+    elif operation == "unlink":
+        monkeypatch.setattr(Path, "unlink", denied)
+    elif operation == "sync":
+        monkeypatch.setattr(encoder.durable, "sync_dir", denied)
+    elif operation == "parse":
+        own.write_text("{broken", encoding="utf-8")
+    else:
+        (tmp_path / "output-1.mkv").write_bytes(b"changed output")
+    with pytest.raises((OSError, json.JSONDecodeError)):
+        encoder.finish_commit(1)
+    if operation != "sync":
+        assert own.exists()
+
+
+def test_finish_commit_preserves_other_jobs(tmp_path):
+    other = _finished_journal(tmp_path, 1)
+    encoder.finish_commit(2)
+    assert other.exists()
+
+
+def test_finish_commit_parallel_threads(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, local
+    paths = [_finished_journal(tmp_path, job_id) for job_id in (1, 2)]
+    barrier, seen = Barrier(2), local()
+    real_glob = Path.glob
+
+    def listed_together(path, pattern):
+        listed = list(real_glob(path, pattern))
+        if path == encoder.COMMIT_JOURNAL_DIR and not getattr(seen, "listed", False):
+            seen.listed = True
+            barrier.wait(timeout=5)
+        return iter(listed)
+
+    monkeypatch.setattr(Path, "glob", listed_together)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(encoder.finish_commit, job_id) for job_id in (1, 2)]
+        for future in futures:
+            future.result(timeout=10)
+    assert all(not path.exists() for path in paths)
